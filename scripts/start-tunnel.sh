@@ -28,4 +28,9 @@ if ! "$TC" profiles list 2>/dev/null | grep -Fq "$PROFILE"; then
 fi
 
 "$TC" doctor --profile "$PROFILE" --explain
-exec "$TC" run --profile "$PROFILE"
+
+HEALTH_FILE="${TUNNEL_HEALTH_URL_FILE:-$ROOT/.runtime/live-tunnel-health.url}"
+mkdir -p "$ROOT/.runtime"
+rm -f "$HEALTH_FILE"
+
+exec "$TC" run   --profile "$PROFILE"   --health.listen-addr 127.0.0.1:0   --health.url-file "$HEALTH_FILE"
