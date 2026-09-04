@@ -2,21 +2,36 @@
 
 POC: ChatGPT Web → OpenAI Secure MCP Tunnel → MCP-to-A2A bridge → Hermes Agent A2A → local Mac.
 
-This repository is intentionally thin: it does not fork Hermes Agent or OpenAI's tunnel client. It wires existing protocol surfaces together, provides repeatable diagnostics, and produces a report that can be pasted back into ChatGPT.
+This repository deliberately does not fork Hermes Agent or OpenAI tunnel-client. It wires the existing protocol surfaces together and produces a diagnostic report that can be pasted back into ChatGPT.
 
-## Quick start
+## One-command run
 
-On the Mac where Hermes is installed:
+From Terminal on the Mac where Hermes is installed:
 
-```bash
-git clone https://github.com/pyxl-dev/chatgpt-hermes-a2a.git
-cd chatgpt-hermes-a2a
-chmod +x scripts/run-all.sh
-./scripts/run-all.sh
-```
+~~~bash
+mkdir -p ~/Projects && cd ~/Projects && (test -d chatgpt-hermes-a2a/.git && git -C chatgpt-hermes-a2a pull --ff-only || git clone https://github.com/pyxl-dev/chatgpt-hermes-a2a.git) && cd chatgpt-hermes-a2a && bash scripts/run-all.sh
+~~~
 
-The script performs non-destructive checks, attempts to start the Hermes gateway if needed, verifies the local A2A Agent Card, installs the local Node dependencies, runs an MCP→A2A smoke test, inspects OpenAI `tunnel-client` availability/configuration, and writes a timestamped report under `reports/`.
+The runner:
 
-It does **not** expose Hermes on the public internet and does not change `A2A_HOST` away from loopback.
+- checks the local prerequisites;
+- enables Hermes inbound A2A on localhost:9900 if necessary;
+- restarts, starts, or installs the Hermes gateway service when required;
+- validates the Hermes Agent Card;
+- installs the pinned MCP-to-A2A bridge dependencies;
+- calls Hermes through MCP → A2A and asks Hermes to create a harmless proof file under /tmp;
+- downloads the latest official OpenAI tunnel-client for macOS when it is not already installed and verifies it against the release SHA256SUMS;
+- if CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY are already exported, creates/checks the stdio tunnel profile and verifies that the tunnel runtime reaches ready state;
+- prints a compact report between REPORT TO SEND BACK markers and saves it under reports/.
 
-See `docs/architecture.md` and `docs/security.md`.
+If the OpenAI tunnel credentials are not present, the local MCP → A2A → Hermes path is still tested and the report will identify the missing tunnel prerequisites.
+
+## Runtime entrypoints
+
+- scripts/start-bridge.sh — stdio MCP server used by tunnel-client.
+- scripts/start-tunnel.sh — foreground Secure MCP Tunnel launcher after the two OpenAI tunnel environment variables are available.
+- scripts/run-all.sh — setup, diagnostics, smoke test, and report generation.
+
+Hermes A2A remains bound to loopback. The project does not expose port 9900 to the public internet.
+
+See docs/architecture.md and docs/security.md.
