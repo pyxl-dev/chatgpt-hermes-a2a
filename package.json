@@ -1,0 +1,14 @@
+{
+  "name": "chatgpt-hermes-a2a",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "POC bridge: ChatGPT Web -> OpenAI Secure MCP Tunnel -> MCP -> A2A -> Hermes Agent",
+  "scripts": {
+    "smoke": "node src/mcp-smoke.mjs"
+  },
+  "dependencies": {
+    "@cognicellai/a2a-mcp": "0.1.1",
+    "@modelcontextprotocol/sdk": "1.30.0"
+  }
+}
