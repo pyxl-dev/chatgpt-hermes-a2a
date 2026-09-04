@@ -97,13 +97,35 @@ if ! curl -fsS --max-time 3 "$A2A_URL" -o "$CARD" 2>/dev/null; then
 
   if command -v hermes >/dev/null 2>&1; then
     capture "gateway-status" hermes gateway status || true
-    if capture "gateway-start" hermes gateway start; then
-      line "- Attempted to start the installed Hermes gateway service."
+
+    CURRENT_A2A="$(hermes config get gateway.platforms.a2a.enabled 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$CURRENT_A2A" != "true" ]]; then
+      if capture "a2a-enable" hermes config set gateway.platforms.a2a.enabled true; then
+        pass "Enabled the Hermes A2A gateway adapter"
+      else
+        warn "Could not enable Hermes A2A through hermes config set"
+      fi
     else
-      warn "Could not start the Hermes gateway service automatically"
+      pass "Hermes A2A gateway adapter was already enabled"
     fi
 
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if capture "a2a-port" hermes config set gateway.platforms.a2a.extra.port 9900; then
+      pass "Hermes A2A port is configured as 9900"
+    else
+      warn "Could not set Hermes A2A port through hermes config set"
+    fi
+
+    if capture "gateway-restart" hermes gateway restart; then
+      pass "Restarted the Hermes gateway service"
+    elif capture "gateway-start" hermes gateway start; then
+      pass "Started the Hermes gateway service"
+    elif capture "gateway-install" hermes gateway install && capture "gateway-start-after-install" hermes gateway start; then
+      pass "Installed and started the Hermes gateway service"
+    else
+      warn "Could not start a managed Hermes gateway service automatically"
+    fi
+
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
       sleep 1
       if curl -fsS --max-time 3 "$A2A_URL" -o "$CARD" 2>/dev/null; then
         break
@@ -237,6 +259,62 @@ else
   warn "CONTROL_PLANE_API_KEY is not exported; tunnel-client cannot authenticate to OpenAI yet"
 fi
 
+TUNNEL_READY=0
+if [[ -n "${TC:-}" && -x "$TC" && -n "${CONTROL_PLANE_TUNNEL_ID:-}" && -n "${CONTROL_PLANE_API_KEY:-}" ]]; then
+  PROFILE="chatgpt-hermes-a2a"
+
+  if "$TC" profiles list 2>/dev/null | grep -Fq "$PROFILE"; then
+    pass "Tunnel profile $PROFILE already exists"
+  else
+    if capture "tunnel-profile-init" "$TC" init       --sample sample_mcp_stdio_local       --profile "$PROFILE"       --tunnel-id "$CONTROL_PLANE_TUNNEL_ID"       --mcp-command "$ROOT/scripts/start-bridge.sh"; then
+      pass "Created the tunnel-client stdio profile"
+    else
+      fail "Could not create the tunnel-client profile"
+    fi
+  fi
+
+  if capture "tunnel-doctor" "$TC" doctor --profile "$PROFILE" --explain; then
+    pass "tunnel-client doctor accepted the profile and runtime credentials"
+
+    HEALTH_FILE="$ROOT/.runtime/tunnel-health.url"
+    TUNNEL_LOG="$ROOT/.runtime/logs/$STAMP-tunnel-run.log"
+    rm -f "$HEALTH_FILE"
+
+    "$TC" run       --profile "$PROFILE"       --health.listen-addr 127.0.0.1:0       --health.url-file "$HEALTH_FILE"       >"$TUNNEL_LOG" 2>&1 &
+    TUNNEL_PID=$!
+
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+      if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        break
+      fi
+      if [[ -s "$HEALTH_FILE" ]]; then
+        HEALTH_URL="$(cat "$HEALTH_FILE" 2>/dev/null || true)"
+        if [[ -n "$HEALTH_URL" ]] && curl -fsS --max-time 3 "$HEALTH_URL/readyz" >/dev/null 2>&1; then
+          TUNNEL_READY=1
+          break
+        fi
+      fi
+      sleep 1
+    done
+
+    kill "$TUNNEL_PID" 2>/dev/null || true
+    wait "$TUNNEL_PID" 2>/dev/null || true
+
+    if [[ "$TUNNEL_READY" -eq 1 ]]; then
+      pass "Secure MCP Tunnel runtime reached ready state against OpenAI"
+    else
+      fail "Secure MCP Tunnel runtime did not reach ready state within 30 seconds"
+      line ""
+      line "  Tunnel run log tail:"
+      line "~~~text"
+      tail -n 35 "$TUNNEL_LOG" |         sed -E           -e 's/(Bearer )[A-Za-z0-9._~+\/-]+/\1[REDACTED]/g'           -e 's/(sk-[A-Za-z0-9_-]{8})[A-Za-z0-9_-]+/\1...[REDACTED]/g'           -e 's/(CONTROL_PLANE_API_KEY=).*/\1[REDACTED]/g'         | tee -a "$REPORT"
+      line "~~~"
+    fi
+  else
+    fail "tunnel-client doctor failed"
+  fi
+fi
+
 section "5. Result"
 
 line "- Passed: $PASS"
@@ -247,10 +325,12 @@ line "- Secure tunnel launcher once tunnel env vars exist: $ROOT/scripts/start-t
 
 if [[ $FAIL -eq 0 ]]; then
   line "- Overall: LOCAL PIPELINE READY"
-  if [[ -n "${CONTROL_PLANE_TUNNEL_ID:-}" && -n "${CONTROL_PLANE_API_KEY:-}" ]]; then
-    line "- Tunnel prerequisites: PRESENT"
+  if [[ "$TUNNEL_READY" -eq 1 ]]; then
+    line "- Tunnel status: READY"
+  elif [[ -n "${CONTROL_PLANE_TUNNEL_ID:-}" && -n "${CONTROL_PLANE_API_KEY:-}" ]]; then
+    line "- Tunnel status: CREDENTIALS PRESENT BUT NOT READY"
   else
-    line "- Tunnel prerequisites: MISSING ENVIRONMENT VALUES"
+    line "- Tunnel status: MISSING ENVIRONMENT VALUES"
   fi
 else
   line "- Overall: NEEDS FIXES; see failed checks above"
