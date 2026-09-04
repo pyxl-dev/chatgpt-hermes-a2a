@@ -70,7 +70,7 @@ const transport = new StdioClientTransport({
   command: bridge,
   args: [],
   env: childEnv,
-  stderr: "pipe",
+  stderr: "inherit",
 });
 
 const client = new Client(
