@@ -35,3 +35,14 @@ If the OpenAI tunnel credentials are not present, the local MCP → A2A → Herm
 Hermes A2A remains bound to loopback. The project does not expose port 9900 to the public internet.
 
 See docs/architecture.md and docs/security.md.
+
+
+## After the local diagnostic passes
+
+Run the guided OpenAI connection step:
+
+~~~bash
+cd ~/Projects/chatgpt-hermes-a2a && git pull --ff-only && bash scripts/connect-openai.sh
+~~~
+
+It opens the official Tunnels and Runtime API Keys pages, prompts for the tunnel ID and runtime key (hidden input), starts tunnel-client, waits for readiness, then opens ChatGPT connector settings. Keep that terminal open while testing the plugin.
