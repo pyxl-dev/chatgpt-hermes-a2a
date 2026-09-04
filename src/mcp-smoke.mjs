@@ -10,6 +10,7 @@ const root = path.resolve(here, "..");
 const bridge = path.join(root, "scripts", "start-bridge.sh");
 const proofFile = "/tmp/chatgpt-hermes-a2a-proof.txt";
 const proofText = "HERMES_A2A_TOOL_OK";
+const proofTimeoutMs = Number(process.env.HERMES_A2A_SMOKE_TIMEOUT_MS || 180000);
 
 const childEnv = Object.fromEntries(
   Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
@@ -38,6 +39,22 @@ function preview(value, max = 2500) {
     : rendered;
 }
 
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForProof() {
+  const deadline = Date.now() + proofTimeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const onDisk = (await fs.readFile(proofFile, "utf8")).trim();
+      if (onDisk === proofText) return true;
+    } catch {}
+    await sleep(2000);
+  }
+  return false;
+}
+
 const summary = {
   ok: false,
   tools: [],
@@ -45,6 +62,7 @@ const summary = {
   agentCard: null,
   sendMessage: null,
   localToolProof: false,
+  waitedMs: 0,
   error: null,
 };
 
@@ -113,22 +131,19 @@ try {
     },
   };
 
+  const sentAt = Date.now();
   const sent = await client.callTool({
     name: "a2a_send_message",
     arguments: { agent: "hermes", request },
   });
   summary.sendMessage = preview(extractText(sent) || sent);
 
-  try {
-    const onDisk = (await fs.readFile(proofFile, "utf8")).trim();
-    summary.localToolProof = onDisk === proofText;
-  } catch {
-    summary.localToolProof = false;
-  }
+  summary.localToolProof = await waitForProof();
+  summary.waitedMs = Date.now() - sentAt;
 
   if (!summary.localToolProof) {
     throw new Error(
-      "Hermes answered through A2A, but the local tool proof file was not created with the expected content.",
+      "The A2A request was accepted, but Hermes did not create the expected local proof file before the smoke-test timeout.",
     );
   }
 
