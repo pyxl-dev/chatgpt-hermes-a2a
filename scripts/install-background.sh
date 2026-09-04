@@ -48,7 +48,7 @@ if [[ -z "$TUNNEL_ID" ]]; then
   PROFILE_PATH="$("$TC" profiles list 2>/dev/null | /usr/bin/awk -v p="$PROFILE" '$1 == p {print $2; exit}' || true)"
 
   if [[ -n "$PROFILE_PATH" && -f "$PROFILE_PATH" ]]; then
-    TUNNEL_ID="$(/usr/bin/grep -Eo 'tunnel_[A-Za-z0-9]+' "$PROFILE_PATH" 2>/dev/null | /usr/bin/head -n 1 || true)"
+    TUNNEL_ID="$(/usr/bin/grep -Eo 'tunnel_[a-z0-9]{32}' "$PROFILE_PATH" 2>/dev/null | /usr/bin/head -n 1 || true)"
   fi
 fi
 
@@ -57,8 +57,8 @@ if [[ -z "$TUNNEL_ID" ]]; then
   read -r TUNNEL_ID
 fi
 
-if [[ ! "$TUNNEL_ID" =~ ^tunnel_[A-Za-z0-9]+$ ]]; then
-  echo "Invalid tunnel ID: expected tunnel_..." >&2
+if [[ ! "$TUNNEL_ID" =~ ^tunnel_[a-z0-9]{32}$ ]]; then
+  echo "Invalid tunnel ID: expected tunnel_ followed by exactly 32 lowercase letters or digits." >&2
   exit 3
 fi
 
