@@ -46,3 +46,36 @@ cd ~/Projects/chatgpt-hermes-a2a && git pull --ff-only && bash scripts/connect-o
 ~~~
 
 It opens the official Tunnels and Runtime API Keys pages, prompts for the tunnel ID and runtime key (hidden input), starts tunnel-client, waits for readiness, then opens ChatGPT connector settings. Keep that terminal open while testing the plugin.
+
+
+## Persistent macOS background runtime
+
+After the end-to-end POC succeeds, install the tunnel as a macOS LaunchAgent:
+
+~~~bash
+cd ~/Projects/chatgpt-hermes-a2a && git config core.fileMode false && git pull --ff-only && bash scripts/install-background.sh
+~~~
+
+The installer:
+
+- reuses the existing tunnel ID when it can discover it from the tunnel-client profile;
+- asks once for the Restricted runtime API key if it is not already stored;
+- stores that key in macOS Keychain under the service name `chatgpt-hermes-a2a.runtime-api-key`;
+- writes/validates the local stdio tunnel profile;
+- retires the foreground POC tunnel process;
+- installs `~/Library/LaunchAgents/com.pyxl.chatgpt-hermes-a2a.plist`;
+- starts the tunnel immediately and verifies `/readyz`;
+- automatically starts again at login and restarts if tunnel-client exits.
+
+Once installed, Terminal is not required for normal use.
+
+Maintenance:
+
+~~~bash
+bash scripts/status.sh
+bash scripts/restart.sh
+bash scripts/stop.sh
+bash scripts/uninstall-background.sh
+~~~
+
+`stop.sh` stops it for the current login session. The LaunchAgent remains installed and starts again next login. `uninstall-background.sh` removes the persistent LaunchAgent; set `DELETE_RUNTIME_KEY=1` if the Keychain item should also be removed.
