@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# GitHub API-created scripts are stored as 0644; ignore local executable-bit
+# differences so diagnostics never leave the checkout artificially dirty.
+git config core.fileMode false 2>/dev/null || true
+
 PROFILE="chatgpt-hermes-a2a"
 LABEL="com.pyxl.chatgpt-hermes-a2a"
 KEYCHAIN_SERVICE="chatgpt-hermes-a2a.runtime-api-key"
@@ -41,26 +45,10 @@ fi
 TUNNEL_ID="${CONTROL_PLANE_TUNNEL_ID:-}"
 
 if [[ -z "$TUNNEL_ID" ]]; then
-  PROFILE_PATH="$("$TC" profiles list --json 2>/dev/null | python3 -c '
-import json,sys
-try:
-    rows=json.load(sys.stdin)
-except Exception:
-    rows=[]
-for row in rows:
-    if row.get("name")=="chatgpt-hermes-a2a":
-        print(row.get("path",""))
-        break
-' || true)"
+  PROFILE_PATH="$("$TC" profiles list 2>/dev/null | /usr/bin/awk -v p="$PROFILE" '$1 == p {print $2; exit}' || true)"
 
   if [[ -n "$PROFILE_PATH" && -f "$PROFILE_PATH" ]]; then
-    TUNNEL_ID="$(python3 - "$PROFILE_PATH" <<'PY'
-import re,sys
-text=open(sys.argv[1], encoding="utf-8", errors="ignore").read()
-m=re.search(r"\btunnel_[A-Za-z0-9]+\b", text)
-print(m.group(0) if m else "")
-PY
-)"
+    TUNNEL_ID="$(/usr/bin/grep -Eo 'tunnel_[A-Za-z0-9]+' "$PROFILE_PATH" 2>/dev/null | /usr/bin/head -n 1 || true)"
   fi
 fi
 
