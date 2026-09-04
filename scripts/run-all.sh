@@ -4,6 +4,10 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# GitHub's contents API does not preserve executable bits on new files.
+# Make every launcher executable before any of them is invoked directly.
+chmod +x "$ROOT"/scripts/*.sh 2>/dev/null || true
+
 mkdir -p "$ROOT/.runtime/logs" "$ROOT/reports"
 STAMP="$(date '+%Y%m%d-%H%M%S')"
 REPORT="$ROOT/reports/diagnostic-$STAMP.md"
