@@ -3,7 +3,6 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
-chmod +x "$ROOT"/scripts/*.sh 2>/dev/null || true
 mkdir -p "$ROOT/.runtime/logs"
 
 TUNNELS_URL="https://platform.openai.com/settings/organization/tunnels"
