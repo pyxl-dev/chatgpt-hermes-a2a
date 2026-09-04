@@ -16,7 +16,7 @@ fi
 if command -v tunnel-client >/dev/null 2>&1; then
   TC="$(command -v tunnel-client)"
 else
-  TC="$("$ROOT/scripts/install-tunnel-client.sh")"
+  TC="$(bash "$ROOT/scripts/install-tunnel-client.sh")"
 fi
 
 if [[ ! -d "$ROOT/node_modules" ]]; then
