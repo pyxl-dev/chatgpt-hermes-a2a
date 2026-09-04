@@ -4,10 +4,6 @@ set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-# GitHub's contents API does not preserve executable bits on new files.
-# Make every launcher executable before any of them is invoked directly.
-chmod +x "$ROOT"/scripts/*.sh 2>/dev/null || true
-
 mkdir -p "$ROOT/.runtime/logs" "$ROOT/reports"
 STAMP="$(date '+%Y%m%d-%H%M%S')"
 REPORT="$ROOT/reports/diagnostic-$STAMP.md"
@@ -198,8 +194,6 @@ if command -v npm >/dev/null 2>&1 && [[ "$NODE_MAJOR" -ge 20 ]]; then
     fail "npm dependency installation failed"
   fi
 
-  chmod +x "$ROOT/scripts/start-bridge.sh" "$ROOT/scripts/install-tunnel-client.sh" "$ROOT/scripts/start-tunnel.sh" "$ROOT/scripts/run-all.sh" 2>/dev/null || true
-
   if [[ -s "$CARD" && -x "$ROOT/node_modules/.bin/a2a-mcp" ]]; then
     SMOKE_LOG="$ROOT/.runtime/logs/$STAMP-mcp-smoke.log"
     node "$ROOT/src/mcp-smoke.mjs" >"$SMOKE_LOG" 2>&1
@@ -270,7 +264,7 @@ if [[ -n "${TC:-}" && -x "$TC" && -n "${CONTROL_PLANE_TUNNEL_ID:-}" && -n "${CON
   if "$TC" profiles list 2>/dev/null | grep -Fq "$PROFILE"; then
     pass "Tunnel profile $PROFILE already exists"
   else
-    if capture "tunnel-profile-init" "$TC" init       --sample sample_mcp_stdio_local       --profile "$PROFILE"       --tunnel-id "$CONTROL_PLANE_TUNNEL_ID"       --mcp-command "$ROOT/scripts/start-bridge.sh"; then
+    if capture "tunnel-profile-init" "$TC" init       --sample sample_mcp_stdio_local       --profile "$PROFILE"       --tunnel-id "$CONTROL_PLANE_TUNNEL_ID"       --mcp-command "/bin/bash $ROOT/scripts/start-bridge.sh"; then
       pass "Created the tunnel-client stdio profile"
     else
       fail "Could not create the tunnel-client profile"
