@@ -1,0 +1,17 @@
+# Local-only development configuration.
+# The runtime launcher generates a token-aware copy under .runtime/ when
+# A2A_BEARER_TOKEN is available.
+agents:
+  hermes:
+    cardUrl: "http://127.0.0.1:9900/.well-known/agent-card.json"
+    allowedBindings: ["JSONRPC", "HTTP+JSON"]
+    signaturePolicy: "disabled"
+    directUrlPolicy: "disabled"
+
+authProfiles: {}
+
+network:
+  allowPrivateAddresses: true
+  requireHttps: false
+  timeoutMs: 330000
+  maxResponseBytes: 10485760
