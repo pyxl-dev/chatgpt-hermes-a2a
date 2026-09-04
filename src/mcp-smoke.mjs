@@ -1,16 +1,26 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const bridge = path.join(root, "scripts", "start-bridge.sh");
-const proofFile = "/tmp/chatgpt-hermes-a2a-proof.txt";
-const proofText = "HERMES_A2A_TOOL_OK";
-const proofTimeoutMs = Number(process.env.HERMES_A2A_SMOKE_TIMEOUT_MS || 180000);
+const proofFile = "/tmp/chatgpt-hermes-ux-proof.txt";
+const proofText = "HERMES_UX_OK";
+const proofTimeoutMs = Number(
+  process.env.HERMES_UX_SMOKE_TIMEOUT_MS ||
+    process.env.HERMES_A2A_SMOKE_TIMEOUT_MS ||
+    180000,
+);
+const expectedTools = [
+  "delegate_to_hermes",
+  "continue_with_hermes",
+  "get_hermes_task",
+  "cancel_hermes_task",
+  "hermes_status",
+];
 
 const childEnv = Object.fromEntries(
   Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
@@ -31,6 +41,18 @@ function extractText(result) {
     .join("\n");
 }
 
+function payloadOf(result) {
+  if (result && result.structuredContent !== undefined) {
+    return result.structuredContent;
+  }
+  const text = extractText(result);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
 function preview(value, max = 2500) {
   const rendered = typeof value === "string" ? value : JSON.stringify(value);
   if (!rendered) return "";
@@ -39,15 +61,44 @@ function preview(value, max = 2500) {
     : rendered;
 }
 
+function resultSummary(result) {
+  const payload = payloadOf(result);
+  if (payload && typeof payload === "object") {
+    return {
+      ok: payload.ok,
+      agent: payload.agent,
+      taskId: payload.taskId,
+      contextId: payload.contextId,
+      state: payload.state,
+      stateName: payload.stateName,
+      text: payload.text,
+      cancelled: payload.cancelled,
+      error: payload.error,
+    };
+  }
+  return preview(payload);
+}
+
+function assertToolSucceeded(result, name) {
+  const payload = payloadOf(result);
+  if (result && result.isError) {
+    throw new Error(`${name} returned an MCP error: ${preview(payload)}`);
+  }
+  if (payload && typeof payload === "object" && payload.ok === false) {
+    throw new Error(`${name} returned an application error: ${preview(payload)}`);
+  }
+  return payload;
+}
+
 async function sleep(ms) {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForProof() {
+async function waitForExactProof() {
   const deadline = Date.now() + proofTimeoutMs;
   while (Date.now() < deadline) {
     try {
-      const onDisk = (await fs.readFile(proofFile, "utf8")).trim();
+      const onDisk = await fs.readFile(proofFile, "utf8");
       if (onDisk === proofText) return true;
     } catch {}
     await sleep(2000);
@@ -58,23 +109,26 @@ async function waitForProof() {
 const summary = {
   ok: false,
   tools: [],
-  listAgents: null,
-  agentCard: null,
-  sendMessage: null,
+  hermesStatus: null,
+  delegate: null,
+  getTask: null,
+  continue: null,
   localToolProof: false,
+  continuedSameContext: null,
   waitedMs: 0,
   error: null,
 };
 
 const transport = new StdioClientTransport({
-  command: bridge,
-  args: [],
+  command: "/bin/bash",
+  args: [bridge],
   env: childEnv,
+  cwd: root,
   stderr: "inherit",
 });
 
 const client = new Client(
-  { name: "chatgpt-hermes-a2a-smoke", version: "0.1.0" },
+  { name: "chatgpt-hermes-ux-smoke", version: "0.1.0" },
   { capabilities: {} },
 );
 
@@ -83,68 +137,108 @@ try {
 
   const listed = await client.listTools();
   summary.tools = (listed.tools || []).map((tool) => tool.name);
-
-  const required = [
-    "a2a_list_agents",
-    "a2a_get_agent_card",
-    "a2a_send_message",
-  ];
-  const missing = required.filter((name) => !summary.tools.includes(name));
-  if (missing.length) {
+  const actual = [...summary.tools].sort();
+  const expected = [...expectedTools].sort();
+  if (
+    actual.length !== expected.length ||
+    actual.some((name, index) => name !== expected[index])
+  ) {
     throw new Error(
-      "MCP bridge is up but required tools are missing: " + missing.join(", "),
+      `UX MCP surface mismatch. Expected exactly ${expectedTools.join(", ")}; got ${summary.tools.join(", ")}`,
     );
   }
+  if (
+    listed.tools.some(
+      (tool) => typeof tool.description !== "string" || tool.description.length < 20,
+    )
+  ) {
+    throw new Error("Every ergonomic UX tool must have an explicit description");
+  }
+  const descriptions = Object.fromEntries(
+    listed.tools.map((tool) => [tool.name, tool.description]),
+  );
+  if (!/new/i.test(descriptions.delegate_to_hermes) || !/contextId/i.test(descriptions.delegate_to_hermes)) {
+    throw new Error("delegate_to_hermes description must identify a new mission and contextId handoff");
+  }
+  if (!/existing|follow-up/i.test(descriptions.continue_with_hermes) || !/contextId/i.test(descriptions.continue_with_hermes)) {
+    throw new Error("continue_with_hermes description must identify existing-context follow-ups");
+  }
 
-  const agents = await client.callTool({
-    name: "a2a_list_agents",
+  const status = await client.callTool({
+    name: "hermes_status",
     arguments: {},
   });
-  summary.listAgents = preview(extractText(agents) || agents);
-
-  const card = await client.callTool({
-    name: "a2a_get_agent_card",
-    arguments: { agent: "hermes" },
-  });
-  summary.agentCard = preview(extractText(card) || card);
+  const statusPayload = assertToolSucceeded(status, "hermes_status");
+  if (statusPayload?.reachable !== true) {
+    throw new Error("hermes_status did not report reachable=true");
+  }
+  summary.hermesStatus = resultSummary(status);
 
   await fs.rm(proofFile, { force: true });
-
-  const request = {
-    message: {
-      messageId: randomUUID(),
-      role: "ROLE_USER",
-      parts: [
-        {
-          text:
-            "This is an automated local diagnostic. Use your local shell/terminal tool to create " +
-            proofFile +
-            " containing exactly " +
-            proofText +
-            " with no trailing commentary in the file. Then read the file back. " +
-            "Do not modify any other file, setting, repository, or service. " +
-            "Reply with " +
-            proofText +
-            " if the operation succeeded.",
-        },
-      ],
-    },
-  };
-
   const sentAt = Date.now();
-  const sent = await client.callTool({
-    name: "a2a_send_message",
-    arguments: { agent: "hermes", request },
+  const delegated = await client.callTool({
+    name: "delegate_to_hermes",
+    arguments: {
+      instruction:
+        `Use your local terminal tool to create ${proofFile} containing exactly ${proofText} with no trailing newline, then read it back. Do not modify any other file, setting, repository, or service. Reply with exactly ${proofText}.`,
+    },
   });
-  summary.sendMessage = preview(extractText(sent) || sent);
-
-  summary.localToolProof = await waitForProof();
+  const delegatedPayload = assertToolSucceeded(
+    delegated,
+    "delegate_to_hermes",
+  );
+  summary.delegate = resultSummary(delegated);
+  summary.localToolProof = await waitForExactProof();
   summary.waitedMs = Date.now() - sentAt;
 
   if (!summary.localToolProof) {
     throw new Error(
-      "The A2A request was accepted, but Hermes did not create the expected local proof file before the smoke-test timeout.",
+      `Hermes did not create ${proofFile} with exactly ${proofText} before the smoke-test timeout.`,
     );
+  }
+
+  const taskId = delegatedPayload?.taskId;
+  const contextId = delegatedPayload?.contextId;
+  if (!taskId || !contextId) {
+    throw new Error("delegate_to_hermes did not return both taskId and contextId");
+  }
+
+  const task = await client.callTool({
+    name: "get_hermes_task",
+    arguments: { taskId },
+  });
+  assertToolSucceeded(task, "get_hermes_task");
+  summary.getTask = resultSummary(task);
+  const returnedText = [summary.delegate?.text, summary.getTask?.text]
+    .filter(Boolean)
+    .join("\n");
+  if (!returnedText.includes(proofText)) {
+    throw new Error(
+      "delegate_to_hermes/get_hermes_task did not return the proof text read-back",
+    );
+  }
+
+  const continued = await client.callTool({
+    name: "continue_with_hermes",
+    arguments: {
+      contextId,
+      instruction:
+        "Do not use tools and do not modify any file. Reply exactly " +
+          proofText +
+          " to confirm this follow-up arrived in the same Hermes conversation.",
+    },
+  });
+  const continuedPayload = assertToolSucceeded(
+    continued,
+    "continue_with_hermes",
+  );
+  summary.continue = resultSummary(continued);
+  summary.continuedSameContext =
+    continuedPayload?.contextId === undefined
+      ? null
+      : continuedPayload.contextId === contextId;
+  if (summary.continuedSameContext !== true) {
+    throw new Error("continue_with_hermes did not preserve the original contextId");
   }
 
   summary.ok = true;
@@ -155,6 +249,7 @@ try {
   try {
     await client.close();
   } catch {}
+  await fs.rm(proofFile, { force: true }).catch(() => {});
 }
 
 process.stdout.write(JSON.stringify(summary, null, 2) + "\n");

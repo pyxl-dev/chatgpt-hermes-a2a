@@ -9,8 +9,10 @@ This project gives a remote ChatGPT session a path to an agent that can act on t
 3. Never commit .env, OpenAI API keys, A2A bearer tokens, or tunnel credentials.
 4. The runtime config references A2A_BEARER_TOKEN by environment-variable name; it does not write the token into the repo.
 5. The diagnostic script reads at most the single A2A_BEARER_TOKEN value from ~/.hermes/.env; it does not source the entire Hermes secret file.
-6. The diagnostic writes only /tmp/chatgpt-hermes-a2a-proof.txt when testing Hermes tool execution.
+6. The diagnostic writes only /tmp/chatgpt-hermes-ux-proof.txt when testing Hermes tool execution.
 7. Reports and runtime logs are gitignored.
+8. `src/hermes-mcp.mjs` exposes exactly five UX tools. It does not forward the generic backend's agent-list, stream, or push-notification tools to ChatGPT.
+9. The wrapper redacts secret-looking fields in backend fallbacks and never logs the A2A bearer-token value.
 
 ## OpenAI tunnel credentials
 

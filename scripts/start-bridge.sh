@@ -61,4 +61,14 @@ else
 fi
 
 export A2A_MCP_CONFIG="$RUNTIME_CONFIG"
-exec "$BIN"
+
+NODE_BIN="$(command -v node || true)"
+if [[ -z "$NODE_BIN" ]]; then
+  echo "node is not installed or is not on PATH." >&2
+  exit 1
+fi
+
+# Keep the proven generic a2a-mcp process as the private backend. The UX
+# wrapper owns the public MCP stdio connection and never forwards its tool list.
+export HERMES_A2A_BACKEND_BIN="${HERMES_A2A_BACKEND_BIN:-${A2A_MCP_BACKEND_BIN:-$BIN}}"
+exec "$NODE_BIN" "$ROOT/src/hermes-mcp.mjs"

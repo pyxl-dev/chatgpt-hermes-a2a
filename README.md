@@ -1,8 +1,8 @@
 # chatgpt-hermes-a2a
 
-POC: ChatGPT Web → OpenAI Secure MCP Tunnel → MCP-to-A2A bridge → Hermes Agent A2A → local Mac.
+POC: ChatGPT Web → OpenAI Secure MCP Tunnel → Hermes MCP UX wrapper → private MCP-to-A2A backend → Hermes Agent A2A → local Mac.
 
-This repository deliberately does not fork Hermes Agent or OpenAI tunnel-client. It wires the existing protocol surfaces together and produces a diagnostic report that can be pasted back into ChatGPT.
+This repository deliberately does not fork Hermes Agent or OpenAI tunnel-client. The public MCP connection is handled by `src/hermes-mcp.mjs`; it delegates to the proven `@cognicellai/a2a-mcp` process over a private stdio connection and keeps that backend's generic tools out of ChatGPT's tool list.
 
 ## One-command run
 
@@ -19,7 +19,7 @@ The runner:
 - restarts, starts, or installs the Hermes gateway service when required;
 - validates the Hermes Agent Card;
 - installs the pinned MCP-to-A2A bridge dependencies;
-- calls Hermes through MCP → A2A and asks Hermes to create a harmless proof file under /tmp;
+- calls Hermes through the five-tool UX MCP surface → the private generic MCP backend → A2A and asks Hermes to create a harmless proof file under /tmp;
 - downloads the latest official OpenAI tunnel-client for macOS when it is not already installed and verifies it against the release SHA256SUMS;
 - if CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY are already exported, creates/checks the stdio tunnel profile and verifies that the tunnel runtime reaches ready state;
 - prints a compact report between REPORT TO SEND BACK markers and saves it under reports/.
@@ -28,13 +28,38 @@ If the OpenAI tunnel credentials are not present, the local MCP → A2A → Herm
 
 ## Runtime entrypoints
 
-- scripts/start-bridge.sh — stdio MCP server used by tunnel-client.
+- src/hermes-mcp.mjs — public UX MCP server; it exposes exactly the five tools listed below and connects to the generic backend as a child process.
+- scripts/start-bridge.sh — stdio command used by tunnel-client; it preserves runtime config/token generation and starts the UX wrapper.
 - scripts/start-tunnel.sh — foreground Secure MCP Tunnel launcher after the two OpenAI tunnel environment variables are available.
 - scripts/run-all.sh — setup, diagnostics, smoke test, and report generation.
 
 Hermes A2A remains bound to loopback. The project does not expose port 9900 to the public internet.
 
 See docs/architecture.md and docs/security.md.
+
+## UX MCP surface
+
+The tunnel-facing server exposes exactly these five tools. The generic `a2a_*` tools remain private behind the wrapper.
+
+| Tool | Use it when | Inputs |
+| --- | --- | --- |
+| `delegate_to_hermes` | Starting a new, independent local Hermes mission | `instruction` |
+| `continue_with_hermes` | Following up in an existing Hermes conversation | `contextId`, `instruction` |
+| `get_hermes_task` | Polling a task or retrieving its result after a previous call | `taskId` |
+| `cancel_hermes_task` | Stopping an in-flight task | `taskId` |
+| `hermes_status` | Checking whether the local `hermes` alias is reachable | no inputs |
+
+Delegation and continuation return a compact normalized response with `text` when available, `taskId`, `contextId`, `state`/`stateName`, and a safe raw fallback. `continue_with_hermes` sends the exact supplied `contextId` in the A2A `Message.contextId` field; use `delegate_to_hermes` for a new mission.
+
+## Local verification
+
+After Hermes A2A is available on `127.0.0.1:9900`, run:
+
+~~~bash
+npm run smoke
+~~~
+
+The smoke test initializes MCP, asserts that `tools/list` contains exactly the five names above, checks `hermes_status`, delegates a benign task that creates `/tmp/chatgpt-hermes-ux-proof.txt` with exactly `HERMES_UX_OK`, polls it, and continues the same `contextId` without changing repository files.
 
 
 ## After the local diagnostic passes
@@ -46,6 +71,16 @@ cd ~/Projects/chatgpt-hermes-a2a && git pull --ff-only && bash scripts/connect-o
 ~~~
 
 It opens the official Tunnels and Runtime API Keys pages, prompts for the tunnel ID and runtime key (hidden input), starts tunnel-client, waits for readiness, then opens ChatGPT connector settings. Keep that terminal open while testing the plugin.
+
+## Switch the existing LaunchAgent after local tests pass
+
+This is the single recommended cutover command. It rewrites/validates the tunnel profile with `scripts/start-bridge.sh`, reloads the existing LaunchAgent, and then prints its status:
+
+~~~bash
+cd ~/Projects/chatgpt-hermes-a2a && bash scripts/install-background.sh && bash scripts/status.sh
+~~~
+
+The installer reuses the existing tunnel ID and Keychain runtime key when available. It does not print the key. Do not run this cutover until `npm run smoke` is green.
 
 
 ## Persistent macOS background runtime
