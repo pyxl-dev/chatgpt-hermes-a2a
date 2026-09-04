@@ -32,3 +32,16 @@ The scripts never print the API key value.
 - Re-run secret scanning.
 - Document exactly what local actions Hermes is allowed to perform.
 - Keep the project framed as an explicit user-authorized local automation bridge, not a mechanism for bypassing ChatGPT product controls.
+
+
+## Background runtime on macOS
+
+The persistent setup uses a per-user LaunchAgent. The plist contains only local paths and the command to start the runtime; it does not contain the OpenAI runtime API key.
+
+The runtime API key is stored as a macOS Keychain generic password with service:
+
+`chatgpt-hermes-a2a.runtime-api-key`
+
+At runtime, `scripts/daemon-run.sh` reads that single Keychain item, exports it only into the tunnel-client process environment, and then execs tunnel-client. The key is not written to the repository, LaunchAgent plist, reports, or logs by this project.
+
+The LaunchAgent keeps the tunnel process alive and starts it again at user login. Hermes A2A remains loopback-only.
