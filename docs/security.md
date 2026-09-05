@@ -11,8 +11,13 @@ This project gives a remote ChatGPT session a path to an agent that can act on t
 5. The diagnostic script reads at most the single A2A_BEARER_TOKEN value from ~/.hermes/.env; it does not source the entire Hermes secret file.
 6. The diagnostic writes only /tmp/chatgpt-hermes-ux-proof.txt when testing Hermes tool execution.
 7. Reports and runtime logs are gitignored.
-8. `src/hermes-mcp.mjs` exposes exactly five UX tools. It does not forward the generic backend's agent-list, stream, or push-notification tools to ChatGPT.
+8. `src/hermes-mcp.mjs` exposes exactly six UX tools. It does not forward the generic backend's agent-list, stream, or push-notification tools to ChatGPT.
 9. The wrapper redacts secret-looking fields in backend fallbacks and never logs the A2A bearer-token value.
+10. `hermes_activity` is read-only with respect to Hermes: it reads local JSONL traces without calling the A2A backend.
+11. Activity traces do not store the full instruction; they store SHA-256 plus a redacted/truncated preview.
+12. `scripts/start-bridge.sh` uses `umask 077`; the wrapper attempts to keep `.runtime/hermes-activity.jsonl` at mode `0600`.
+
+The activity preview redaction is a safety aid, not a formal DLP boundary. Do not intentionally put secrets in Hermes instructions. The idempotence cache is process-local: it reduces accidental duplicate execution inside one bridge process, but it is not a transactional guarantee across multiple bridge processes or restarts.
 
 ## OpenAI tunnel credentials
 

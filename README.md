@@ -19,7 +19,7 @@ The runner:
 - restarts, starts, or installs the Hermes gateway service when required;
 - validates the Hermes Agent Card;
 - installs the pinned MCP-to-A2A bridge dependencies;
-- calls Hermes through the five-tool UX MCP surface → the private generic MCP backend → A2A and asks Hermes to create a harmless proof file under /tmp;
+- calls Hermes through the six-tool UX MCP surface → the private generic MCP backend → A2A and asks Hermes to create a harmless proof file under /tmp;
 - downloads the latest official OpenAI tunnel-client for macOS when it is not already installed and verifies it against the release SHA256SUMS;
 - if CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY are already exported, creates/checks the stdio tunnel profile and verifies that the tunnel runtime reaches ready state;
 - prints a compact report between REPORT TO SEND BACK markers and saves it under reports/.
@@ -28,7 +28,7 @@ If the OpenAI tunnel credentials are not present, the local MCP → A2A → Herm
 
 ## Runtime entrypoints
 
-- src/hermes-mcp.mjs — public UX MCP server; it exposes exactly the five tools listed below and connects to the generic backend as a child process.
+- src/hermes-mcp.mjs — public UX MCP server; it exposes exactly the six tools listed below, adds bridge-level tracing/idempotence, and connects to the generic backend as a child process.
 - scripts/start-bridge.sh — stdio command used by tunnel-client; it preserves runtime config/token generation and starts the UX wrapper.
 - scripts/start-tunnel.sh — foreground Secure MCP Tunnel launcher after the two OpenAI tunnel environment variables are available.
 - scripts/run-all.sh — setup, diagnostics, smoke test, and report generation.
@@ -39,7 +39,7 @@ See docs/architecture.md and docs/security.md.
 
 ## UX MCP surface
 
-The tunnel-facing server exposes exactly these five tools. The generic `a2a_*` tools remain private behind the wrapper.
+The tunnel-facing server exposes exactly these six tools. The generic `a2a_*` tools remain private behind the wrapper.
 
 | Tool | Use it when | Inputs |
 | --- | --- | --- |
@@ -48,18 +48,34 @@ The tunnel-facing server exposes exactly these five tools. The generic `a2a_*` t
 | `get_hermes_task` | Polling a background task or retrieving its result | `taskId`, optional `historyLength` |
 | `cancel_hermes_task` | Stopping an in-flight task | `taskId` |
 | `hermes_status` | Checking whether the local `hermes` alias is reachable | no inputs |
+| `hermes_activity` | Reading recent local bridge traces without contacting Hermes | optional `limit`, `tool`, `since`, `deduplicatedOnly`, `errorsOnly` |
 
 Delegation and continuation return a compact normalized response with `text` when available, `taskId`, `contextId`, `state`/`stateName`, and a safe raw fallback. Normal calls wait for Hermes to finish; set `background: true` only for intentionally long-running work and then poll with `get_hermes_task`. `continue_with_hermes` sends the exact supplied `contextId` in the A2A `Message.contextId` field; use `delegate_to_hermes` for a new mission.
+
+## Observability and idempotence
+
+Every public MCP call writes one local JSONL trace to `.runtime/hermes-activity.jsonl` by default. The record includes `traceId`, start/end timestamps, `durationMs`, tool name, a `purpose`, SHA-256 `instructionHash`, redacted/truncated `instructionPreview`, input/output `contextId` and `taskId`, state, success/error, `deduplicated`, `duplicateOfTraceId`, and `background`.
+
+The full instruction is not written to the activity log. The preview is normalized, passed through the bridge redaction rules, and truncated to 240 characters. `.runtime/` remains gitignored; the launcher uses `umask 077` and the wrapper attempts to keep the activity file at mode `0600`.
+
+`hermes_activity` reads that JSONL file directly. It does not call `a2a-mcp` or Hermes. It supports `limit`, `tool`, `since`, `deduplicatedOnly`, and `errorsOnly` filters.
+
+`delegate_to_hermes` now deduplicates an identical normalized mission before `a2a_send_message`. Mission identity is SHA-256 of the instruction after Unicode NFKC normalization, trim, and whitespace collapse. Different normalized instructions therefore produce different keys. `background` is traced but excluded from mission identity because it changes waiting behavior, not the work requested.
+
+The default completed-result window is 60 seconds (`HERMES_DEDUP_WINDOW_MS=60000`). An identical mission that is still in flight remains deduplicable until it settles, even if it runs longer than 60 seconds. Successful duplicates reuse the original result/task/context and return `deduplicated: true` plus `duplicateOfTraceId`. Backend failures remove the cache entry so a later real retry can execute.
+
+The deduplication cache is process-local and clears on bridge restart; JSONL activity history remains on disk. The log path can be overridden with `HERMES_ACTIVITY_LOG=/absolute/path/hermes-activity.jsonl`.
 
 ## Local verification
 
 After Hermes A2A is available on `127.0.0.1:9900`, run:
 
 ~~~bash
+npm run check
 npm run smoke
 ~~~
 
-The smoke test initializes MCP, asserts that `tools/list` contains exactly the five names above, checks `hermes_status`, delegates a benign task that creates `/tmp/chatgpt-hermes-ux-proof.txt` with exactly `HERMES_UX_OK`, polls it, and continues the same `contextId` without changing repository files.
+The smoke test initializes MCP, asserts that `tools/list` contains exactly the six names above, checks `hermes_status`, delegates a benign task that creates `/tmp/chatgpt-hermes-ux-proof.txt` with exactly `HERMES_UX_OK`, immediately repeats the exact delegation and verifies reuse of the same `taskId`/`contextId` with `deduplicated: true`, polls it, continues the same `contextId`, and verifies the trace records through `hermes_activity`.
 
 
 ## After the local diagnostic passes
