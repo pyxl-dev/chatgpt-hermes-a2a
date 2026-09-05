@@ -8,6 +8,8 @@ const execFileAsync = promisify(execFile);
 const DEFAULT_TIMEOUT_MS = 330000;
 const DEFAULT_HISTORY_LIMIT = 50;
 const MAX_HISTORY_LIMIT = 200;
+const DEFAULT_SESSION_LIST_LIMIT = 50;
+const MAX_SESSION_LIST_LIMIT = 200;
 const MAX_MESSAGE_CHARS = 12000;
 const MAX_BUFFER_BYTES = 16 * 1024 * 1024;
 
@@ -69,6 +71,67 @@ function sessionIdOf(session, fallback) {
   return String(session?.id || session?.session_id || fallback || "");
 }
 
+function nullableCell(value) {
+  const text = String(value || "").trim();
+  return !text || text === "—" ? null : text;
+}
+
+function parseSessionList(stdout, requestedSource = null) {
+  const lines = String(stdout || "")
+    .split(/\r?\n/u)
+    .map((line) => line.replace(/\s+$/u, ""))
+    .filter(Boolean);
+
+  if (!lines.length || lines[0].trim() === "No sessions found.") {
+    return [];
+  }
+
+  const headerIndex = lines.findIndex(
+    (line) => line.includes("ID") && line.includes("Last Active"),
+  );
+  if (headerIndex < 0 || headerIndex + 1 >= lines.length) {
+    throw new Error("Could not parse Hermes sessions list output");
+  }
+
+  const header = lines[headerIndex];
+  const known = ["Title", "Preview", "Workspace", "Last Active", "Src", "ID"];
+  const columns = known
+    .map((label) => ({ label, start: header.indexOf(label) }))
+    .filter((column) => column.start >= 0)
+    .sort((a, b) => a.start - b.start);
+
+  if (!columns.some((column) => column.label === "ID")) {
+    throw new Error("Hermes sessions list output is missing the ID column");
+  }
+
+  const rows = [];
+  for (const line of lines.slice(headerIndex + 2)) {
+    if (!line.trim() || /^[─-]+$/u.test(line.trim())) continue;
+
+    const values = {};
+    for (let index = 0; index < columns.length; index += 1) {
+      const current = columns[index];
+      const next = columns[index + 1];
+      values[current.label] = line
+        .slice(current.start, next ? next.start : undefined)
+        .trim();
+    }
+
+    const sessionId = nullableCell(values.ID);
+    if (!sessionId) continue;
+
+    rows.push({
+      sessionId,
+      title: nullableCell(values.Title),
+      preview: nullableCell(values.Preview),
+      workspace: nullableCell(values.Workspace),
+      lastActive: nullableCell(values["Last Active"]),
+      source: nullableCell(values.Src) || requestedSource || null,
+    });
+  }
+  return rows;
+}
+
 function simplifyMessage(message) {
   const role = String(message?.role || "unknown");
   const toolName =
@@ -122,6 +185,52 @@ export function createHermesSessionAccess({
         ),
       );
     }
+  }
+
+  async function listSessions(options = {}) {
+    const limit =
+      options.limit === undefined ? DEFAULT_SESSION_LIST_LIMIT : options.limit;
+    if (
+      !Number.isInteger(limit) ||
+      limit < 1 ||
+      limit > MAX_SESSION_LIST_LIMIT
+    ) {
+      throw new Error(
+        "limit must be an integer between 1 and " + MAX_SESSION_LIST_LIMIT,
+      );
+    }
+
+    const source =
+      typeof options.source === "string" && options.source.trim()
+        ? options.source.trim()
+        : null;
+    const workspace =
+      typeof options.workspace === "string" && options.workspace.trim()
+        ? options.workspace.trim()
+        : null;
+
+    const args = ["sessions", "list", "--limit", String(limit)];
+    if (source) args.push("--source", source);
+    if (workspace) args.push("--workspace", workspace);
+
+    const { stdout } = await runHermes(args);
+    const sessions = parseSessionList(stdout, source).map((session) => ({
+      ...session,
+      title: session.title ? redactText(session.title) : null,
+      preview: session.preview ? redactText(session.preview) : null,
+      workspace: session.workspace ? redactText(session.workspace) : null,
+    }));
+
+    return {
+      ok: true,
+      operation: "list_hermes_sessions",
+      agent: "hermes",
+      limit,
+      source,
+      workspace,
+      count: sessions.length,
+      sessions,
+    };
   }
 
   async function exportSession(sessionId) {
@@ -245,6 +354,7 @@ export function createHermesSessionAccess({
   return {
     hermesBin,
     timeoutMs,
+    listSessions,
     getSession,
     continueSession,
   };
