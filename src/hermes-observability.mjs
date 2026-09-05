@@ -10,6 +10,7 @@ const INSTRUCTION_PREVIEW_MAX = 240;
 const TOOL_PURPOSE = {
   delegate_to_hermes: "new-mission",
   continue_with_hermes: "continue-existing-context",
+  list_hermes_sessions: "list-native-sessions",
   get_hermes_session: "read-native-session",
   continue_hermes_session: "continue-native-session",
   get_hermes_task: "read-task-state",
