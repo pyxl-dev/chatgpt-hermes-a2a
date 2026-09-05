@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createHermesObservability } from "./hermes-observability.mjs";
+import { createHermesSessionAccess } from "./hermes-sessions.mjs";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -140,6 +141,62 @@ const TOOLS = [
     },
   },
   {
+    name: "get_hermes_session",
+    description:
+      "Read a persisted Hermes conversation directly by its durable Hermes sessionId. This uses Hermes' native session export, does not create a new A2A context, does not ask the model to summarize itself, excludes system/tool messages by default, and redacts secrets before returning history.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        sessionId: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Durable Hermes session ID such as 20260905_053252_4248284e. Copy it exactly.",
+        },
+        limit: {
+          type: "integer",
+          minimum: 0,
+          maximum: 200,
+          default: 50,
+          description:
+            "Maximum number of most recent visible messages to return. Use 0 for metadata only.",
+        },
+        includeTools: {
+          type: "boolean",
+          default: false,
+          description:
+            "When true, include persisted tool-result messages as well as user/assistant messages. Leave false unless tool history is needed.",
+        },
+      },
+      required: ["sessionId"],
+    },
+  },
+  {
+    name: "continue_hermes_session",
+    description:
+      "Continue a persisted Hermes conversation directly by its durable Hermes sessionId. This resumes the existing Hermes session with its stored transcript; it does not create a new A2A conversation. Use this when the user provides a Hermes session ID or when get_hermes_session returned one.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        sessionId: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Durable Hermes session ID to resume, copied exactly.",
+        },
+        instruction: {
+          type: "string",
+          minLength: 1,
+          description:
+            "The next instruction to execute inside that existing Hermes conversation.",
+        },
+      },
+      required: ["sessionId", "instruction"],
+    },
+  },
+  {
     name: "get_hermes_task",
     description:
       "Read the current state and available result of a Hermes task. Use this after a background delegation/continuation, or when a previous call returned submitted/working. Pass the taskId exactly as returned; do not use this to start work.",
@@ -210,6 +267,8 @@ const TOOLS = [
           enum: [
             "delegate_to_hermes",
             "continue_with_hermes",
+            "get_hermes_session",
+            "continue_hermes_session",
             "get_hermes_task",
             "cancel_hermes_task",
             "hermes_status",
@@ -266,7 +325,7 @@ async function ensureBackend() {
 
   backendConnectPromise = (async () => {
     const client = new Client(
-      { name: "chatgpt-hermes-ux-backend", version: "0.2.0" },
+      { name: "chatgpt-hermes-ux-backend", version: "0.3.0" },
       { capabilities: {} },
     );
     const transport = createBackendTransport();
@@ -441,6 +500,16 @@ function cleanHermesText(value) {
     )
     .trim();
 }
+
+const sessionAccess = createHermesSessionAccess({
+  root: ROOT,
+  redactText,
+  randomUUID,
+  cleanText: cleanHermesText,
+});
+const continueNativeSession = observability.wrapSessionContinue(
+  sessionAccess.continueSession,
+);
 
 function messageText(message) {
   if (!message || typeof message !== "object") return "";
@@ -671,6 +740,21 @@ async function executePublicTool(name, args, traceId) {
         args.background === true,
       );
 
+    case "get_hermes_session": {
+      const limit = args.limit === undefined ? undefined : args.limit;
+      return sessionAccess.getSession(requireString(args, "sessionId"), {
+        ...(limit === undefined ? {} : { limit }),
+        includeTools: args.includeTools === true,
+      });
+    }
+
+    case "continue_hermes_session":
+      return continueNativeSession(
+        requireString(args, "sessionId"),
+        requireString(args, "instruction"),
+        traceId,
+      );
+
     case "get_hermes_task": {
       let historyLength;
       if (args.historyLength !== undefined) {
@@ -703,7 +787,7 @@ async function executePublicTool(name, args, traceId) {
 }
 
 const server = new Server(
-  { name: "hermes-mac", version: "0.3.0" },
+  { name: "hermes-mac", version: "0.4.0" },
   { capabilities: { tools: {} } },
 );
 
