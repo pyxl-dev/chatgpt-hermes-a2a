@@ -141,6 +141,37 @@ const TOOLS = [
     },
   },
   {
+    name: "list_hermes_sessions",
+    description:
+      "List recent persisted Hermes conversations so you can discover the correct durable sessionId before reading or resuming one. Uses Hermes' native sessions list command, does not contact the model, and returns compact metadata such as title/preview, workspace, last activity, source when available, and sessionId.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 200,
+          default: 50,
+          description:
+            "Maximum number of recent sessions to return, ordered by Hermes' native session listing.",
+        },
+        source: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Optional Hermes source filter such as cli, tui, telegram, discord, slack, cron, a2a, or tool.",
+        },
+        workspace: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Optional Hermes workspace filter. Hermes matches a path substring or exact directory basename.",
+        },
+      },
+    },
+  },
+  {
     name: "get_hermes_session",
     description:
       "Read a persisted Hermes conversation directly by its durable Hermes sessionId. This uses Hermes' native session export, does not create a new A2A context, does not ask the model to summarize itself, excludes system/tool messages by default, and redacts secrets before returning history.",
@@ -267,6 +298,7 @@ const TOOLS = [
           enum: [
             "delegate_to_hermes",
             "continue_with_hermes",
+            "list_hermes_sessions",
             "get_hermes_session",
             "continue_hermes_session",
             "get_hermes_task",
@@ -325,7 +357,7 @@ async function ensureBackend() {
 
   backendConnectPromise = (async () => {
     const client = new Client(
-      { name: "chatgpt-hermes-ux-backend", version: "0.3.0" },
+      { name: "chatgpt-hermes-ux-backend", version: "0.4.0" },
       { capabilities: {} },
     );
     const transport = createBackendTransport();
@@ -740,6 +772,15 @@ async function executePublicTool(name, args, traceId) {
         args.background === true,
       );
 
+    case "list_hermes_sessions":
+      return sessionAccess.listSessions({
+        ...(args.limit === undefined ? {} : { limit: args.limit }),
+        ...(typeof args.source === "string" ? { source: args.source } : {}),
+        ...(typeof args.workspace === "string"
+          ? { workspace: args.workspace }
+          : {}),
+      });
+
     case "get_hermes_session": {
       const limit = args.limit === undefined ? undefined : args.limit;
       return sessionAccess.getSession(requireString(args, "sessionId"), {
@@ -787,7 +828,7 @@ async function executePublicTool(name, args, traceId) {
 }
 
 const server = new Server(
-  { name: "hermes-mac", version: "0.4.0" },
+  { name: "hermes-mac", version: "0.5.0" },
   { capabilities: { tools: {} } },
 );
 
