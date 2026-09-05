@@ -10,6 +10,8 @@ const INSTRUCTION_PREVIEW_MAX = 240;
 const TOOL_PURPOSE = {
   delegate_to_hermes: "new-mission",
   continue_with_hermes: "continue-existing-context",
+  get_hermes_session: "read-native-session",
+  continue_hermes_session: "continue-native-session",
   get_hermes_task: "read-task-state",
   cancel_hermes_task: "cancel-task",
   hermes_status: "health-check",
@@ -44,6 +46,7 @@ export function createHermesObservability({
   let activityWriteChain = Promise.resolve();
   const recentActivity = [];
   const delegationCache = new Map();
+  const sessionContinuationCache = new Map();
 
   function instructionHash(value) {
     if (typeof value !== "string" || value.trim() === "") return null;
@@ -73,6 +76,8 @@ export function createHermesObservability({
       inputContextId:
         typeof args?.contextId === "string" ? args.contextId : null,
       inputTaskId: typeof args?.taskId === "string" ? args.taskId : null,
+      inputSessionId:
+        typeof args?.sessionId === "string" ? args.sessionId : null,
       background: args?.background === true,
     };
   }
@@ -96,6 +101,11 @@ export function createHermesObservability({
           : null,
       outputTaskId:
         payload && typeof payload.taskId === "string" ? payload.taskId : null,
+      inputSessionId: base.inputSessionId,
+      outputSessionId:
+        payload && typeof payload.sessionId === "string"
+          ? payload.sessionId
+          : null,
       state: payload?.state ?? null,
       stateName: payload?.stateName ?? null,
       ok: !error && payload?.ok !== false,
@@ -228,13 +238,13 @@ export function createHermesObservability({
     };
   }
 
-  function pruneDelegationCache(now = Date.now()) {
-    for (const [key, entry] of delegationCache.entries()) {
+  function pruneCache(cache, now = Date.now()) {
+    for (const [key, entry] of cache.entries()) {
       if (
         entry.settledAtMs !== null &&
         now - entry.settledAtMs > dedupWindowMs
       ) {
-        delegationCache.delete(key);
+        cache.delete(key);
       }
     }
   }
@@ -247,7 +257,7 @@ export function createHermesObservability({
     ) {
       const hash = instructionHash(instruction);
       const now = Date.now();
-      pruneDelegationCache(now);
+      pruneCache(delegationCache, now);
 
       const existing = delegationCache.get(hash);
       const reusable =
@@ -301,6 +311,69 @@ export function createHermesObservability({
     };
   }
 
+  function wrapSessionContinue(executeContinue) {
+    return async function deduplicatedSessionContinue(
+      sessionId,
+      instruction,
+      traceId = null,
+    ) {
+      const hash = instructionHash(instruction);
+      const key = String(sessionId) + ":" + hash;
+      const now = Date.now();
+      pruneCache(sessionContinuationCache, now);
+
+      const existing = sessionContinuationCache.get(key);
+      const reusable =
+        existing &&
+        (existing.settledAtMs === null ||
+          now - existing.settledAtMs <= dedupWindowMs);
+
+      if (reusable) {
+        try {
+          const result = await existing.promise;
+          return {
+            ...result,
+            deduplicated: true,
+            duplicateOfTraceId: existing.traceId,
+            dedupWindowMs,
+          };
+        } catch (error) {
+          if (error && typeof error === "object") {
+            error.deduplicated = true;
+            error.duplicateOfTraceId = existing.traceId;
+          }
+          throw error;
+        }
+      }
+
+      const promise = executeContinue(sessionId, instruction);
+      const entry = {
+        traceId,
+        createdAtMs: now,
+        settledAtMs: null,
+        promise,
+      };
+      sessionContinuationCache.set(key, entry);
+
+      try {
+        const result = await promise;
+        entry.settledAtMs = Date.now();
+        entry.promise = Promise.resolve(result);
+        return {
+          ...result,
+          deduplicated: false,
+          duplicateOfTraceId: null,
+          dedupWindowMs,
+        };
+      } catch (error) {
+        if (sessionContinuationCache.get(key) === entry) {
+          sessionContinuationCache.delete(key);
+        }
+        throw error;
+      }
+    };
+  }
+
   return {
     activityLog,
     dedupWindowMs,
@@ -310,5 +383,6 @@ export function createHermesObservability({
     flush,
     readActivity,
     wrapDelegate,
+    wrapSessionContinue,
   };
 }
