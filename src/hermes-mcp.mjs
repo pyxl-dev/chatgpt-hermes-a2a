@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createHermesObservability } from "./hermes-observability.mjs";
+
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -69,6 +71,13 @@ function redactValue(value) {
 function errorMessage(error) {
   return redactText(error instanceof Error ? error.message : String(error));
 }
+
+const observability = createHermesObservability({
+  root: ROOT,
+  redactText,
+  redactValue,
+  randomUUID,
+});
 
 const TOOLS = [
   {
@@ -181,6 +190,51 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: "hermes_activity",
+    description:
+      "Read recent local MCP activity traces from the bridge without contacting Hermes. Use this to inspect call counts, tools, sanitized instruction previews, task/context IDs, duration, state, errors, background usage, and whether a delegate_to_hermes call was deduplicated.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        limit: {
+          type: "integer",
+          minimum: 1,
+          maximum: 200,
+          default: 50,
+          description: "Maximum number of newest matching trace records to return.",
+        },
+        tool: {
+          type: "string",
+          enum: [
+            "delegate_to_hermes",
+            "continue_with_hermes",
+            "get_hermes_task",
+            "cancel_hermes_task",
+            "hermes_status",
+            "hermes_activity",
+          ],
+          description: "Optional tool name filter.",
+        },
+        since: {
+          type: "string",
+          description:
+            "Optional ISO-8601 timestamp. Only traces that started at or after this timestamp are returned.",
+        },
+        deduplicatedOnly: {
+          type: "boolean",
+          default: false,
+          description: "When true, return only deduplicated calls.",
+        },
+        errorsOnly: {
+          type: "boolean",
+          default: false,
+          description: "When true, return only failed calls.",
+        },
+      },
+    },
+  },
 ];
 
 let backend = null;
@@ -252,12 +306,19 @@ function toolText(payload) {
   };
 }
 
-function toolError(error, operation = "unknown") {
+function toolError(
+  error,
+  operation = "unknown",
+  traceId = null,
+  metadata = {},
+) {
   const payload = {
     ok: false,
     operation,
     agent: AGENT,
+    ...(traceId ? { traceId } : {}),
     ...(operation === "hermes_status" ? { reachable: false } : {}),
+    ...metadata,
     error: { message: errorMessage(error) },
   };
   return {
@@ -511,7 +572,7 @@ function makeUserMessage(instruction, contextId, taskId) {
   };
 }
 
-async function delegate(instruction, background = false) {
+async function delegateOnce(instruction, background = false) {
   const raw = await callBackend("a2a_send_message", {
     agent: AGENT,
     request: {
@@ -523,6 +584,8 @@ async function delegate(instruction, background = false) {
   });
   return normalizeTask(raw, "delegate_to_hermes");
 }
+
+const delegate = observability.wrapDelegate(delegateOnce);
 
 async function continueContext(
   contextId,
@@ -589,8 +652,58 @@ async function status() {
   };
 }
 
+async function executePublicTool(name, args, traceId) {
+  switch (name) {
+    case "delegate_to_hermes":
+      return delegate(
+        requireString(args, "instruction"),
+        args.background === true,
+        traceId,
+      );
+
+    case "continue_with_hermes":
+      return continueContext(
+        requireString(args, "contextId"),
+        requireString(args, "instruction"),
+        typeof args.taskId === "string" && args.taskId.trim()
+          ? args.taskId
+          : undefined,
+        args.background === true,
+      );
+
+    case "get_hermes_task": {
+      let historyLength;
+      if (args.historyLength !== undefined) {
+        if (
+          !Number.isInteger(args.historyLength) ||
+          args.historyLength < 0 ||
+          args.historyLength > 100
+        ) {
+          throw new Error(
+            "historyLength must be an integer between 0 and 100",
+          );
+        }
+        historyLength = args.historyLength;
+      }
+      return getTask(requireString(args, "taskId"), historyLength);
+    }
+
+    case "cancel_hermes_task":
+      return cancelTask(requireString(args, "taskId"));
+
+    case "hermes_status":
+      return status();
+
+    case "hermes_activity":
+      return observability.readActivity(args);
+
+    default:
+      throw new Error("Unknown tool: " + name);
+  }
+}
+
 const server = new Server(
-  { name: "hermes-mac", version: "0.2.0" },
+  { name: "hermes-mac", version: "0.3.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -599,60 +712,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  const name = request.params.name;
+  const args = requireObject(request.params.arguments);
+  const trace = observability.beginTrace(name, args);
+  let payload = null;
+  let failure = null;
+
   try {
-    const args = requireObject(request.params.arguments);
-
-    switch (request.params.name) {
-      case "delegate_to_hermes":
-        return toolText(
-          await delegate(
-            requireString(args, "instruction"),
-            args.background === true,
-          ),
-        );
-
-      case "continue_with_hermes":
-        return toolText(
-          await continueContext(
-            requireString(args, "contextId"),
-            requireString(args, "instruction"),
-            typeof args.taskId === "string" && args.taskId.trim()
-              ? args.taskId
-              : undefined,
-            args.background === true,
-          ),
-        );
-
-      case "get_hermes_task": {
-        let historyLength;
-        if (args.historyLength !== undefined) {
-          if (
-            !Number.isInteger(args.historyLength) ||
-            args.historyLength < 0 ||
-            args.historyLength > 100
-          ) {
-            throw new Error(
-              "historyLength must be an integer between 0 and 100",
-            );
-          }
-          historyLength = args.historyLength;
-        }
-        return toolText(
-          await getTask(requireString(args, "taskId"), historyLength),
-        );
-      }
-
-      case "cancel_hermes_task":
-        return toolText(await cancelTask(requireString(args, "taskId")));
-
-      case "hermes_status":
-        return toolText(await status());
-
-      default:
-        throw new Error(`Unknown tool: ${request.params.name}`);
-    }
+    payload = await executePublicTool(name, args, trace.traceId);
+    payload = { ...payload, traceId: trace.traceId };
+    return toolText(payload);
   } catch (error) {
-    return toolError(error, request.params.name);
+    failure = error;
+    payload = {
+      ok: false,
+      operation: name,
+      agent: AGENT,
+      traceId: trace.traceId,
+      error: { message: errorMessage(error) },
+      deduplicated: error?.deduplicated === true,
+      duplicateOfTraceId: error?.duplicateOfTraceId || null,
+    };
+    return toolError(error, name, trace.traceId, {
+      deduplicated: payload.deduplicated,
+      duplicateOfTraceId: payload.duplicateOfTraceId,
+    });
+  } finally {
+    await observability.appendTrace(
+      observability.finishTrace(trace, payload, failure),
+    );
   }
 });
 
@@ -660,6 +748,7 @@ let closing = false;
 async function shutdown() {
   if (closing) return;
   closing = true;
+  await observability.flush();
   try {
     await backend?.close();
   } catch {
@@ -680,7 +769,13 @@ try {
   // Keep the public MCP endpoint available so hermes_status can report a
   // backend/agent outage instead of making initialization fail opaquely.
   await server.connect(new StdioServerTransport());
-  console.error("Hermes Mac UX MCP ready on stdio");
+  console.error(
+    "Hermes Mac UX MCP ready on stdio; activity=" +
+      observability.activityLog +
+      "; dedup=" +
+      observability.dedupWindowMs +
+      "ms",
+  );
 } catch (error) {
   console.error(`Failed to start Hermes Mac UX MCP: ${errorMessage(error)}`);
   await shutdown();

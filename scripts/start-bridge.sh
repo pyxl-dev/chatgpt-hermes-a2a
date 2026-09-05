@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$ROOT/.runtime"
@@ -8,6 +9,7 @@ TEMPLATE="$ROOT/config/a2a-mcp.config.yaml"
 BIN="$ROOT/node_modules/.bin/a2a-mcp"
 
 mkdir -p "$RUNTIME_DIR"
+chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
 
 # launchd does not inherit the interactive shell environment. If Hermes A2A
 # uses a bearer token, load only that single value from ~/.hermes/.env.
@@ -61,6 +63,7 @@ else
 fi
 
 export A2A_MCP_CONFIG="$RUNTIME_CONFIG"
+export HERMES_ACTIVITY_LOG="${HERMES_ACTIVITY_LOG:-$RUNTIME_DIR/hermes-activity.jsonl}"
 
 NODE_BIN="$(command -v node || true)"
 if [[ -z "$NODE_BIN" ]]; then

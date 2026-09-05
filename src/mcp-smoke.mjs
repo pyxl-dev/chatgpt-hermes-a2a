@@ -20,6 +20,7 @@ const expectedTools = [
   "get_hermes_task",
   "cancel_hermes_task",
   "hermes_status",
+  "hermes_activity",
 ];
 
 const childEnv = Object.fromEntries(
@@ -67,12 +68,15 @@ function resultSummary(result) {
     return {
       ok: payload.ok,
       agent: payload.agent,
+      traceId: payload.traceId,
       taskId: payload.taskId,
       contextId: payload.contextId,
       state: payload.state,
       stateName: payload.stateName,
       text: payload.text,
       cancelled: payload.cancelled,
+      deduplicated: payload.deduplicated,
+      duplicateOfTraceId: payload.duplicateOfTraceId,
       error: payload.error,
     };
   }
@@ -111,8 +115,11 @@ const summary = {
   tools: [],
   hermesStatus: null,
   delegate: null,
+  duplicateDelegate: null,
+  dedupSameTask: null,
   getTask: null,
   continue: null,
+  activity: null,
   localToolProof: false,
   continuedSameContext: null,
   waitedMs: 0,
@@ -175,13 +182,19 @@ try {
   summary.hermesStatus = resultSummary(status);
 
   await fs.rm(proofFile, { force: true });
+  const instruction =
+    "Use your local terminal tool to create " +
+    proofFile +
+    " containing exactly " +
+    proofText +
+    " with no trailing newline, then read it back. Do not modify any other file, setting, repository, or service. Reply with exactly " +
+    proofText +
+    ".";
+
   const sentAt = Date.now();
   const delegated = await client.callTool({
     name: "delegate_to_hermes",
-    arguments: {
-      instruction:
-        `Use your local terminal tool to create ${proofFile} containing exactly ${proofText} with no trailing newline, then read it back. Do not modify any other file, setting, repository, or service. Reply with exactly ${proofText}.`,
-    },
+    arguments: { instruction },
   });
   const delegatedPayload = assertToolSucceeded(
     delegated,
@@ -201,6 +214,32 @@ try {
   const contextId = delegatedPayload?.contextId;
   if (!taskId || !contextId) {
     throw new Error("delegate_to_hermes did not return both taskId and contextId");
+  }
+  if (delegatedPayload?.deduplicated !== false) {
+    throw new Error("First delegate_to_hermes call must report deduplicated=false");
+  }
+
+  const duplicate = await client.callTool({
+    name: "delegate_to_hermes",
+    arguments: { instruction },
+  });
+  const duplicatePayload = assertToolSucceeded(
+    duplicate,
+    "delegate_to_hermes duplicate",
+  );
+  summary.duplicateDelegate = resultSummary(duplicate);
+  summary.dedupSameTask =
+    duplicatePayload?.taskId === taskId &&
+    duplicatePayload?.contextId === contextId;
+
+  if (duplicatePayload?.deduplicated !== true) {
+    throw new Error("Second identical delegate_to_hermes call was not deduplicated");
+  }
+  if (summary.dedupSameTask !== true) {
+    throw new Error("Deduplicated delegation did not reuse the original task/context");
+  }
+  if (duplicatePayload?.duplicateOfTraceId !== delegatedPayload?.traceId) {
+    throw new Error("Deduplicated delegation did not point to the original traceId");
   }
 
   const task = await client.callTool({
@@ -239,6 +278,64 @@ try {
       : continuedPayload.contextId === contextId;
   if (summary.continuedSameContext !== true) {
     throw new Error("continue_with_hermes did not preserve the original contextId");
+  }
+
+  const activityResult = await client.callTool({
+    name: "hermes_activity",
+    arguments: { limit: 20 },
+  });
+  const activityPayload = assertToolSucceeded(activityResult, "hermes_activity");
+  summary.activity = {
+    ok: activityPayload?.ok,
+    count: activityPayload?.count,
+    totalMatching: activityPayload?.totalMatching,
+    deduplicatedCount: activityPayload?.deduplicatedCount,
+    errorCount: activityPayload?.errorCount,
+    dedupWindowMs: activityPayload?.dedupWindowMs,
+  };
+
+  const traces = Array.isArray(activityPayload?.records)
+    ? activityPayload.records
+    : [];
+  const firstDelegateTrace = traces.find(
+    (trace) => trace.traceId === delegatedPayload.traceId,
+  );
+  const duplicateDelegateTrace = traces.find(
+    (trace) => trace.traceId === duplicatePayload.traceId,
+  );
+  if (!firstDelegateTrace || !duplicateDelegateTrace) {
+    throw new Error("hermes_activity did not expose both delegation traces");
+  }
+  if (
+    firstDelegateTrace.deduplicated !== false ||
+    duplicateDelegateTrace.deduplicated !== true
+  ) {
+    throw new Error("hermes_activity deduplication flags are incorrect");
+  }
+  for (const trace of [firstDelegateTrace, duplicateDelegateTrace]) {
+    for (const key of [
+      "traceId",
+      "startedAt",
+      "endedAt",
+      "durationMs",
+      "tool",
+      "instructionHash",
+      "instructionPreview",
+      "inputContextId",
+      "inputTaskId",
+      "outputContextId",
+      "outputTaskId",
+      "state",
+      "stateName",
+      "ok",
+      "error",
+      "deduplicated",
+      "background",
+    ]) {
+      if (!(key in trace)) {
+        throw new Error("Activity trace is missing required field: " + key);
+      }
+    }
   }
 
   summary.ok = true;
