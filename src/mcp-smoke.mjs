@@ -17,6 +17,7 @@ const proofTimeoutMs = Number(
 const expectedTools = [
   "delegate_to_hermes",
   "continue_with_hermes",
+  "list_hermes_sessions",
   "get_hermes_session",
   "continue_hermes_session",
   "get_hermes_task",
@@ -116,6 +117,7 @@ const summary = {
   ok: false,
   tools: [],
   hermesStatus: null,
+  sessionList: null,
   delegate: null,
   duplicateDelegate: null,
   dedupSameTask: null,
@@ -173,6 +175,9 @@ try {
   if (!/existing|follow-up/i.test(descriptions.continue_with_hermes) || !/contextId/i.test(descriptions.continue_with_hermes)) {
     throw new Error("continue_with_hermes description must identify existing-context follow-ups");
   }
+  if (!/sessionId/i.test(descriptions.list_hermes_sessions) || !/list|discover/i.test(descriptions.list_hermes_sessions)) {
+    throw new Error("list_hermes_sessions description must identify session discovery");
+  }
   if (!/sessionId/i.test(descriptions.get_hermes_session) || !/persisted|durable/i.test(descriptions.get_hermes_session)) {
     throw new Error("get_hermes_session description must identify durable Hermes session reads");
   }
@@ -189,6 +194,30 @@ try {
     throw new Error("hermes_status did not report reachable=true");
   }
   summary.hermesStatus = resultSummary(status);
+
+  const sessionListResult = await client.callTool({
+    name: "list_hermes_sessions",
+    arguments: { limit: 5 },
+  });
+  const sessionListPayload = assertToolSucceeded(
+    sessionListResult,
+    "list_hermes_sessions",
+  );
+  if (!Array.isArray(sessionListPayload?.sessions)) {
+    throw new Error("list_hermes_sessions did not return a sessions array");
+  }
+  for (const session of sessionListPayload.sessions) {
+    if (typeof session?.sessionId !== "string" || !session.sessionId.trim()) {
+      throw new Error("list_hermes_sessions returned a row without sessionId");
+    }
+  }
+  summary.sessionList = {
+    ok: sessionListPayload.ok,
+    count: sessionListPayload.count,
+    sessionIds: sessionListPayload.sessions
+      .slice(0, 5)
+      .map((session) => session.sessionId),
+  };
 
   const smokeSessionId =
     typeof process.env.HERMES_UX_SMOKE_SESSION_ID === "string"
