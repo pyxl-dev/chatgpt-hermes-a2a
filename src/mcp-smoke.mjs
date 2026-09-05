@@ -17,6 +17,8 @@ const proofTimeoutMs = Number(
 const expectedTools = [
   "delegate_to_hermes",
   "continue_with_hermes",
+  "get_hermes_session",
+  "continue_hermes_session",
   "get_hermes_task",
   "cancel_hermes_task",
   "hermes_status",
@@ -122,6 +124,7 @@ const summary = {
   activity: null,
   localToolProof: false,
   continuedSameContext: null,
+  nativeSessionRead: "skipped",
   waitedMs: 0,
   error: null,
 };
@@ -170,6 +173,12 @@ try {
   if (!/existing|follow-up/i.test(descriptions.continue_with_hermes) || !/contextId/i.test(descriptions.continue_with_hermes)) {
     throw new Error("continue_with_hermes description must identify existing-context follow-ups");
   }
+  if (!/sessionId/i.test(descriptions.get_hermes_session) || !/persisted|durable/i.test(descriptions.get_hermes_session)) {
+    throw new Error("get_hermes_session description must identify durable Hermes session reads");
+  }
+  if (!/sessionId/i.test(descriptions.continue_hermes_session) || !/resume|existing/i.test(descriptions.continue_hermes_session)) {
+    throw new Error("continue_hermes_session description must identify durable Hermes session resume");
+  }
 
   const status = await client.callTool({
     name: "hermes_status",
@@ -180,6 +189,30 @@ try {
     throw new Error("hermes_status did not report reachable=true");
   }
   summary.hermesStatus = resultSummary(status);
+
+  const smokeSessionId =
+    typeof process.env.HERMES_UX_SMOKE_SESSION_ID === "string"
+      ? process.env.HERMES_UX_SMOKE_SESSION_ID.trim()
+      : "";
+  if (smokeSessionId) {
+    const nativeRead = await client.callTool({
+      name: "get_hermes_session",
+      arguments: { sessionId: smokeSessionId, limit: 5 },
+    });
+    const nativePayload = assertToolSucceeded(
+      nativeRead,
+      "get_hermes_session",
+    );
+    if (!nativePayload?.sessionId) {
+      throw new Error("get_hermes_session did not return a sessionId");
+    }
+    summary.nativeSessionRead = {
+      ok: nativePayload.ok,
+      requestedSessionId: nativePayload.requestedSessionId,
+      sessionId: nativePayload.sessionId,
+      returnedMessageCount: nativePayload.returnedMessageCount,
+    };
+  }
 
   await fs.rm(proofFile, { force: true });
   const instruction =
@@ -325,6 +358,8 @@ try {
       "inputTaskId",
       "outputContextId",
       "outputTaskId",
+      "inputSessionId",
+      "outputSessionId",
       "state",
       "stateName",
       "ok",
