@@ -11,13 +11,16 @@ This project gives a remote ChatGPT session a path to an agent that can act on t
 5. The diagnostic script reads at most the single A2A_BEARER_TOKEN value from ~/.hermes/.env; it does not source the entire Hermes secret file.
 6. The diagnostic writes only /tmp/chatgpt-hermes-ux-proof.txt when testing Hermes tool execution.
 7. Reports and runtime logs are gitignored.
-8. `src/hermes-mcp.mjs` exposes exactly six UX tools. It does not forward the generic backend's agent-list, stream, or push-notification tools to ChatGPT.
+8. `src/hermes-mcp.mjs` exposes exactly eight UX tools. It does not forward the generic backend's agent-list, stream, or push-notification tools to ChatGPT.
 9. The wrapper redacts secret-looking fields in backend fallbacks and never logs the A2A bearer-token value.
 10. `hermes_activity` is read-only with respect to Hermes: it reads local JSONL traces without calling the A2A backend.
 11. Activity traces do not store the full instruction; they store SHA-256 plus a redacted/truncated preview.
 12. `scripts/start-bridge.sh` uses `umask 077`; the wrapper attempts to keep `.runtime/hermes-activity.jsonl` at mode `0600`.
+13. `get_hermes_session` uses Hermes' native `sessions export` with `--redact`; its temporary JSONL lives under gitignored `.runtime/` and is removed in a `finally` block after parsing.
+14. Native session commands use Node `execFile` with argument arrays, not a shell command string, so a supplied `sessionId` or instruction is not shell-interpreted by the bridge.
+15. `continue_hermes_session` resumes an existing privileged Hermes conversation and can therefore cause the same local actions that Hermes could perform in that session; treat it as an action tool, not a read-only history tool.
 
-The activity preview redaction is a safety aid, not a formal DLP boundary. Do not intentionally put secrets in Hermes instructions. The idempotence cache is process-local: it reduces accidental duplicate execution inside one bridge process, but it is not a transactional guarantee across multiple bridge processes or restarts.
+Native session exports are requested with Hermes' own secret redaction and are then passed through the bridge redaction layer before returning to ChatGPT. This is defense in depth, not a formal DLP boundary. The activity preview redaction is also only a safety aid. Do not intentionally put secrets in Hermes instructions. The idempotence cache is process-local: it reduces accidental duplicate execution inside one bridge process, but it is not a transactional guarantee across multiple bridge processes or restarts.
 
 ## OpenAI tunnel credentials
 
