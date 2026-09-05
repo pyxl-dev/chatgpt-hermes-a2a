@@ -85,6 +85,12 @@ const TOOLS = [
           description:
             "The complete task for Hermes. Include exact paths, constraints, expected result, and anything Hermes must not change.",
         },
+        background: {
+          type: "boolean",
+          description:
+            "Optional. Leave false/omit for normal interactive use so the tool waits for Hermes to finish. Set true only for intentionally long-running work; then use get_hermes_task with the returned taskId.",
+          default: false,
+        },
       },
       required: ["instruction"],
     },
@@ -108,6 +114,18 @@ const TOOLS = [
           minLength: 1,
           description: "The follow-up instruction for Hermes in that same context.",
         },
+        taskId: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Optional. Pass the previous taskId only when resuming an interrupted input-required/auth-required task. For a normal follow-up after completion, omit it and use contextId only.",
+        },
+        background: {
+          type: "boolean",
+          description:
+            "Optional. Leave false/omit for normal interactive use so the tool waits for Hermes to finish. Set true only for intentionally long-running work; then poll get_hermes_task.",
+          default: false,
+        },
       },
       required: ["contextId", "instruction"],
     },
@@ -115,7 +133,7 @@ const TOOLS = [
   {
     name: "get_hermes_task",
     description:
-      "Read the current state and available result of a Hermes task. Use this when a previous delegate or continue call returned a taskId, especially when the state was submitted or working. Pass the taskId exactly as returned; do not use this to start work.",
+      "Read the current state and available result of a Hermes task. Use this after a background delegation/continuation, or when a previous call returned submitted/working. Pass the taskId exactly as returned; do not use this to start work.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -124,6 +142,13 @@ const TOOLS = [
           type: "string",
           minLength: 1,
           description: "Opaque A2A taskId returned by Hermes.",
+        },
+        historyLength: {
+          type: "integer",
+          minimum: 0,
+          maximum: 100,
+          description:
+            "Optional number of task history messages to include. Omit unless additional context is needed.",
         },
       },
       required: ["taskId"],
@@ -163,12 +188,10 @@ let backendConnectPromise = null;
 
 function createBackendTransport() {
   const childEnv = {
+    ...process.env,
     A2A_MCP_CONFIG:
       process.env.A2A_MCP_CONFIG ||
       path.join(ROOT, ".runtime", "a2a-mcp.config.yaml"),
-    ...(process.env.A2A_BEARER_TOKEN
-      ? { A2A_BEARER_TOKEN: process.env.A2A_BEARER_TOKEN }
-      : {}),
   };
   const transport = new StdioClientTransport({
     command: BACKEND_BIN,
@@ -288,14 +311,22 @@ function decodeBackendResult(result) {
 
 async function callBackend(name, args) {
   const client = await ensureBackend();
-  const result = await client.callTool(
-    { name, arguments: args },
-    undefined,
-    {
-      timeout: BACKEND_TIMEOUT_MS,
-      maxTotalTimeout: BACKEND_TIMEOUT_MS,
-    },
-  );
+  let result;
+  try {
+    result = await client.callTool(
+      { name, arguments: args },
+      undefined,
+      {
+        timeout: BACKEND_TIMEOUT_MS,
+        maxTotalTimeout: BACKEND_TIMEOUT_MS,
+      },
+    );
+  } catch (error) {
+    if (backend === client) backend = null;
+    backendConnectPromise = null;
+    await client.close().catch(() => {});
+    throw error;
+  }
 
   if (result?.isError) {
     const decoded = decodeBackendResult(result);
@@ -340,13 +371,24 @@ function partText(part) {
   return "";
 }
 
+function cleanHermesText(value) {
+  const text = String(value || "").trim();
+  return text
+    .replace(
+      /^💭\s*\*\*Reasoning:\*\*\s*(?:\n```[\s\S]*?```\s*)?/u,
+      "",
+    )
+    .trim();
+}
+
 function messageText(message) {
   if (!message || typeof message !== "object") return "";
-  return (message.parts || message.content || [])
-    .map(partText)
-    .filter(Boolean)
-    .join("\n")
-    .trim();
+  return cleanHermesText(
+    (message.parts || message.content || [])
+      .map(partText)
+      .filter(Boolean)
+      .join("\n"),
+  );
 }
 
 function isAgentMessage(message) {
@@ -362,7 +404,9 @@ function taskText(task) {
     .flatMap((artifact) => artifact?.parts || artifact?.content || [])
     .map(partText)
     .filter(Boolean);
-  if (artifactTexts.length) return artifactTexts.join("\n").trim();
+  if (artifactTexts.length) {
+    return cleanHermesText(artifactTexts.join("\n"));
+  }
 
   const statusText = messageText(task?.status?.message || task?.status?.update);
   if (statusText) return statusText;
@@ -379,7 +423,7 @@ function taskText(task) {
     if (text) return text;
   }
 
-  return typeof task?.text === "string" ? task.text : "";
+  return typeof task?.text === "string" ? cleanHermesText(task.text) : "";
 }
 
 function stateName(state) {
@@ -457,41 +501,54 @@ function normalizeTask(value, operation) {
   };
 }
 
-function makeUserMessage(instruction, contextId) {
+function makeUserMessage(instruction, contextId, taskId) {
   return {
     messageId: randomUUID(),
     ...(contextId ? { contextId } : {}),
+    ...(taskId ? { taskId } : {}),
     role: "ROLE_USER",
     parts: [{ text: instruction }],
   };
 }
 
-async function delegate(instruction) {
+async function delegate(instruction, background = false) {
   const raw = await callBackend("a2a_send_message", {
     agent: AGENT,
     request: {
       message: makeUserMessage(instruction),
-      configuration: { returnImmediately: true },
+      ...(background
+        ? { configuration: { returnImmediately: true } }
+        : {}),
     },
   });
   return normalizeTask(raw, "delegate_to_hermes");
 }
 
-async function continueContext(contextId, instruction) {
+async function continueContext(
+  contextId,
+  instruction,
+  taskId,
+  background = false,
+) {
   const raw = await callBackend("a2a_send_message", {
     agent: AGENT,
     request: {
-      message: makeUserMessage(instruction, contextId),
-      configuration: { returnImmediately: true },
+      message: makeUserMessage(instruction, contextId, taskId),
+      ...(background
+        ? { configuration: { returnImmediately: true } }
+        : {}),
     },
   });
   return normalizeTask(raw, "continue_with_hermes");
 }
 
-async function getTask(taskId) {
+async function getTask(taskId, historyLength) {
+  const request = { id: taskId };
+  if (historyLength !== undefined) request.historyLength = historyLength;
+
   const raw = await callBackend("a2a_get_task", {
     agent: AGENT,
-    request: { id: taskId, historyLength: 20 },
+    request,
   });
   return normalizeTask(raw, "get_hermes_task");
 }
@@ -517,6 +574,7 @@ async function status() {
 
   return {
     ok: true,
+    operation: "hermes_status",
     reachable: true,
     agent: AGENT,
     name: raw?.name || null,
@@ -546,18 +604,43 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     switch (request.params.name) {
       case "delegate_to_hermes":
-        return toolText(await delegate(requireString(args, "instruction")));
+        return toolText(
+          await delegate(
+            requireString(args, "instruction"),
+            args.background === true,
+          ),
+        );
 
       case "continue_with_hermes":
         return toolText(
           await continueContext(
             requireString(args, "contextId"),
             requireString(args, "instruction"),
+            typeof args.taskId === "string" && args.taskId.trim()
+              ? args.taskId
+              : undefined,
+            args.background === true,
           ),
         );
 
-      case "get_hermes_task":
-        return toolText(await getTask(requireString(args, "taskId")));
+      case "get_hermes_task": {
+        let historyLength;
+        if (args.historyLength !== undefined) {
+          if (
+            !Number.isInteger(args.historyLength) ||
+            args.historyLength < 0 ||
+            args.historyLength > 100
+          ) {
+            throw new Error(
+              "historyLength must be an integer between 0 and 100",
+            );
+          }
+          historyLength = args.historyLength;
+        }
+        return toolText(
+          await getTask(requireString(args, "taskId"), historyLength),
+        );
+      }
 
       case "cancel_hermes_task":
         return toolText(await cancelTask(requireString(args, "taskId")));

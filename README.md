@@ -43,13 +43,13 @@ The tunnel-facing server exposes exactly these five tools. The generic `a2a_*` t
 
 | Tool | Use it when | Inputs |
 | --- | --- | --- |
-| `delegate_to_hermes` | Starting a new, independent local Hermes mission | `instruction` |
-| `continue_with_hermes` | Following up in an existing Hermes conversation | `contextId`, `instruction` |
-| `get_hermes_task` | Polling a task or retrieving its result after a previous call | `taskId` |
+| `delegate_to_hermes` | Starting a new, independent local Hermes mission | `instruction`, optional `background` |
+| `continue_with_hermes` | Following up in an existing Hermes conversation | `contextId`, `instruction`, optional `taskId`, optional `background` |
+| `get_hermes_task` | Polling a background task or retrieving its result | `taskId`, optional `historyLength` |
 | `cancel_hermes_task` | Stopping an in-flight task | `taskId` |
 | `hermes_status` | Checking whether the local `hermes` alias is reachable | no inputs |
 
-Delegation and continuation return a compact normalized response with `text` when available, `taskId`, `contextId`, `state`/`stateName`, and a safe raw fallback. `continue_with_hermes` sends the exact supplied `contextId` in the A2A `Message.contextId` field; use `delegate_to_hermes` for a new mission.
+Delegation and continuation return a compact normalized response with `text` when available, `taskId`, `contextId`, `state`/`stateName`, and a safe raw fallback. Normal calls wait for Hermes to finish; set `background: true` only for intentionally long-running work and then poll with `get_hermes_task`. `continue_with_hermes` sends the exact supplied `contextId` in the A2A `Message.contextId` field; use `delegate_to_hermes` for a new mission.
 
 ## Local verification
 
