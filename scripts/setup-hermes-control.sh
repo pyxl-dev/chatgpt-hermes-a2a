@@ -46,14 +46,14 @@ else
 fi
 
 "$HERMES_BIN" config set API_SERVER_ENABLED true >/dev/null
-"$HERMES_BIN" config set API_SERVER_HOST 127.0.0.1 >/dev/null
+"$HERMES_BIN" config set platforms.api_server.extra.host 127.0.0.1 >/dev/null
 
 PORT="$(read_env_value API_SERVER_PORT)"
 if [[ -z "$PORT" ]]; then
   PORT="$("$HERMES_BIN" config get API_SERVER_PORT 2>/dev/null || true)"
 fi
 if [[ -z "$PORT" ]]; then
-  PORT="$("$HERMES_BIN" config get gateway.api_server.port 2>/dev/null || true)"
+  PORT="$("$HERMES_BIN" config get platforms.api_server.extra.port 2>/dev/null || true)"
 fi
 if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
   PORT=8642
