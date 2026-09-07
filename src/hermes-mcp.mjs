@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { createHermesObservability } from "./hermes-observability.mjs";
 import { createHermesSessionAccess } from "./hermes-sessions.mjs";
+import { createHermesControl } from "./hermes-control.mjs";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -40,6 +41,8 @@ function redactText(value) {
     "A2A_BEARER_TOKEN",
     "CONTROL_PLANE_API_KEY",
     "OPENAI_API_KEY",
+    "API_SERVER_KEY",
+    "HERMES_API_SERVER_KEY",
   ]) {
     const secret = process.env[key];
     if (secret) text = text.split(secret).join("[REDACTED]");
@@ -78,6 +81,11 @@ const observability = createHermesObservability({
   redactText,
   redactValue,
   randomUUID,
+});
+
+const control = createHermesControl({
+  redactText,
+  redactValue,
 });
 
 const TOOLS = [
@@ -228,6 +236,85 @@ const TOOLS = [
     },
   },
   {
+    name: "start_hermes_run",
+    description:
+      "Start a CONTROLLABLE Hermes run and return immediately with a runId. Use this instead of a blocking delegation when the work may need steering or stopping. Pass sessionId to continue an existing durable Hermes conversation, or omit sessionId to start a new run.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        instruction: {
+          type: "string",
+          minLength: 1,
+          description: "The task for Hermes.",
+        },
+        sessionId: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Optional durable Hermes session ID. When present, Hermes loads that session transcript before starting the run.",
+        },
+      },
+      required: ["instruction"],
+    },
+  },
+  {
+    name: "get_hermes_run",
+    description:
+      "Read the status/result of a controllable Hermes run by runId. Use after start_hermes_run and after steering/stopping to see whether the run is running, stopping, completed, failed, cancelled, or waiting for approval.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        runId: {
+          type: "string",
+          minLength: 1,
+          description: "Hermes run ID returned by start_hermes_run.",
+        },
+      },
+      required: ["runId"],
+    },
+  },
+  {
+    name: "steer_hermes_run",
+    description:
+      "Steer a currently RUNNING Hermes run without starting a new user turn. Hermes queues the guidance into the live agent and applies it at the next tool boundary. A successful response means queued, not necessarily consumed; poll get_hermes_run afterward.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        runId: {
+          type: "string",
+          minLength: 1,
+          description: "Running Hermes run ID.",
+        },
+        instruction: {
+          type: "string",
+          minLength: 1,
+          description: "Course-correction guidance to inject into the live run.",
+        },
+      },
+      required: ["runId", "instruction"],
+    },
+  },
+  {
+    name: "stop_hermes_run",
+    description:
+      "Stop a controllable Hermes run through Hermes' native interruption mechanism. This requests a safe cooperative stop and returns immediately; poll get_hermes_run until the run settles as cancelled or another terminal state.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        runId: {
+          type: "string",
+          minLength: 1,
+          description: "Hermes run ID to stop.",
+        },
+      },
+      required: ["runId"],
+    },
+  },
+  {
     name: "get_hermes_task",
     description:
       "Read the current state and available result of a Hermes task. Use this after a background delegation/continuation, or when a previous call returned submitted/working. Pass the taskId exactly as returned; do not use this to start work.",
@@ -301,6 +388,10 @@ const TOOLS = [
             "list_hermes_sessions",
             "get_hermes_session",
             "continue_hermes_session",
+            "start_hermes_run",
+            "get_hermes_run",
+            "steer_hermes_run",
+            "stop_hermes_run",
             "get_hermes_task",
             "cancel_hermes_task",
             "hermes_status",
@@ -357,7 +448,7 @@ async function ensureBackend() {
 
   backendConnectPromise = (async () => {
     const client = new Client(
-      { name: "chatgpt-hermes-ux-backend", version: "0.4.0" },
+      { name: "chatgpt-hermes-ux-backend", version: "0.5.0" },
       { capabilities: {} },
     );
     const transport = createBackendTransport();
@@ -796,6 +887,26 @@ async function executePublicTool(name, args, traceId) {
         traceId,
       );
 
+    case "start_hermes_run":
+      return control.startRun(
+        requireString(args, "instruction"),
+        typeof args.sessionId === "string" && args.sessionId.trim()
+          ? args.sessionId
+          : null,
+      );
+
+    case "get_hermes_run":
+      return control.getRun(requireString(args, "runId"));
+
+    case "steer_hermes_run":
+      return control.steerRun(
+        requireString(args, "runId"),
+        requireString(args, "instruction"),
+      );
+
+    case "stop_hermes_run":
+      return control.stopRun(requireString(args, "runId"));
+
     case "get_hermes_task": {
       let historyLength;
       if (args.historyLength !== undefined) {
@@ -828,7 +939,7 @@ async function executePublicTool(name, args, traceId) {
 }
 
 const server = new Server(
-  { name: "hermes-mac", version: "0.5.0" },
+  { name: "hermes-mac", version: "0.6.0" },
   { capabilities: { tools: {} } },
 );
 
