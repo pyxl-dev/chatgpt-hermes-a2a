@@ -54,7 +54,7 @@ if [[ -z "${API_SERVER_PORT:-}" ]]; then
     DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_PORT 2>/dev/null || true)"
   fi
   if [[ -z "$DETECTED_API_PORT" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
-    DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get gateway.api_server.port 2>/dev/null || true)"
+    DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get platforms.api_server.extra.port 2>/dev/null || true)"
   fi
   if [[ "$DETECTED_API_PORT" =~ ^[0-9]+$ ]] &&
      (( DETECTED_API_PORT >= 1 && DETECTED_API_PORT <= 65535 )); then
