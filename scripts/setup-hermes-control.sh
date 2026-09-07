@@ -49,7 +49,15 @@ fi
 "$HERMES_BIN" config set API_SERVER_HOST 127.0.0.1 >/dev/null
 
 PORT="$(read_env_value API_SERVER_PORT)"
-PORT="${PORT:-8642}"
+if [[ -z "$PORT" ]]; then
+  PORT="$("$HERMES_BIN" config get API_SERVER_PORT 2>/dev/null || true)"
+fi
+if [[ -z "$PORT" ]]; then
+  PORT="$("$HERMES_BIN" config get gateway.api_server.port 2>/dev/null || true)"
+fi
+if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  PORT=8642
+fi
 
 echo "Restarting Hermes gateway with the control API enabled..."
 "$HERMES_BIN" gateway restart >/dev/null
@@ -71,8 +79,18 @@ fi
 
 CAPS="$(curl -fsS --max-time 5   -H "Authorization: Bearer $API_KEY"   "http://127.0.0.1:$PORT/v1/capabilities")"
 
-if [[ "$CAPS" != *'"run_submission": true'* ||
-      "$CAPS" != *'"run_stop": true'* ]]; then
+if ! printf '%s' "$CAPS" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+features = data.get("features") or {}
+endpoints = data.get("endpoints") or {}
+ok = (
+    features.get("run_submission") is True
+    and features.get("run_stop") is True
+    and (features.get("run_steer") is True or bool(endpoints.get("run_steer")))
+)
+raise SystemExit(0 if ok else 1)
+'; then
   echo "Hermes API server is reachable but required Runs API capabilities are missing." >&2
   exit 3
 fi
