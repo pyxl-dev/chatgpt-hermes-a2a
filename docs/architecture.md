@@ -15,6 +15,7 @@ src/hermes-mcp.mjs
   |\
   | \ native Hermes CLI session API
   |  \--> sessions list / sessions export --session-id / chat --resume
+  |  \--> authenticated Runs API :8642 (start/status/steer/stop)
   |
   | private MCP stdio
   v
@@ -48,7 +49,7 @@ macOS
 
 `delegate_to_hermes` is guarded before `a2a_send_message`: the normalized instruction is SHA-256 hashed and checked against a process-local cache. An identical in-flight mission shares the existing promise; a recently completed successful mission reuses its result for 60 seconds by default. Different normalized instructions produce different keys. Failed backend attempts are removed from the cache so a real retry can run. `continue_hermes_session` applies the same short-window protection with a separate key composed of `sessionId` plus normalized instruction.
 
-The public surface is therefore nine tools: five A2A task/context operations, the read-only `hermes_activity`, and three durable Hermes-session operations (`list_hermes_sessions`, `get_hermes_session`, `continue_hermes_session`).
+The public surface is therefore thirteen tools: five A2A task/context operations, the read-only `hermes_activity`, three durable Hermes-session operations (`list_hermes_sessions`, `get_hermes_session`, `continue_hermes_session`), and four controllable-run operations (`start_hermes_run`, `get_hermes_run`, `steer_hermes_run`, `stop_hermes_run`).
 
 ## Dependencies
 
@@ -59,8 +60,10 @@ The public surface is therefore nine tools: five A2A task/context operations, th
 - @modelcontextprotocol/sdk 1.30.0.
 - OpenAI tunnel-client.
 
-The wrapper uses the installed MCP SDK `Client`/`StdioClientTransport` APIs to connect to the existing `a2a-mcp` child process, then maps `delegate_to_hermes` and `continue_with_hermes` to `a2a_send_message`, task reads to `a2a_get_task`, cancellation to `a2a_cancel_task`, and status to `a2a_get_agent_card`. Separately, `list_hermes_sessions` invokes Hermes' native `sessions list` command and parses its compact table into structured discovery metadata. `get_hermes_session` shells no user text: it invokes `hermes sessions export` via Node `execFile`, parses the redacted JSONL export, and removes it; `continue_hermes_session` invokes `hermes chat -q ... -Q --resume <sessionId>` via `execFile`.
+The wrapper uses the installed MCP SDK `Client`/`StdioClientTransport` APIs to connect to the existing `a2a-mcp` child process, then maps `delegate_to_hermes` and `continue_with_hermes` to `a2a_send_message`, task reads to `a2a_get_task`, cancellation to `a2a_cancel_task`, and status to `a2a_get_agent_card`. For controllable work, `src/hermes-control.mjs` calls the Hermes gateway's loopback Runs API. `start_hermes_run` submits an asynchronous run (optionally loading a durable `sessionId`), `get_hermes_run` polls it, `steer_hermes_run` queues guidance at a live tool boundary, and `stop_hermes_run` requests Hermes' cooperative hard-interrupt path. The API remains bound to loopback and bearer-authenticated.
+
+Separately, `list_hermes_sessions` invokes Hermes' native `sessions list` command and parses its compact table into structured discovery metadata. `get_hermes_session` shells no user text: it invokes `hermes sessions export` via Node `execFile`, parses the redacted JSONL export, and removes it; `continue_hermes_session` invokes `hermes chat -q ... -Q --resume <sessionId>` via `execFile`.
 
 ## POC success criterion
 
-The local POC is considered valid only if the nine-tool UX MCP surface reaches Hermes through the private backend and A2A, and Hermes uses one of its own local tools to create the expected temporary proof file. A text-only response is not sufficient.
+The local POC is considered valid only if the thirteen-tool UX MCP surface reaches Hermes through the private backend and A2A, and Hermes uses one of its own local tools to create the expected temporary proof file. A text-only response is not sufficient.
