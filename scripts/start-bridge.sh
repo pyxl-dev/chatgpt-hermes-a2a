@@ -11,11 +11,14 @@ BIN="$ROOT/node_modules/.bin/a2a-mcp"
 mkdir -p "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
 
-# launchd does not inherit the interactive shell environment. If Hermes A2A
-# uses a bearer token, load only that single value from ~/.hermes/.env.
-if [[ -z "${A2A_BEARER_TOKEN:-}" && -f "$HOME/.hermes/.env" ]]; then
-  DETECTED_TOKEN="$(/usr/bin/awk -F= '
-    $1 ~ /^[[:space:]]*A2A_BEARER_TOKEN[[:space:]]*$/ {
+# launchd does not inherit the interactive shell environment. Read only the
+# exact Hermes values this bridge needs; never source the full Hermes .env.
+read_hermes_env_value() {
+  local key="$1"
+  local file="$HOME/.hermes/.env"
+  [[ -f "$file" ]] || return 0
+  /usr/bin/awk -F= -v wanted="$key" '
+    $1 ~ "^[[:space:]]*" wanted "[[:space:]]*$" {
       sub(/^[^=]*=/, "")
       gsub(/^[[:space:]]+|[[:space:]]+$/, "")
       if ((substr($0,1,1)=="\"" && substr($0,length($0),1)=="\"") ||
@@ -25,11 +28,31 @@ if [[ -z "${A2A_BEARER_TOKEN:-}" && -f "$HOME/.hermes/.env" ]]; then
       print
       exit
     }
-  ' "$HOME/.hermes/.env")"
-  if [[ -n "$DETECTED_TOKEN" ]]; then
-    export A2A_BEARER_TOKEN="$DETECTED_TOKEN"
+  ' "$file"
+}
+
+if [[ -z "${A2A_BEARER_TOKEN:-}" ]]; then
+  DETECTED_A2A_TOKEN="$(read_hermes_env_value A2A_BEARER_TOKEN)"
+  if [[ -n "$DETECTED_A2A_TOKEN" ]]; then
+    export A2A_BEARER_TOKEN="$DETECTED_A2A_TOKEN"
   fi
-  unset DETECTED_TOKEN
+  unset DETECTED_A2A_TOKEN
+fi
+
+if [[ -z "${API_SERVER_KEY:-}" ]]; then
+  DETECTED_API_KEY="$(read_hermes_env_value API_SERVER_KEY)"
+  if [[ -n "$DETECTED_API_KEY" ]]; then
+    export API_SERVER_KEY="$DETECTED_API_KEY"
+  fi
+  unset DETECTED_API_KEY
+fi
+
+if [[ -z "${API_SERVER_PORT:-}" ]]; then
+  DETECTED_API_PORT="$(read_hermes_env_value API_SERVER_PORT)"
+  if [[ -n "$DETECTED_API_PORT" ]]; then
+    export API_SERVER_PORT="$DETECTED_API_PORT"
+  fi
+  unset DETECTED_API_PORT
 fi
 
 if [[ ! -x "$BIN" ]]; then
