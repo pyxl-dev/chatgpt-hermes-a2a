@@ -210,6 +210,21 @@ try {
   if (statusPayload?.reachable !== true) {
     throw new Error("hermes_status did not report reachable=true");
   }
+  if (
+    statusPayload?.control?.configured === true &&
+    (
+      statusPayload.control.reachable !== true ||
+      statusPayload.control.runSubmission !== true ||
+      statusPayload.control.runStatus !== true ||
+      statusPayload.control.runSteer !== true ||
+      statusPayload.control.runStop !== true
+    )
+  ) {
+    throw new Error(
+      "Hermes control API is configured but not fully ready: " +
+        preview(statusPayload.control),
+    );
+  }
   summary.hermesStatus = resultSummary(status);
 
   const sessionListResult = await client.callTool({
