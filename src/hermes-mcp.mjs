@@ -278,7 +278,7 @@ const TOOLS = [
   {
     name: "steer_hermes_run",
     description:
-      "Steer a currently RUNNING Hermes run without starting a new user turn. Hermes queues the guidance into the live agent and applies it at the next tool boundary. A successful response means queued, not necessarily consumed; poll get_hermes_run afterward.",
+      "Steer a currently RUNNING Hermes run by its exact runId without starting a new user turn. Hermes queues the guidance into the live agent and applies it at the next tool boundary. A successful response means queued, not necessarily consumed; poll get_hermes_run afterward.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -300,7 +300,7 @@ const TOOLS = [
   {
     name: "stop_hermes_run",
     description:
-      "Stop a controllable Hermes run through Hermes' native interruption mechanism. This requests a safe cooperative stop and returns immediately; poll get_hermes_run until the run settles as cancelled or another terminal state.",
+      "Stop a controllable Hermes run by its exact runId through Hermes' native interruption mechanism. This requests a safe cooperative stop and returns immediately; poll get_hermes_run until the run settles as cancelled or another terminal state.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
