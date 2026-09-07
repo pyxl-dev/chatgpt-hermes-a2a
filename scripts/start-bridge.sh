@@ -49,10 +49,18 @@ fi
 
 if [[ -z "${API_SERVER_PORT:-}" ]]; then
   DETECTED_API_PORT="$(read_hermes_env_value API_SERVER_PORT)"
-  if [[ -n "$DETECTED_API_PORT" ]]; then
+  HERMES_BIN_FOR_CONFIG="$(command -v hermes || true)"
+  if [[ -z "$DETECTED_API_PORT" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+    DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_PORT 2>/dev/null || true)"
+  fi
+  if [[ -z "$DETECTED_API_PORT" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+    DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get gateway.api_server.port 2>/dev/null || true)"
+  fi
+  if [[ "$DETECTED_API_PORT" =~ ^[0-9]+$ ]] &&
+     (( DETECTED_API_PORT >= 1 && DETECTED_API_PORT <= 65535 )); then
     export API_SERVER_PORT="$DETECTED_API_PORT"
   fi
-  unset DETECTED_API_PORT
+  unset DETECTED_API_PORT HERMES_BIN_FOR_CONFIG
 fi
 
 if [[ ! -x "$BIN" ]]; then
