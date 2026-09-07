@@ -31,17 +31,31 @@ read_env_value() {
 
 API_KEY="$(read_env_value API_SERVER_KEY)"
 if [[ -z "$API_KEY" ]]; then
+  API_KEY="$("$HERMES_BIN" config get API_SERVER_KEY 2>/dev/null || true)"
+fi
+
+if [[ -z "$API_KEY" ]]; then
   if command -v openssl >/dev/null 2>&1; then
-    API_KEY="$(openssl rand -hex 32)"
+    GENERATED_API_KEY="$(openssl rand -hex 32)"
   else
-    API_KEY="$(python3 - <<'PY'
+    GENERATED_API_KEY="$(python3 - <<'PY'
 import secrets
 print(secrets.token_hex(32))
 PY
 )"
   fi
-  "$HERMES_BIN" config set API_SERVER_KEY "$API_KEY" >/dev/null
-  echo "Created a Hermes API server key in the active Hermes env file."
+  "$HERMES_BIN" config set API_SERVER_KEY "$GENERATED_API_KEY" >/dev/null
+
+  # Do not trust the writer's exit code alone: resolve the value back through
+  # Hermes' own config/secret precedence and fail closed if it was not retained.
+  API_KEY="$("$HERMES_BIN" config get API_SERVER_KEY 2>/dev/null || true)"
+  if [[ -z "$API_KEY" ]]; then
+    unset GENERATED_API_KEY
+    echo "Hermes did not retain API_SERVER_KEY after config set." >&2
+    exit 4
+  fi
+  unset GENERATED_API_KEY
+  echo "Created and verified a Hermes API server key."
 else
   echo "Reusing the existing Hermes API server key."
 fi
@@ -101,7 +115,7 @@ unset API_KEY CAPS
 echo "===== HERMES CONTROL API ====="
 echo "Enabled: YES"
 echo "Bind: 127.0.0.1:$PORT"
-echo "Authentication: bearer key in ~/.hermes/.env"
+echo "Authentication: bearer key resolved by Hermes config"
 echo "Run submission: READY"
 echo "Run steer/stop: READY"
 echo "===== END HERMES CONTROL API ====="
