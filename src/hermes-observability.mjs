@@ -13,6 +13,10 @@ const TOOL_PURPOSE = {
   list_hermes_sessions: "list-native-sessions",
   get_hermes_session: "read-native-session",
   continue_hermes_session: "continue-native-session",
+  start_hermes_run: "start-controllable-run",
+  get_hermes_run: "read-controllable-run",
+  steer_hermes_run: "steer-controllable-run",
+  stop_hermes_run: "stop-controllable-run",
   get_hermes_task: "read-task-state",
   cancel_hermes_task: "cancel-task",
   hermes_status: "health-check",
@@ -77,6 +81,7 @@ export function createHermesObservability({
       inputContextId:
         typeof args?.contextId === "string" ? args.contextId : null,
       inputTaskId: typeof args?.taskId === "string" ? args.taskId : null,
+      inputRunId: typeof args?.runId === "string" ? args.runId : null,
       inputSessionId:
         typeof args?.sessionId === "string" ? args.sessionId : null,
       background: args?.background === true,
@@ -102,6 +107,9 @@ export function createHermesObservability({
           : null,
       outputTaskId:
         payload && typeof payload.taskId === "string" ? payload.taskId : null,
+      inputRunId: base.inputRunId,
+      outputRunId:
+        payload && typeof payload.runId === "string" ? payload.runId : null,
       inputSessionId: base.inputSessionId,
       outputSessionId:
         payload && typeof payload.sessionId === "string"
