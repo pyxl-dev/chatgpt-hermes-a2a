@@ -58,10 +58,17 @@ fi
 
 if [[ -z "${API_SERVER_KEY:-}" ]]; then
   DETECTED_API_KEY="$(read_hermes_env_value API_SERVER_KEY)"
+  HERMES_BIN_FOR_SECRET="$(command -v hermes || true)"
+  if [[ -z "$DETECTED_API_KEY" && -n "$HERMES_BIN_FOR_SECRET" ]]; then
+    # Hermes may resolve credentials from a managed/profile secret layer even
+    # when the literal key is absent from the profile .env. Ask Hermes itself
+    # for the resolved value rather than duplicating its secret precedence.
+    DETECTED_API_KEY="$("$HERMES_BIN_FOR_SECRET" config get API_SERVER_KEY 2>/dev/null || true)"
+  fi
   if [[ -n "$DETECTED_API_KEY" ]]; then
     export API_SERVER_KEY="$DETECTED_API_KEY"
   fi
-  unset DETECTED_API_KEY
+  unset DETECTED_API_KEY HERMES_BIN_FOR_SECRET
 fi
 
 if [[ -z "${API_SERVER_PORT:-}" ]]; then
