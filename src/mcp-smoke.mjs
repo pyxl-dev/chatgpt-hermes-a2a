@@ -20,6 +20,10 @@ const expectedTools = [
   "list_hermes_sessions",
   "get_hermes_session",
   "continue_hermes_session",
+  "start_hermes_run",
+  "get_hermes_run",
+  "steer_hermes_run",
+  "stop_hermes_run",
   "get_hermes_task",
   "cancel_hermes_task",
   "hermes_status",
@@ -81,6 +85,7 @@ function resultSummary(result) {
       deduplicated: payload.deduplicated,
       duplicateOfTraceId: payload.duplicateOfTraceId,
       error: payload.error,
+      control: payload.control,
     };
   }
   return preview(payload);
@@ -183,6 +188,18 @@ try {
   }
   if (!/sessionId/i.test(descriptions.continue_hermes_session) || !/resume|existing/i.test(descriptions.continue_hermes_session)) {
     throw new Error("continue_hermes_session description must identify durable Hermes session resume");
+  }
+  if (!/controll|steer|stop/i.test(descriptions.start_hermes_run) || !/runId/i.test(descriptions.start_hermes_run)) {
+    throw new Error("start_hermes_run description must explain controllable runs and runId");
+  }
+  if (!/runId/i.test(descriptions.get_hermes_run)) {
+    throw new Error("get_hermes_run description must identify runId");
+  }
+  if (!/steer/i.test(descriptions.steer_hermes_run) || !/runId/i.test(descriptions.steer_hermes_run)) {
+    throw new Error("steer_hermes_run description must identify live-run steering");
+  }
+  if (!/stop/i.test(descriptions.stop_hermes_run) || !/runId/i.test(descriptions.stop_hermes_run)) {
+    throw new Error("stop_hermes_run description must identify live-run stopping");
   }
 
   const status = await client.callTool({
@@ -385,8 +402,10 @@ try {
       "instructionPreview",
       "inputContextId",
       "inputTaskId",
+      "inputRunId",
       "outputContextId",
       "outputTaskId",
+      "outputRunId",
       "inputSessionId",
       "outputSessionId",
       "state",
