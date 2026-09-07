@@ -96,7 +96,10 @@ After Hermes A2A is available on `127.0.0.1:9900`, run:
 ~~~bash
 npm run check
 npm run smoke
+npm run smoke:control
 ~~~
+
+`npm run smoke:control` is a separate opt-in functional test: it starts a harmless controllable run, waits for `running`, injects steer guidance, requests stop, and requires the run to settle as `cancelled`. The ordinary smoke does not start a control run.
 
 The smoke test initializes MCP, asserts that `tools/list` contains exactly the thirteen names above, checks `hermes_status`, exercises the read-only `list_hermes_sessions` path, delegates a benign task that creates `/tmp/chatgpt-hermes-ux-proof.txt` with exactly `HERMES_UX_OK`, immediately repeats the exact delegation and verifies reuse of the same `taskId`/`contextId` with `deduplicated: true`, polls it, continues the same `contextId`, and verifies the trace records through `hermes_activity`. To non-destructively exercise native session reading against a known session, run `HERMES_UX_SMOKE_SESSION_ID=<sessionId> npm run smoke`; the smoke reads at most five visible messages and never resumes/modifies that session.
 
