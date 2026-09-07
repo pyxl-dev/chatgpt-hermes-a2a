@@ -827,6 +827,23 @@ async function status() {
   const supportedInterface =
     raw?.supportedInterfaces?.[0] || raw?.interfaces?.[0] || {};
 
+  let controlStatus = { configured: control.configured, reachable: false };
+  if (control.configured) {
+    try {
+      controlStatus = {
+        configured: true,
+        reachable: true,
+        ...(await control.status()),
+      };
+    } catch (error) {
+      controlStatus = {
+        configured: true,
+        reachable: false,
+        error: { message: errorMessage(error) },
+      };
+    }
+  }
+
   return {
     ok: true,
     operation: "hermes_status",
@@ -841,6 +858,7 @@ async function status() {
     url: supportedInterface.url || raw?.url || null,
     capabilities: raw?.capabilities || {},
     skillsCount: Array.isArray(raw?.skills) ? raw.skills.length : null,
+    control: controlStatus,
   };
 }
 
