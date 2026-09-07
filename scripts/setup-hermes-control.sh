@@ -8,8 +8,9 @@ if [[ -z "$HERMES_BIN" ]]; then
   exit 1
 fi
 
-ENV_FILE="$HOME/.hermes/.env"
-mkdir -p "$HOME/.hermes"
+ENV_FILE="$("$HERMES_BIN" config env-path 2>/dev/null || true)"
+ENV_FILE="${ENV_FILE:-$HOME/.hermes/.env}"
+mkdir -p "$(dirname "$ENV_FILE")"
 
 read_env_value() {
   local key="$1"
@@ -40,7 +41,7 @@ PY
 )"
   fi
   "$HERMES_BIN" config set API_SERVER_KEY "$API_KEY" >/dev/null
-  echo "Created a Hermes API server key in ~/.hermes/.env."
+  echo "Created a Hermes API server key in the active Hermes env file."
 else
   echo "Reusing the existing Hermes API server key."
 fi
