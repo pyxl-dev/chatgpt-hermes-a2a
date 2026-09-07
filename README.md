@@ -87,7 +87,7 @@ The steer/stop tools use Hermes' authenticated loopback Runs API. Configure it o
 bash scripts/setup-hermes-control.sh
 ~~~
 
-The setup reuses an existing `API_SERVER_KEY` when present or generates one through `hermes config set`, which stores the secret in `~/.hermes/.env`. It forces the API bind to `127.0.0.1`, restarts the Hermes gateway, and verifies Runs API capabilities. `scripts/start-bridge.sh` reads only the exact API key/port values it needs; it never sources the full Hermes environment file.
+The setup resolves the active Hermes profile through `hermes config env-path`, reuses an existing `API_SERVER_KEY` when present or generates one through `hermes config set`, and stores the secret in that profile's env file. It forces the API bind to `127.0.0.1`, restarts the Hermes gateway, and verifies Runs API capabilities. `scripts/start-bridge.sh` resolves the same env path and reads only the exact API key/port values it needs; it never sources the full Hermes environment file.
 
 ## Local verification
 
