@@ -19,7 +19,7 @@ The runner:
 - restarts, starts, or installs the Hermes gateway service when required;
 - validates the Hermes Agent Card;
 - installs the pinned MCP-to-A2A bridge dependencies;
-- calls Hermes through the nine-tool UX MCP surface → the private generic MCP backend → A2A and asks Hermes to create a harmless proof file under /tmp;
+- calls Hermes through the thirteen-tool UX MCP surface → the private generic MCP backend → A2A and asks Hermes to create a harmless proof file under /tmp;
 - downloads the latest official OpenAI tunnel-client for macOS when it is not already installed and verifies it against the release SHA256SUMS;
 - if CONTROL_PLANE_TUNNEL_ID and CONTROL_PLANE_API_KEY are already exported, creates/checks the stdio tunnel profile and verifies that the tunnel runtime reaches ready state;
 - prints a compact report between REPORT TO SEND BACK markers and saves it under reports/.
@@ -28,7 +28,7 @@ If the OpenAI tunnel credentials are not present, the local MCP → A2A → Herm
 
 ## Runtime entrypoints
 
-- src/hermes-mcp.mjs — public UX MCP server; it exposes exactly the nine tools listed below, adds bridge-level tracing/idempotence, and connects to the generic backend as a child process.
+- src/hermes-mcp.mjs — public UX MCP server; it exposes exactly the thirteen tools listed below, adds bridge-level tracing/idempotence, and connects to the generic backend as a child process.
 - scripts/start-bridge.sh — stdio command used by tunnel-client; it preserves runtime config/token generation and starts the UX wrapper.
 - scripts/start-tunnel.sh — foreground Secure MCP Tunnel launcher after the two OpenAI tunnel environment variables are available.
 - scripts/run-all.sh — setup, diagnostics, smoke test, and report generation.
@@ -39,7 +39,7 @@ See docs/architecture.md and docs/security.md.
 
 ## UX MCP surface
 
-The tunnel-facing server exposes exactly these nine tools. The generic `a2a_*` tools remain private behind the wrapper.
+The tunnel-facing server exposes exactly these thirteen tools. The generic `a2a_*` tools remain private behind the wrapper.
 
 | Tool | Use it when | Inputs |
 | --- | --- | --- |
@@ -47,8 +47,12 @@ The tunnel-facing server exposes exactly these nine tools. The generic `a2a_*` t
 | `continue_with_hermes` | Following up in an existing A2A conversation | `contextId`, `instruction`, optional `taskId`, optional `background` |
 | `list_hermes_sessions` | Discovering recent durable Hermes conversations and their IDs | optional `limit`, `source`, `workspace` |
 | `get_hermes_session` | Reading a durable Hermes conversation by native session ID | `sessionId`, optional `limit`, optional `includeTools` |
-| `continue_hermes_session` | Resuming a durable Hermes conversation without creating a new A2A context | `sessionId`, `instruction` |
-| `get_hermes_task` | Polling a background task or retrieving its result | `taskId`, optional `historyLength` |
+| `continue_hermes_session` | Resuming a durable Hermes conversation synchronously | `sessionId`, `instruction` |
+| `start_hermes_run` | Starting a controllable Hermes run, optionally inside an existing session | `instruction`, optional `sessionId` |
+| `get_hermes_run` | Polling a controllable Hermes run | `runId` |
+| `steer_hermes_run` | Injecting course-correction guidance into a running Hermes run | `runId`, `instruction` |
+| `stop_hermes_run` | Requesting a safe stop of a running Hermes run | `runId` |
+| `get_hermes_task` | Polling a background A2A task or retrieving its result | `taskId`, optional `historyLength` |
 | `cancel_hermes_task` | Stopping an in-flight task | `taskId` |
 | `hermes_status` | Checking whether the local `hermes` alias is reachable | no inputs |
 | `hermes_activity` | Reading recent local bridge traces without contacting Hermes | optional `limit`, `tool`, `since`, `deduplicatedOnly`, `errorsOnly` |
@@ -56,6 +60,8 @@ The tunnel-facing server exposes exactly these nine tools. The generic `a2a_*` t
 Delegation and A2A continuation return a compact normalized response with `text` when available, `taskId`, `contextId`, `state`/`stateName`, and a safe raw fallback. Normal A2A calls wait for Hermes to finish; set `background: true` only for intentionally long-running work and then poll with `get_hermes_task`. `continue_with_hermes` sends the exact supplied `contextId` in the A2A `Message.contextId` field; use `delegate_to_hermes` for a new mission.
 
 For durable Hermes conversations, use `list_hermes_sessions` to discover likely sessions first, then `get_hermes_session` and `continue_hermes_session` with the Hermes `sessionId` (for example `20260905_053252_4248284e`). These tools bypass A2A conversation creation. Session discovery uses Hermes' documented `sessions list` surface and returns compact structured metadata (title/preview, workspace, last activity, source when available, and session ID) without asking the model. It accepts Hermes-native `source` and `workspace` filters. Session reads use Hermes' documented `sessions export --session-id ... --format jsonl --redact` surface, filter out system messages and tool results by default, and delete the temporary export after parsing. Session continuation uses Hermes' documented one-shot resume path (`hermes chat ... --resume <sessionId>`) so Hermes reloads its persisted transcript directly.
+
+For work that may need intervention while it is running, use `start_hermes_run` instead. It uses Hermes' native Runs API and returns a `runId` immediately. The bridge can then poll with `get_hermes_run`, inject guidance with `steer_hermes_run`, or request a cooperative interrupt with `stop_hermes_run`. Steering is queued into the live agent at its next tool boundary; stopping asks Hermes itself to interrupt the active run rather than merely marking an A2A task cancelled.
 
 ## Observability and idempotence
 
@@ -73,6 +79,16 @@ The default completed-result window is 60 seconds (`HERMES_DEDUP_WINDOW_MS=60000
 
 The deduplication caches are process-local and clear on bridge restart; JSONL activity history remains on disk. The log path can be overridden with `HERMES_ACTIVITY_LOG=/absolute/path/hermes-activity.jsonl`.
 
+## Enable controllable runs
+
+The steer/stop tools use Hermes' authenticated loopback Runs API. Configure it once:
+
+~~~bash
+bash scripts/setup-hermes-control.sh
+~~~
+
+The setup reuses an existing `API_SERVER_KEY` when present or generates one through `hermes config set`, which stores the secret in `~/.hermes/.env`. It forces the API bind to `127.0.0.1`, restarts the Hermes gateway, and verifies Runs API capabilities. `scripts/start-bridge.sh` reads only the exact API key/port values it needs; it never sources the full Hermes environment file.
+
 ## Local verification
 
 After Hermes A2A is available on `127.0.0.1:9900`, run:
@@ -82,7 +98,7 @@ npm run check
 npm run smoke
 ~~~
 
-The smoke test initializes MCP, asserts that `tools/list` contains exactly the nine names above, checks `hermes_status`, exercises the read-only `list_hermes_sessions` path, delegates a benign task that creates `/tmp/chatgpt-hermes-ux-proof.txt` with exactly `HERMES_UX_OK`, immediately repeats the exact delegation and verifies reuse of the same `taskId`/`contextId` with `deduplicated: true`, polls it, continues the same `contextId`, and verifies the trace records through `hermes_activity`. To non-destructively exercise native session reading against a known session, run `HERMES_UX_SMOKE_SESSION_ID=<sessionId> npm run smoke`; the smoke reads at most five visible messages and never resumes/modifies that session.
+The smoke test initializes MCP, asserts that `tools/list` contains exactly the thirteen names above, checks `hermes_status`, exercises the read-only `list_hermes_sessions` path, delegates a benign task that creates `/tmp/chatgpt-hermes-ux-proof.txt` with exactly `HERMES_UX_OK`, immediately repeats the exact delegation and verifies reuse of the same `taskId`/`contextId` with `deduplicated: true`, polls it, continues the same `contextId`, and verifies the trace records through `hermes_activity`. To non-destructively exercise native session reading against a known session, run `HERMES_UX_SMOKE_SESSION_ID=<sessionId> npm run smoke`; the smoke reads at most five visible messages and never resumes/modifies that session.
 
 
 ## After the local diagnostic passes
