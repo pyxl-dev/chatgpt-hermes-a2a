@@ -92,7 +92,7 @@ const TOOLS = [
   {
     name: "delegate_to_hermes",
     description:
-      "Start a NEW local mission on the user's Mac through Hermes. Use this for a first request to inspect or act on local files, apps, terminal, browser, code, or other Mac resources. The instruction is sent to the Hermes agent loop, not executed by this MCP wrapper. For a follow-up to an existing mission, use continue_with_hermes with the exact contextId returned here instead of starting a new context.",
+      "Start a NEW local mission on the user's Mac through Hermes over A2A. Use this for ordinary short requests. The instruction is sent to the Hermes agent loop, not executed by this MCP wrapper. For a follow-up to an existing A2A mission, use continue_with_hermes with the exact contextId returned here. If the work may need live steering or a true agent stop, use start_hermes_run instead.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -341,7 +341,7 @@ const TOOLS = [
   {
     name: "cancel_hermes_task",
     description:
-      "Request cancellation of a Hermes task that is still running. Use only when the user asks to stop the task or continuing it is undesirable. Pass the taskId exactly as returned by Hermes.",
+      "Cancel an A2A task envelope that is still running. This resolves/cancels the A2A task but does NOT guarantee interruption of Hermes' underlying agent computation. For a true live agent stop, use start_hermes_run and stop_hermes_run. Pass the taskId exactly as returned by Hermes.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
