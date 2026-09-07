@@ -53,7 +53,7 @@ The tunnel-facing server exposes exactly these thirteen tools. The generic `a2a_
 | `steer_hermes_run` | Injecting course-correction guidance into a running Hermes run | `runId`, `instruction` |
 | `stop_hermes_run` | Requesting a safe stop of a running Hermes run | `runId` |
 | `get_hermes_task` | Polling a background A2A task or retrieving its result | `taskId`, optional `historyLength` |
-| `cancel_hermes_task` | Stopping an in-flight task | `taskId` |
+| `cancel_hermes_task` | Cancelling an A2A task envelope (not a guaranteed agent interrupt) | `taskId` |
 | `hermes_status` | Checking whether the local `hermes` alias is reachable | no inputs |
 | `hermes_activity` | Reading recent local bridge traces without contacting Hermes | optional `limit`, `tool`, `since`, `deduplicatedOnly`, `errorsOnly` |
 
