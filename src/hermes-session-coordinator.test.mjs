@@ -153,6 +153,34 @@ test("rejects a different A2A context for the same ChatGPT conversation", async 
   );
 });
 
+test("delegate follows an already-bound native Hermes route", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const native = await coordinator.begin(scope, {
+    mode: "continue-session",
+    tool: "continue_hermes_session",
+    traceId: "trace-native",
+    instruction: "resume native",
+    requestedSessionId: "native-1",
+  });
+  await coordinator.complete(scope, native.operationId, {
+    payload: { ok: true, sessionId: "native-1" },
+    traceId: "trace-native",
+    sessionId: "native-1",
+  });
+
+  const delegated = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-delegate",
+    instruction: "ordinary follow up",
+  });
+  assert.equal(delegated.canonicalRoute, "native");
+  assert.equal(delegated.sessionIdToUse, "native-1");
+  assert.equal(delegated.contextIdToUse, null);
+});
+
 test("prevents mixing A2A and native Hermes routes in one ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
