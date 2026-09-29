@@ -37,6 +37,7 @@ function activeSummary(active) {
     sessionId: active.sessionId || null,
     taskId: active.taskId || null,
     runId: active.runId || null,
+    stateName: active.stateName || null,
   };
 }
 
@@ -193,6 +194,7 @@ export function createHermesSessionCoordinator({
       instruction,
       requestedContextId = null,
       requestedSessionId = null,
+      requestedTaskId = null,
       reconcileActive = null,
     },
   ) {
@@ -237,7 +239,13 @@ export function createHermesSessionCoordinator({
         }
       }
 
-      if (record.active) {
+      const resumableTask =
+        record.active?.kind === "a2a-task" &&
+        requestedTaskId &&
+        record.active.taskId === requestedTaskId &&
+        ["input-required", "auth-required"].includes(record.active.stateName);
+
+      if (record.active && !resumableTask) {
         if (changed) {
           record.updatedAt = new Date().toISOString();
           await persist();
@@ -250,6 +258,11 @@ export function createHermesSessionCoordinator({
             active: activeSummary(record.active),
           },
         );
+      }
+
+      if (resumableTask) {
+        record.active = null;
+        changed = true;
       }
 
       const targetRoute =
@@ -355,8 +368,9 @@ export function createHermesSessionCoordinator({
           requestedContextId || record.canonicalContextId || null,
         sessionId:
           requestedSessionId || record.canonicalSessionId || null,
-        taskId: null,
+        taskId: requestedTaskId || null,
         runId: null,
+        stateName: null,
         fingerprint,
       };
       record.updatedAt = new Date().toISOString();
@@ -389,6 +403,7 @@ export function createHermesSessionCoordinator({
       runId = null,
       keepActive = false,
       activeKind = null,
+      activeStateName = null,
     } = {},
   ) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
@@ -454,17 +469,19 @@ export function createHermesSessionCoordinator({
           sessionId: sessionId || active.sessionId || null,
           taskId: taskId || active.taskId || null,
           runId: runId || active.runId || null,
+          stateName: activeStateName || active.stateName || null,
         };
       } else {
         record.active = null;
-        if (active.fingerprint && payload) {
-          recentResults.set(scope.sessionHash, {
-            fingerprint: active.fingerprint,
-            settledAtMs: Date.now(),
-            traceId: traceId || active.traceId || null,
-            payload,
-          });
-        }
+      }
+
+      if (active.fingerprint && payload) {
+        recentResults.set(scope.sessionHash, {
+          fingerprint: active.fingerprint,
+          settledAtMs: Date.now(),
+          traceId: traceId || active.traceId || null,
+          payload,
+        });
       }
       record.updatedAt = new Date().toISOString();
       await persist();
