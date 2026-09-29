@@ -23,8 +23,11 @@ This project gives a remote ChatGPT session a path to an agent that can act on t
 17. Controllable runs use Hermes' authenticated API server on loopback only. `scripts/setup-hermes-control.sh` sets `API_SERVER_HOST=127.0.0.1` and never prints the bearer key.
 18. `scripts/start-bridge.sh` reads only the exact `API_SERVER_KEY` secret from `~/.hermes/.env`. For the non-secret API port it checks the exact env value first, then Hermes' resolved config via `hermes config get`; it never sources the full Hermes environment. The key is redacted from wrapper errors/results and is never written to the repository or activity log.
 19. `steer_hermes_run` can change live agent behavior and `stop_hermes_run` can interrupt active local work. Both require an exact `runId` created under the same authenticated Hermes API profile.
+20. ChatGPT's `_meta["openai/session"]` value is treated only as a correlation key, never as an authorization credential. The raw value is SHA-256 hashed immediately and is not persisted or written to activity traces.
+21. Session-coordination state is stored under gitignored `.runtime/chatgpt-session-coordinator.json` with restrictive permissions. It contains hashed ChatGPT session keys plus canonical Hermes context/session identifiers and active-operation metadata.
+22. For ChatGPT-scoped calls the wrapper enforces one canonical Hermes route and one mutating operation at a time, and disables background A2A delegation in favor of controllable Runs API work.
 
-Native session exports are requested with Hermes' own secret redaction and are then passed through the bridge redaction layer before returning to ChatGPT. This is defense in depth, not a formal DLP boundary. The activity preview redaction is also only a safety aid. Do not intentionally put secrets in Hermes instructions. The idempotence cache is process-local: it reduces accidental duplicate execution inside one bridge process, but it is not a transactional guarantee across multiple bridge processes or restarts.
+Native session exports are requested with Hermes' own secret redaction and are then passed through the bridge redaction layer before returning to ChatGPT. This is defense in depth, not a formal DLP boundary. The activity preview redaction is also only a safety aid. Do not intentionally put secrets in Hermes instructions. Exact-instruction result caches remain process-local, while canonical route and active-operation coordination are persisted across bridge restarts.
 
 ## OpenAI tunnel credentials
 
