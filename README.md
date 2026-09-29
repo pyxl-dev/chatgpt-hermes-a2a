@@ -201,9 +201,20 @@ The full instruction is not written to the activity log. `.runtime/` is gitignor
 
 `hermes_activity` reads this log directly and does not contact Hermes.
 
-`delegate_to_hermes` deduplicates an identical normalized mission while it is in flight and for 60 seconds after a successful result by default. `continue_hermes_session` has equivalent short-window protection scoped to the native Hermes session ID.
+For ChatGPT calls, the wrapper now uses `_meta["openai/session"]` as a conversation scope. The raw OpenAI session value is SHA-256 hashed immediately; only the hash is stored in local coordination state and activity traces.
 
-This protects against accidental repeated tool calls from ChatGPT. Failed backend attempts are removed from the cache so a real retry can execute.
+The first mutating Hermes call in a ChatGPT conversation binds that conversation to one canonical route:
+
+- **A2A route** — `delegate_to_hermes` creates the first context, then later `delegate_to_hermes` calls automatically continue the same canonical `contextId`.
+- **Native-session route** — `continue_hermes_session` or `start_hermes_run` binds the conversation to a durable Hermes session. Later controllable runs reuse that session when Hermes returned a `sessionId`.
+
+A ChatGPT conversation may have only one mutating Hermes operation active at a time. A second instruction is rejected before it reaches Hermes instead of being queued or launched in parallel. Switching between A2A and native-session routes is also rejected because it would create a second Hermes conversation.
+
+ChatGPT-scoped A2A background delegation is disabled; intentionally asynchronous work should use `start_hermes_run`, whose `runId` can be polled, steered and stopped. Active run/task state and canonical routing are persisted under `.runtime/chatgpt-session-coordinator.json`, so the bridge can reconcile work after a restart.
+
+Exact-instruction deduplication remains as a second line of defense for 60 seconds by default, but is now scoped by ChatGPT session so two unrelated ChatGPT conversations can never share a cached A2A context merely because their instructions are identical. Failed backend attempts are removed from the cache so a genuine retry can execute.
+
+Clients that do not send `openai/session` keep the legacy behavior and are not forced into ChatGPT session coordination.
 
 ## Enable controllable runs
 
