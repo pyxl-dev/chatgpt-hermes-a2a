@@ -68,7 +68,7 @@ export function createHermesObservability({
       : safe;
   }
 
-  function beginTrace(tool, args) {
+  function beginTrace(tool, args, metadata = {}) {
     const startedAtMs = Date.now();
     return {
       traceId: randomUUID(),
@@ -76,6 +76,10 @@ export function createHermesObservability({
       startedAtMs,
       tool,
       purpose: TOOL_PURPOSE[tool] || "unknown",
+      chatgptSessionHash:
+        typeof metadata?.chatgptSessionHash === "string"
+          ? metadata.chatgptSessionHash
+          : null,
       instructionHash: instructionHash(args?.instruction),
       instructionPreview: instructionPreview(args?.instruction),
       inputContextId:
@@ -97,6 +101,7 @@ export function createHermesObservability({
       durationMs: Math.max(0, endedAtMs - base.startedAtMs),
       tool: base.tool,
       purpose: base.purpose,
+      chatgptSessionHash: base.chatgptSessionHash || null,
       instructionHash: base.instructionHash,
       instructionPreview: base.instructionPreview,
       inputContextId: base.inputContextId,
