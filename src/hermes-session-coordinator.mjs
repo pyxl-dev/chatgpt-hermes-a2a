@@ -260,11 +260,6 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      if (resumableTask) {
-        record.active = null;
-        changed = true;
-      }
-
       const targetRoute =
         mode === "delegate"
           ? record.canonicalRoute || "a2a"
@@ -321,6 +316,11 @@ export function createHermesSessionCoordinator({
         );
       }
 
+      if (resumableTask) {
+        record.active = null;
+        changed = true;
+      }
+
       const fingerprint =
         typeof instruction === "string" && instruction.trim()
           ? sha256(mode + "\n" + normalizeInstruction(instruction))
@@ -353,19 +353,12 @@ export function createHermesSessionCoordinator({
         };
       }
 
-      record.canonicalRoute = record.canonicalRoute || targetRoute;
-      if (requestedContextId && !record.canonicalContextId) {
-        record.canonicalContextId = requestedContextId;
-      }
-      if (requestedSessionId && !record.canonicalSessionId) {
-        record.canonicalSessionId = requestedSessionId;
-      }
-
       const operationId = randomUUID();
       record.active = {
         operationId,
         tool,
         kind: targetRoute === "a2a" ? "a2a-pending" : "native-pending",
+        route: targetRoute,
         traceId: traceId || null,
         startedAt: new Date().toISOString(),
         contextId:
@@ -384,7 +377,7 @@ export function createHermesSessionCoordinator({
         tracked: true,
         replay: false,
         operationId,
-        canonicalRoute: record.canonicalRoute,
+        canonicalRoute: record.canonicalRoute || targetRoute,
         canonicalContextId: record.canonicalContextId || null,
         canonicalSessionId: record.canonicalSessionId || null,
         contextIdToUse:
@@ -418,6 +411,25 @@ export function createHermesSessionCoordinator({
       const active = record.active;
       if (!active || active.operationId !== operationId) {
         return snapshot(scope, record);
+      }
+
+      if (
+        active.route &&
+        record.canonicalRoute &&
+        active.route !== record.canonicalRoute
+      ) {
+        record.active = null;
+        record.updatedAt = new Date().toISOString();
+        await persist();
+        throw coordinatorError(
+          "HERMES_ROUTE_DRIFT",
+          "Hermes operation completed through a different route than the canonical route for this ChatGPT conversation.",
+          {
+            sessionHash: scope.sessionHash,
+            canonicalRoute: record.canonicalRoute,
+            returnedRoute: active.route,
+          },
+        );
       }
 
       if (
@@ -458,6 +470,9 @@ export function createHermesSessionCoordinator({
         );
       }
 
+      if (active.route && !record.canonicalRoute) {
+        record.canonicalRoute = active.route;
+      }
       if (contextId && !record.canonicalContextId) {
         record.canonicalContextId = contextId;
       }
