@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createHermesObservability } from "./hermes-observability.mjs";
 import { createHermesSessionAccess } from "./hermes-sessions.mjs";
 import { createHermesControl } from "./hermes-control.mjs";
+import { createHermesSessionCoordinator } from "./hermes-session-coordinator.mjs";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -76,6 +77,21 @@ function errorMessage(error) {
   return redactText(error instanceof Error ? error.message : String(error));
 }
 
+function publicError(error) {
+  return {
+    message: errorMessage(error),
+    ...(typeof error?.code === "string" ? { code: error.code } : {}),
+    ...(error?.details ? { details: redactValue(error.details) } : {}),
+  };
+}
+
+function codedError(code, message, details = null) {
+  const error = new Error(message);
+  error.code = code;
+  if (details) error.details = details;
+  return error;
+}
+
 const observability = createHermesObservability({
   root: ROOT,
   redactText,
@@ -88,11 +104,16 @@ const control = createHermesControl({
   redactValue,
 });
 
+const sessionCoordinator = createHermesSessionCoordinator({
+  root: ROOT,
+  randomUUID,
+});
+
 const TOOLS = [
   {
     name: "delegate_to_hermes",
     description:
-      "Start a NEW local mission on the user's Mac through Hermes over A2A. Use this for ordinary short requests. The instruction is sent to the Hermes agent loop, not executed by this MCP wrapper. For a follow-up to an existing A2A mission, use continue_with_hermes with the exact contextId returned here. If the work may need live steering or a true agent stop, use start_hermes_run instead.",
+      "Run ordinary Hermes work for this ChatGPT conversation. The first call creates the canonical A2A context; later calls from the same ChatGPT conversation automatically continue that exact context instead of starting a second Hermes conversation. Do not use background mode from ChatGPT; use start_hermes_run when live steering or stopping is required.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -106,7 +127,7 @@ const TOOLS = [
         background: {
           type: "boolean",
           description:
-            "Optional. Leave false/omit for normal interactive use so the tool waits for Hermes to finish. Set true only for intentionally long-running work; then use get_hermes_task with the returned taskId.",
+            "Optional legacy/local-client mode. ChatGPT-scoped calls must leave this false/omit so one conversation cannot leave an uncontrolled A2A job running in parallel. Use start_hermes_run for long controllable work.",
           default: false,
         },
       },
@@ -116,7 +137,7 @@ const TOOLS = [
   {
     name: "continue_with_hermes",
     description:
-      "Continue an EXISTING Hermes mission in the same A2A conversation. Use only with a contextId previously returned by delegate_to_hermes or this tool; reuse that opaque value exactly so Hermes retains the prior context. Do not invent a contextId and do not use this for a new unrelated mission.",
+      "Explicitly continue the canonical A2A Hermes context for this ChatGPT conversation. The wrapper rejects a different contextId and rejects parallel work. Ordinary follow-ups can use delegate_to_hermes, which automatically reuses the canonical context.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -141,7 +162,7 @@ const TOOLS = [
         background: {
           type: "boolean",
           description:
-            "Optional. Leave false/omit for normal interactive use so the tool waits for Hermes to finish. Set true only for intentionally long-running work; then poll get_hermes_task.",
+            "Optional legacy/local-client mode. ChatGPT-scoped calls must leave this false/omit; use start_hermes_run for asynchronous work that must remain steerable/stoppable.",
           default: false,
         },
       },
@@ -214,7 +235,7 @@ const TOOLS = [
   {
     name: "continue_hermes_session",
     description:
-      "Continue a persisted Hermes conversation directly by its durable Hermes sessionId. This resumes the existing Hermes session with its stored transcript; it does not create a new A2A conversation. Use this when the user provides a Hermes session ID or when get_hermes_session returned one.",
+      "Continue a persisted Hermes conversation by durable sessionId. For a ChatGPT conversation this establishes the canonical native-session route; the wrapper then rejects switching to a separate A2A conversation or to a different durable session.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -238,7 +259,7 @@ const TOOLS = [
   {
     name: "start_hermes_run",
     description:
-      "Start a CONTROLLABLE Hermes run and return immediately with a runId. Use this instead of a blocking delegation when the work may need steering or stopping. Pass sessionId to continue an existing durable Hermes conversation, or omit sessionId to start a new run.",
+      "Start the single CONTROLLABLE Hermes run allowed for this ChatGPT conversation and return a runId. The wrapper blocks concurrent runs, reuses the canonical durable session when known, and rejects switching from an existing A2A route because that would create a second Hermes conversation.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -501,7 +522,7 @@ function toolError(
     ...(traceId ? { traceId } : {}),
     ...(operation === "hermes_status" ? { reachable: false } : {}),
     ...metadata,
-    error: { message: errorMessage(error) },
+    error: publicError(error),
   };
   return {
     isError: true,
@@ -862,24 +883,170 @@ async function status() {
   };
 }
 
-async function executePublicTool(name, args, traceId) {
-  switch (name) {
-    case "delegate_to_hermes":
-      return delegate(
-        requireString(args, "instruction"),
-        args.background === true,
-        traceId,
-      );
+const TERMINAL_TASK_STATES = new Set([
+  "completed",
+  "failed",
+  "canceled",
+  "rejected",
+]);
+const TERMINAL_RUN_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "canceled",
+  "interrupted",
+  "rejected",
+]);
 
-    case "continue_with_hermes":
-      return continueContext(
-        requireString(args, "contextId"),
-        requireString(args, "instruction"),
+function taskIsTerminal(result) {
+  if (result?.kind === "message") return true;
+  return TERMINAL_TASK_STATES.has(result?.stateName);
+}
+
+function runIsTerminal(result) {
+  return TERMINAL_RUN_STATUSES.has(
+    String(result?.status || "").toLowerCase(),
+  );
+}
+
+function rejectScopedBackground(sessionScope, background) {
+  if (sessionScope?.tracked && background === true) {
+    throw codedError(
+      "HERMES_SCOPED_BACKGROUND_DISABLED",
+      "Background A2A delegation is disabled for ChatGPT-scoped calls because it can leave an uncontrolled Hermes job running in parallel. Use start_hermes_run instead.",
+      { sessionHash: sessionScope.sessionHash },
+    );
+  }
+}
+
+async function reconcileCoordinatorActive(active) {
+  if (active?.kind === "run" && active.runId) {
+    const result = await control.getRun(active.runId);
+    return {
+      terminal: runIsTerminal(result),
+      sessionId: result.sessionId || active.sessionId || null,
+    };
+  }
+  if (active?.kind === "a2a-task" && active.taskId) {
+    const result = await getTask(active.taskId);
+    return {
+      terminal: taskIsTerminal(result),
+      contextId: result.contextId || active.contextId || null,
+    };
+  }
+  return { terminal: false };
+}
+
+async function completeA2AOperation(
+  sessionScope,
+  lease,
+  result,
+  traceId,
+) {
+  const keepActive = !taskIsTerminal(result);
+  await sessionCoordinator.complete(sessionScope, lease.operationId, {
+    payload: result,
+    traceId,
+    contextId: result.contextId || lease.contextIdToUse || null,
+    taskId: result.taskId || null,
+    keepActive,
+    activeKind: keepActive ? "a2a-task" : null,
+    activeStateName: keepActive ? result.stateName || null : null,
+  });
+  return result;
+}
+
+async function executePublicTool(
+  name,
+  args,
+  traceId,
+  sessionScope,
+) {
+  switch (name) {
+    case "delegate_to_hermes": {
+      const instruction = requireString(args, "instruction");
+      rejectScopedBackground(sessionScope, args.background === true);
+
+      const lease = await sessionCoordinator.begin(sessionScope, {
+        mode: "delegate",
+        tool: name,
+        traceId,
+        instruction,
+        reconcileActive: reconcileCoordinatorActive,
+      });
+      if (lease.replay) return lease.replayPayload;
+
+      try {
+        let result;
+        if (lease.contextIdToUse) {
+          result = await continueContext(
+            lease.contextIdToUse,
+            instruction,
+            undefined,
+            false,
+          );
+          result = {
+            ...result,
+            operation: "delegate_to_hermes",
+            continuedCanonicalContext: true,
+          };
+        } else {
+          result = await delegate(
+            instruction,
+            args.background === true,
+            traceId,
+          );
+        }
+        return await completeA2AOperation(
+          sessionScope,
+          lease,
+          result,
+          traceId,
+        );
+      } catch (error) {
+        await sessionCoordinator.fail(sessionScope, lease.operationId);
+        throw error;
+      }
+    }
+
+    case "continue_with_hermes": {
+      const contextId = requireString(args, "contextId");
+      const instruction = requireString(args, "instruction");
+      const taskId =
         typeof args.taskId === "string" && args.taskId.trim()
           ? args.taskId
-          : undefined,
-        args.background === true,
-      );
+          : undefined;
+      rejectScopedBackground(sessionScope, args.background === true);
+
+      const lease = await sessionCoordinator.begin(sessionScope, {
+        mode: "continue-context",
+        tool: name,
+        traceId,
+        instruction,
+        requestedContextId: contextId,
+        requestedTaskId: taskId || null,
+        reconcileActive: reconcileCoordinatorActive,
+      });
+      if (lease.replay) return lease.replayPayload;
+
+      try {
+        const result = await continueContext(
+          lease.contextIdToUse || contextId,
+          instruction,
+          taskId,
+          args.background === true,
+        );
+        return await completeA2AOperation(
+          sessionScope,
+          lease,
+          result,
+          traceId,
+        );
+      } catch (error) {
+        await sessionCoordinator.fail(sessionScope, lease.operationId);
+        throw error;
+      }
+    }
 
     case "list_hermes_sessions":
       return sessionAccess.listSessions({
@@ -898,32 +1065,115 @@ async function executePublicTool(name, args, traceId) {
       });
     }
 
-    case "continue_hermes_session":
-      return continueNativeSession(
-        requireString(args, "sessionId"),
-        requireString(args, "instruction"),
+    case "continue_hermes_session": {
+      const sessionId = requireString(args, "sessionId");
+      const instruction = requireString(args, "instruction");
+      const lease = await sessionCoordinator.begin(sessionScope, {
+        mode: "continue-session",
+        tool: name,
         traceId,
-      );
+        instruction,
+        requestedSessionId: sessionId,
+        reconcileActive: reconcileCoordinatorActive,
+      });
+      if (lease.replay) return lease.replayPayload;
 
-    case "start_hermes_run":
-      return control.startRun(
-        requireString(args, "instruction"),
+      try {
+        const result = await continueNativeSession(
+          lease.sessionIdToUse || sessionId,
+          instruction,
+          traceId,
+        );
+        await sessionCoordinator.complete(
+          sessionScope,
+          lease.operationId,
+          {
+            payload: result,
+            traceId,
+            sessionId: result.sessionId || lease.sessionIdToUse || sessionId,
+          },
+        );
+        return result;
+      } catch (error) {
+        await sessionCoordinator.fail(sessionScope, lease.operationId);
+        throw error;
+      }
+    }
+
+    case "start_hermes_run": {
+      const instruction = requireString(args, "instruction");
+      const requestedSessionId =
         typeof args.sessionId === "string" && args.sessionId.trim()
           ? args.sessionId
-          : null,
-      );
+          : null;
+      const lease = await sessionCoordinator.begin(sessionScope, {
+        mode: "start-run",
+        tool: name,
+        traceId,
+        instruction,
+        requestedSessionId,
+        reconcileActive: reconcileCoordinatorActive,
+      });
+      if (lease.replay) return lease.replayPayload;
 
-    case "get_hermes_run":
-      return control.getRun(requireString(args, "runId"));
+      try {
+        const result = await control.startRun(
+          instruction,
+          lease.sessionIdToUse,
+        );
+        const keepActive = !runIsTerminal(result);
+        await sessionCoordinator.complete(
+          sessionScope,
+          lease.operationId,
+          {
+            payload: result,
+            traceId,
+            sessionId: result.sessionId || lease.sessionIdToUse || null,
+            runId: result.runId || null,
+            keepActive,
+            activeKind: keepActive ? "run" : null,
+          },
+        );
+        return result;
+      } catch (error) {
+        await sessionCoordinator.fail(sessionScope, lease.operationId);
+        throw error;
+      }
+    }
 
-    case "steer_hermes_run":
+    case "get_hermes_run": {
+      const runId = requireString(args, "runId");
+      const result = await control.getRun(runId);
+      await sessionCoordinator.observe(sessionScope, {
+        kind: "run",
+        id: runId,
+        terminal: runIsTerminal(result),
+        sessionId: result.sessionId || null,
+      });
+      return result;
+    }
+
+    case "steer_hermes_run": {
+      const runId = requireString(args, "runId");
+      await sessionCoordinator.assertActiveRun(sessionScope, runId);
       return control.steerRun(
-        requireString(args, "runId"),
+        runId,
         requireString(args, "instruction"),
       );
+    }
 
-    case "stop_hermes_run":
-      return control.stopRun(requireString(args, "runId"));
+    case "stop_hermes_run": {
+      const runId = requireString(args, "runId");
+      await sessionCoordinator.assertActiveRun(sessionScope, runId);
+      const result = await control.stopRun(runId);
+      await sessionCoordinator.observe(sessionScope, {
+        kind: "run",
+        id: runId,
+        terminal: runIsTerminal(result),
+        sessionId: result.sessionId || null,
+      });
+      return result;
+    }
 
     case "get_hermes_task": {
       let historyLength;
@@ -939,11 +1189,22 @@ async function executePublicTool(name, args, traceId) {
         }
         historyLength = args.historyLength;
       }
-      return getTask(requireString(args, "taskId"), historyLength);
+      const taskId = requireString(args, "taskId");
+      const result = await getTask(taskId, historyLength);
+      await sessionCoordinator.observe(sessionScope, {
+        kind: "a2a-task",
+        id: taskId,
+        terminal: taskIsTerminal(result),
+        contextId: result.contextId || null,
+      });
+      return result;
     }
 
-    case "cancel_hermes_task":
-      return cancelTask(requireString(args, "taskId"));
+    case "cancel_hermes_task": {
+      const taskId = requireString(args, "taskId");
+      await sessionCoordinator.assertActiveTask(sessionScope, taskId);
+      return cancelTask(taskId);
+    }
 
     case "hermes_status":
       return status();
@@ -957,7 +1218,7 @@ async function executePublicTool(name, args, traceId) {
 }
 
 const server = new Server(
-  { name: "hermes-mac", version: "0.6.0" },
+  { name: "hermes-mac", version: "0.7.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -965,15 +1226,23 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: TOOLS,
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const name = request.params.name;
   const args = requireObject(request.params.arguments);
-  const trace = observability.beginTrace(name, args);
+  const sessionScope = sessionCoordinator.scopeFromMeta(extra?._meta);
+  const trace = observability.beginTrace(name, args, {
+    chatgptSessionHash: sessionScope.sessionHash,
+  });
   let payload = null;
   let failure = null;
 
   try {
-    payload = await executePublicTool(name, args, trace.traceId);
+    payload = await executePublicTool(
+      name,
+      args,
+      trace.traceId,
+      sessionScope,
+    );
     payload = { ...payload, traceId: trace.traceId };
     return toolText(payload);
   } catch (error) {
@@ -983,7 +1252,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       operation: name,
       agent: AGENT,
       traceId: trace.traceId,
-      error: { message: errorMessage(error) },
+      error: publicError(error),
       deduplicated: error?.deduplicated === true,
       duplicateOfTraceId: error?.duplicateOfTraceId || null,
     };
