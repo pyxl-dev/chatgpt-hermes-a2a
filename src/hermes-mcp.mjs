@@ -978,6 +978,36 @@ async function executePublicTool(
 
       try {
         let result;
+        if (lease.canonicalRoute === "native") {
+          if (!lease.sessionIdToUse) {
+            throw codedError(
+              "HERMES_NATIVE_SESSION_UNRESOLVED",
+              "This ChatGPT conversation is bound to the native Hermes route, but no durable sessionId is available yet. Inspect the active/previous controllable run before starting more work.",
+              { sessionHash: sessionScope?.sessionHash || null },
+            );
+          }
+          result = await continueNativeSession(
+            lease.sessionIdToUse,
+            instruction,
+            traceId,
+          );
+          result = {
+            ...result,
+            operation: "delegate_to_hermes",
+            continuedCanonicalSession: true,
+          };
+          await sessionCoordinator.complete(
+            sessionScope,
+            lease.operationId,
+            {
+              payload: result,
+              traceId,
+              sessionId: result.sessionId || lease.sessionIdToUse,
+            },
+          );
+          return result;
+        }
+
         if (lease.contextIdToUse) {
           result = await continueContext(
             lease.contextIdToUse,
