@@ -208,6 +208,8 @@ The first mutating Hermes call in a ChatGPT conversation binds that conversation
 - **A2A route** — `delegate_to_hermes` creates the first context, then later `delegate_to_hermes` calls automatically continue the same canonical `contextId`.
 - **Native-session route** — `continue_hermes_session` or `start_hermes_run` binds the conversation to a durable Hermes session. Later controllable runs reuse that session when Hermes returned a `sessionId`.
 
+After either route is established, ordinary `delegate_to_hermes` calls follow that canonical route automatically: they continue the A2A `contextId` or the durable native `sessionId` rather than creating another Hermes conversation.
+
 A ChatGPT conversation may have only one mutating Hermes operation active at a time. A second instruction is rejected before it reaches Hermes instead of being queued or launched in parallel. Switching between A2A and native-session routes is also rejected because it would create a second Hermes conversation.
 
 ChatGPT-scoped A2A background delegation is disabled; intentionally asynchronous work should use `start_hermes_run`, whose `runId` can be polled, steered and stopped. Active run/task state and canonical routing are persisted under `.runtime/chatgpt-session-coordinator.json`, so the bridge can reconcile work after a restart.
