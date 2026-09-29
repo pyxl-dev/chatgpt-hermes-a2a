@@ -217,7 +217,7 @@ export function createHermesSessionCoordinator({
       let changed = false;
 
       if (isStalePending(record.active, stalePendingMs)) {
-        record.active = null;
+        record.active = record.active.restoreOnFailure || null;
         changed = true;
       }
 
@@ -356,10 +356,9 @@ export function createHermesSessionCoordinator({
         };
       }
 
-      if (resumableTask) {
-        record.active = null;
-        changed = true;
-      }
+      const restoreOnFailure = resumableTask
+        ? { ...record.active, restoreOnFailure: null }
+        : null;
 
       const operationId = randomUUID();
       record.active = {
@@ -377,6 +376,7 @@ export function createHermesSessionCoordinator({
         runId: null,
         stateName: null,
         fingerprint,
+        restoreOnFailure,
       };
       record.updatedAt = new Date().toISOString();
       await persist();
@@ -491,6 +491,7 @@ export function createHermesSessionCoordinator({
       if (keepActive) {
         record.active = {
           ...active,
+          restoreOnFailure: null,
           kind: activeKind || active.kind,
           contextId: contextId || active.contextId || null,
           sessionId: sessionId || active.sessionId || null,
@@ -522,7 +523,7 @@ export function createHermesSessionCoordinator({
     return withLock(scope.sessionHash, async () => {
       const record = getRecord(scope.sessionHash);
       if (record.active?.operationId === operationId) {
-        record.active = null;
+        record.active = record.active.restoreOnFailure || null;
         record.updatedAt = new Date().toISOString();
         await persist();
       }
