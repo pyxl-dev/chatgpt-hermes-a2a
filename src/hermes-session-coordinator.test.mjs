@@ -197,6 +197,83 @@ test("invalid resumable context keeps the original task locked", async () => {
   assert.equal(snapshot.canonicalContextId, "ctx-canonical");
 });
 
+test("deduplicated resumable retry preserves the active task lock", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const initial = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-initial",
+    instruction: "needs input",
+  });
+  await coordinator.complete(scope, initial.operationId, {
+    payload: {
+      ok: true,
+      taskId: "task-input",
+      contextId: "ctx-canonical",
+      stateName: "input-required",
+    },
+    traceId: "trace-initial",
+    taskId: "task-input",
+    contextId: "ctx-canonical",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "input-required",
+  });
+
+  const resume = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-resume",
+    instruction: "same resume answer",
+    requestedContextId: "ctx-canonical",
+    requestedTaskId: "task-input",
+  });
+  await coordinator.complete(scope, resume.operationId, {
+    payload: {
+      ok: true,
+      taskId: "task-input",
+      contextId: "ctx-canonical",
+      stateName: "input-required",
+      text: "still needs input",
+    },
+    traceId: "trace-resume",
+    taskId: "task-input",
+    contextId: "ctx-canonical",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "input-required",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-resume-retry",
+    instruction: "same   resume   answer",
+    requestedContextId: "ctx-canonical",
+    requestedTaskId: "task-input",
+  });
+
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.text, "still needs input");
+  assert.equal(retry.replayPayload.deduplicated, true);
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.active?.taskId, "task-input");
+  assert.equal(snapshot.active?.stateName, "input-required");
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-parallel",
+      instruction: "parallel work must stay blocked",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
