@@ -266,7 +266,11 @@ export function createHermesSessionCoordinator({
       }
 
       const targetRoute =
-        mode === "delegate" || mode === "continue-context" ? "a2a" : "native";
+        mode === "delegate"
+          ? record.canonicalRoute || "a2a"
+          : mode === "continue-context"
+            ? "a2a"
+            : "native";
       if (record.canonicalRoute && record.canonicalRoute !== targetRoute) {
         throw coordinatorError(
           "HERMES_ROUTE_CONFLICT",
