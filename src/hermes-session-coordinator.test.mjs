@@ -274,6 +274,63 @@ test("deduplicated resumable retry preserves the active task lock", async () => 
   );
 });
 
+test("failed resumable retry restores the original active task lock", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const initial = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-initial",
+    instruction: "needs input",
+  });
+  await coordinator.complete(scope, initial.operationId, {
+    payload: {
+      ok: true,
+      taskId: "task-input",
+      contextId: "ctx-canonical",
+      stateName: "input-required",
+    },
+    traceId: "trace-initial",
+    taskId: "task-input",
+    contextId: "ctx-canonical",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "input-required",
+  });
+
+  const resume = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-resume",
+    instruction: "answer for Hermes",
+    requestedContextId: "ctx-canonical",
+    requestedTaskId: "task-input",
+  });
+
+  const duringRetry = await coordinator.inspect(scope);
+  assert.equal(duringRetry.active?.kind, "a2a-pending");
+  assert.equal(duringRetry.active?.taskId, "task-input");
+
+  await coordinator.fail(scope, resume.operationId);
+
+  const restored = await coordinator.inspect(scope);
+  assert.equal(restored.active?.kind, "a2a-task");
+  assert.equal(restored.active?.taskId, "task-input");
+  assert.equal(restored.active?.stateName, "input-required");
+  assert.equal(restored.active?.contextId, "ctx-canonical");
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-parallel",
+      instruction: "parallel work must remain blocked",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
