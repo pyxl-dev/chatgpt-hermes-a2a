@@ -71,8 +71,8 @@ For each ChatGPT conversation it enforces these invariants:
 1. one canonical execution route: either A2A or native Hermes sessions/runs;
 2. one mutating Hermes operation active at a time;
 3. one canonical A2A `contextId` or durable Hermes `sessionId`;
-4. later `delegate_to_hermes` calls automatically continue the canonical A2A context instead of creating another one;
-5. a different `contextId`, `sessionId`, execution route, or concurrent operation is rejected before a model call reaches Hermes.
+4. later `delegate_to_hermes` calls automatically follow the canonical route, continuing either the A2A `contextId` or native Hermes `sessionId` instead of creating another conversation;
+5. a different explicit `contextId`, `sessionId`, execution route, or concurrent operation is rejected before a model call reaches Hermes.
 
 Controllable runs remain marked active until a terminal Runs API state is observed. Nonterminal A2A task envelopes are similarly retained when they occur. Before rejecting a new operation, the coordinator can reconcile a persisted run/task with Hermes so a bridge restart does not leave a completed operation permanently locked.
 
