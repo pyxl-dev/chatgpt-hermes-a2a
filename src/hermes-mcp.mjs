@@ -995,6 +995,7 @@ async function executePublicTool(
             instruction,
             args.background === true,
             traceId,
+            sessionScope?.sessionHash || null,
           );
         }
         return await completeA2AOperation(
