@@ -268,12 +268,17 @@ export function createHermesObservability({
       instruction,
       background = false,
       traceId = null,
+      scopeKey = null,
     ) {
       const hash = instructionHash(instruction);
+      const key =
+        (typeof scopeKey === "string" && scopeKey ? scopeKey : "unscoped") +
+        ":" +
+        hash;
       const now = Date.now();
       pruneCache(delegationCache, now);
 
-      const existing = delegationCache.get(hash);
+      const existing = delegationCache.get(key);
       const reusable =
         existing &&
         (existing.settledAtMs === null ||
@@ -304,7 +309,7 @@ export function createHermesObservability({
         settledAtMs: null,
         promise,
       };
-      delegationCache.set(hash, entry);
+      delegationCache.set(key, entry);
 
       try {
         const result = await promise;
@@ -317,8 +322,8 @@ export function createHermesObservability({
           dedupWindowMs,
         };
       } catch (error) {
-        if (delegationCache.get(hash) === entry) {
-          delegationCache.delete(hash);
+        if (delegationCache.get(key) === entry) {
+          delegationCache.delete(key);
         }
         throw error;
       }
