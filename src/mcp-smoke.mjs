@@ -413,6 +413,7 @@ try {
       "endedAt",
       "durationMs",
       "tool",
+      "chatgptSessionHash",
       "instructionHash",
       "instructionPreview",
       "inputContextId",
