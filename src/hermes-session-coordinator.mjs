@@ -316,14 +316,17 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      if (resumableTask) {
-        record.active = null;
-        changed = true;
-      }
-
       const fingerprint =
         typeof instruction === "string" && instruction.trim()
-          ? sha256(mode + "\n" + normalizeInstruction(instruction))
+          ? sha256(
+              [
+                mode,
+                requestedContextId || "",
+                requestedSessionId || "",
+                requestedTaskId || "",
+                normalizeInstruction(instruction),
+              ].join("\n"),
+            )
           : null;
       const recent = recentResults.get(scope.sessionHash);
       const now = Date.now();
@@ -351,6 +354,11 @@ export function createHermesSessionCoordinator({
             dedupWindowMs,
           },
         };
+      }
+
+      if (resumableTask) {
+        record.active = null;
+        changed = true;
       }
 
       const operationId = randomUUID();
