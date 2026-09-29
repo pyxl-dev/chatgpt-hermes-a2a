@@ -124,6 +124,79 @@ test("replays an identical completed instruction inside the dedup window", async
   assert.equal(replay.replayPayload.duplicateOfTraceId, "trace-original");
 });
 
+test("failed first continuation does not poison canonical route or ids", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const provisional = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-bad",
+    instruction: "bad first continuation",
+    requestedContextId: "ctx-mistyped",
+  });
+  await coordinator.fail(scope, provisional.operationId);
+
+  const afterFailure = await coordinator.inspect(scope);
+  assert.equal(afterFailure.canonicalRoute, null);
+  assert.equal(afterFailure.canonicalContextId, null);
+  assert.equal(afterFailure.canonicalSessionId, null);
+  assert.equal(afterFailure.active, null);
+
+  const native = await coordinator.begin(scope, {
+    mode: "continue-session",
+    tool: "continue_hermes_session",
+    traceId: "trace-good",
+    instruction: "valid native continuation",
+    requestedSessionId: "native-valid",
+  });
+  assert.equal(native.canonicalRoute, "native");
+  assert.equal(native.sessionIdToUse, "native-valid");
+});
+
+test("invalid resumable context keeps the original task locked", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-input",
+    instruction: "needs input",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      taskId: "task-input",
+      contextId: "ctx-canonical",
+      stateName: "input-required",
+    },
+    traceId: "trace-input",
+    taskId: "task-input",
+    contextId: "ctx-canonical",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "input-required",
+  });
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "continue-context",
+      tool: "continue_with_hermes",
+      traceId: "trace-wrong-context",
+      instruction: "resume with wrong context",
+      requestedContextId: "ctx-wrong",
+      requestedTaskId: "task-input",
+    }),
+    (error) => error?.code === "HERMES_CONTEXT_MISMATCH",
+  );
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.active?.taskId, "task-input");
+  assert.equal(snapshot.active?.stateName, "input-required");
+  assert.equal(snapshot.canonicalContextId, "ctx-canonical");
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
