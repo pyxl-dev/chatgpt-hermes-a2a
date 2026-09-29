@@ -58,15 +58,29 @@ There are three deliberately separate control surfaces:
 
 This means the tunnel gives ChatGPT access to the wrapper, not arbitrary direct network access to the Hermes gateway or the Mac.
 
-## Bridge observability and idempotence
+## Bridge observability, session coordination and idempotence
 
-`src/hermes-mcp.mjs` creates a trace for every public tool call and appends it to `.runtime/hermes-activity.jsonl`. The trace records timing, tool/purpose, a safe instruction fingerprint/preview, input/output task and context IDs, state, error status, background mode, and whether the call was deduplicated.
+`src/hermes-mcp.mjs` creates a trace for every public tool call and appends it to `.runtime/hermes-activity.jsonl`. The trace records timing, tool/purpose, a safe instruction fingerprint/preview, input/output task and context IDs, state, error status, background mode, deduplication metadata, and the SHA-256 hash of the ChatGPT conversation scope when `_meta["openai/session"]` is present. The raw OpenAI session value is never written to the activity log.
 
 `hermes_activity` is implemented entirely in the wrapper. It reads the local JSONL file and never initializes or calls the private A2A backend.
 
-`delegate_to_hermes` is guarded before `a2a_send_message`: the normalized instruction is SHA-256 hashed and checked against a process-local cache. An identical in-flight mission shares the existing promise; a recently completed successful mission reuses its result for 60 seconds by default. Different normalized instructions produce different keys. Failed backend attempts are removed from the cache so a real retry can run. `continue_hermes_session` applies the same short-window protection with a separate key composed of `sessionId` plus normalized instruction.
+`src/hermes-session-coordinator.mjs` is the server-side concurrency boundary for ChatGPT calls. It persists only hashed ChatGPT session keys plus canonical Hermes identifiers under `.runtime/chatgpt-session-coordinator.json`.
 
-The deduplication layer protects against accidental repeated MCP tool calls without turning retries after genuine failures into no-ops.
+For each ChatGPT conversation it enforces these invariants:
+
+1. one canonical execution route: either A2A or native Hermes sessions/runs;
+2. one mutating Hermes operation active at a time;
+3. one canonical A2A `contextId` or durable Hermes `sessionId`;
+4. later `delegate_to_hermes` calls automatically continue the canonical A2A context instead of creating another one;
+5. a different `contextId`, `sessionId`, execution route, or concurrent operation is rejected before a model call reaches Hermes.
+
+Controllable runs remain marked active until a terminal Runs API state is observed. Nonterminal A2A task envelopes are similarly retained when they occur. Before rejecting a new operation, the coordinator can reconcile a persisted run/task with Hermes so a bridge restart does not leave a completed operation permanently locked.
+
+For scoped ChatGPT traffic, background A2A delegation is disabled in favor of `start_hermes_run`, because A2A cancellation only cancels the task envelope and cannot guarantee interruption of the underlying agent loop.
+
+Exact-instruction deduplication remains a separate 60-second defense. `delegate_to_hermes` now keys that cache by ChatGPT session hash plus normalized instruction, preventing identical instructions from unrelated conversations from sharing a cached A2A context. `continue_hermes_session` keeps its existing key of durable `sessionId` plus normalized instruction. Failed backend attempts are removed from the caches so a real retry can run.
+
+Calls from clients that do not provide `openai/session` keep the prior unscoped behavior for compatibility.
 
 ## Dependencies
 
