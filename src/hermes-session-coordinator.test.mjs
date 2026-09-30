@@ -490,6 +490,57 @@ test("expired replays are pruned globally on restart", async () => {
   assert.equal(pruned.recentResults[scopeA.sessionHash], undefined);
 });
 
+test("invalid deduplication windows fall back to the default expiry", async () => {
+  for (const invalidWindow of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
+    const { root, coordinator } = await makeCoordinator({
+      dedupWindowMs: 60_000,
+    });
+    const scope = coordinator.scopeFromMeta(metaA);
+    const lease = await coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "expire-invalid-window",
+    });
+    await coordinator.complete(scope, lease.operationId, {
+      payload: {
+        ok: true,
+        operation: "delegate_to_hermes",
+        runId: "run-expire",
+        sessionId: "session-expire",
+        status: "completed",
+      },
+      runId: "run-expire",
+      sessionId: "session-expire",
+    });
+
+    const statePath = path.join(
+      root,
+      ".runtime",
+      "chatgpt-session-coordinator.json",
+    );
+    const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+    const bucket = state.recentResults[scope.sessionHash];
+    const fingerprint = Object.keys(bucket)[0];
+    bucket[fingerprint].settledAtMs = Date.now() - 120_000;
+    await fs.writeFile(statePath, JSON.stringify(state, null, 2) + "\n");
+
+    let n = 0;
+    const restarted = createHermesSessionCoordinator({
+      root,
+      dedupWindowMs: invalidWindow,
+      randomUUID: () => "invalid-window-" + ++n,
+    });
+    await restarted.inspect(restarted.scopeFromMeta(metaA));
+
+    const pruned = JSON.parse(await fs.readFile(statePath, "utf8"));
+    assert.equal(
+      pruned.recentResults[scope.sessionHash],
+      undefined,
+      "invalid window " + String(invalidWindow) + " should use default expiry",
+    );
+  }
+});
+
 test("all live replay results remain available inside the dedup window", async () => {
   const { coordinator } = await makeCoordinator({
     dedupWindowMs: 600_000,
