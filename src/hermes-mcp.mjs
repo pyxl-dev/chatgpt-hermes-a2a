@@ -130,7 +130,6 @@ const sessionAccess = createHermesSessionAccess({
   root: ROOT,
   redactText,
   randomUUID,
-  cleanText: cleanHermesText,
 });
 
 const sessionCoordinator = createHermesSessionCoordinator({
@@ -787,7 +786,11 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         agent: AGENT,
         reachable: true,
         nativeOnly: true,
-        control: controlStatus,
+        control: {
+          ...controlStatus,
+          configured: control.configured,
+          reachable: true,
+        },
       };
     }
 
