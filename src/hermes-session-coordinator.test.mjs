@@ -1445,6 +1445,130 @@ test("replays a reconciled native session continuation", async () => {
   assert.equal(retry.replayPayload.text, "continued");
 });
 
+test("persists terminal reconciliation before rejecting conflicting next work", async () => {
+  const { root, coordinator } = await makeCoordinator({
+    dedupWindowMs: 60_000,
+  });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-running",
+    instruction: "original async work",
+    requestedSessionId: "session-native",
+  });
+  await coordinator.complete(scope, first.operationId, {
+    payload: {
+      ok: true,
+      operation: "start_hermes_run",
+      runId: "run-original",
+      sessionId: "session-native",
+      status: "started",
+    },
+    traceId: "trace-running",
+    runId: "run-original",
+    sessionId: "session-native",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "continue-context",
+      tool: "continue_with_hermes",
+      traceId: "trace-conflict",
+      instruction: "conflicting a2a work",
+      requestedContextId: "ctx-conflict",
+      reconcileActive: async () => ({
+        terminal: true,
+        sessionId: "session-native",
+        replayPayload: {
+          ok: true,
+          operation: "start_hermes_run",
+          runId: "run-original",
+          sessionId: "session-native",
+          status: "completed",
+          output: "done",
+          recovered: true,
+        },
+      }),
+    }),
+    (error) => error?.code === "HERMES_ROUTE_CONFLICT",
+  );
+
+  let counter = 0;
+  const restarted = createHermesSessionCoordinator({
+    root,
+    dedupWindowMs: 60_000,
+    randomUUID: () => "post-conflict-" + ++counter,
+  });
+  const restartedScope = restarted.scopeFromMeta(metaA);
+  const snapshot = await restarted.inspect(restartedScope);
+  assert.equal(snapshot.active, null);
+  assert.equal(snapshot.canonicalSessionId, "session-native");
+
+  const replay = await restarted.begin(restartedScope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-retry-original",
+    instruction: "original   async work",
+    requestedSessionId: "session-native",
+  });
+  assert.equal(replay.replay, true);
+  assert.equal(replay.replayPayload.runId, "run-original");
+});
+
+test("blocks ordinary delegation from an unresolved persisted A2A route", async () => {
+  const { root, coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+  const statePath = path.join(
+    root,
+    ".runtime",
+    "chatgpt-session-coordinator.json",
+  );
+  await fs.mkdir(path.dirname(statePath), {
+    recursive: true,
+  });
+  await fs.writeFile(
+    statePath,
+    JSON.stringify(
+      {
+        version: 1,
+        sessions: {
+          [scope.sessionHash]: {
+            canonicalRoute: "a2a",
+            canonicalContextId: null,
+            canonicalSessionId: null,
+            active: null,
+            updatedAt: new Date().toISOString(),
+          },
+        },
+        recentResults: {},
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+
+  let counter = 0;
+  const restarted = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "unresolved-a2a-" + ++counter,
+  });
+  const restartedScope = restarted.scopeFromMeta(metaA);
+
+  await assert.rejects(
+    restarted.begin(restartedScope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-delegate",
+      instruction: "must not fork a new a2a context",
+    }),
+    (error) => error?.code === "HERMES_A2A_CONTEXT_UNRESOLVED",
+  );
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
