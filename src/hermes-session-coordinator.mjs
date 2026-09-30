@@ -20,6 +20,13 @@ function normalizeInstruction(value) {
   return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
 }
 
+function normalizedDedupWindowMs(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_DEDUP_WINDOW_MS;
+}
+
 function payloadIsReusable(payload) {
   if (!payload || payload.ok === false || payload.error) return false;
   const status = String(payload.status || "").toLowerCase();
@@ -67,15 +74,15 @@ export function createHermesSessionCoordinator({
   root,
   randomUUID,
   statePath = null,
-  dedupWindowMs = Number(
-    process.env.HERMES_DEDUP_WINDOW_MS || DEFAULT_DEDUP_WINDOW_MS,
-  ),
+  dedupWindowMs = process.env.HERMES_DEDUP_WINDOW_MS,
 }) {
   const runtimeDir = path.join(root, ".runtime");
   const filePath =
     statePath ||
     process.env.HERMES_SESSION_COORDINATOR_STATE ||
     path.join(runtimeDir, "chatgpt-session-coordinator.json");
+
+  const replayWindowMs = normalizedDedupWindowMs(dedupWindowMs);
 
   const state = { version: 3, sessions: {}, recentResults: {} };
   const instanceId = randomUUID();
@@ -123,7 +130,7 @@ export function createHermesSessionCoordinator({
           typeof recent !== "object" ||
           Array.isArray(recent) ||
           !Number.isFinite(settledAtMs) ||
-          now - settledAtMs > dedupWindowMs
+          now - settledAtMs > replayWindowMs
         ) {
           delete bucket[fingerprint];
           changed = true;
@@ -494,7 +501,7 @@ export function createHermesSessionCoordinator({
       if (
         fingerprint &&
         recent &&
-        now - Number(recent.settledAtMs) <= dedupWindowMs
+        now - Number(recent.settledAtMs) <= replayWindowMs
       ) {
         return {
           tracked: true,
@@ -506,7 +513,7 @@ export function createHermesSessionCoordinator({
             ...recent.payload,
             deduplicated: true,
             duplicateOfTraceId: recent.traceId || null,
-            dedupWindowMs,
+            dedupWindowMs: replayWindowMs,
           },
           idempotencyKey: null,
         };
