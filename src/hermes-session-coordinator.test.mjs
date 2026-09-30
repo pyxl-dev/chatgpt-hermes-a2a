@@ -776,6 +776,206 @@ test("failed terminal A2A result is not cached for dedup replay", async () => {
   assert.ok(retry.operationId);
 });
 
+test("polling a successful native delegate preserves exact retry replay", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-poll-native",
+    instruction: "poll me once",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-poll",
+      status: "started",
+    },
+    traceId: "trace-poll-native",
+    runId: "run-poll",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  await coordinator.observe(scope, {
+    kind: "run",
+    id: "run-poll",
+    terminal: true,
+    sessionId: "session-poll",
+    replayPayload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-poll",
+      sessionId: "session-poll",
+      status: "completed",
+      text: "polled result",
+      nativeSession: true,
+    },
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-retry",
+    instruction: "poll   me once",
+  });
+
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.runId, "run-poll");
+  assert.equal(retry.replayPayload.text, "polled result");
+});
+
+test("polling a successful A2A task preserves exact retry replay", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-poll-a2a",
+    instruction: "continue once",
+    requestedContextId: "ctx-poll",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      contextId: "ctx-poll",
+      taskId: "task-poll",
+      stateName: "working",
+    },
+    traceId: "trace-poll-a2a",
+    contextId: "ctx-poll",
+    taskId: "task-poll",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "working",
+  });
+
+  await coordinator.observe(scope, {
+    kind: "a2a-task",
+    id: "task-poll",
+    terminal: true,
+    contextId: "ctx-poll",
+    replayPayload: {
+      ok: true,
+      contextId: "ctx-poll",
+      taskId: "task-poll",
+      stateName: "completed",
+      text: "a2a done",
+    },
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-retry",
+    instruction: "continue   once",
+    requestedContextId: "ctx-poll",
+  });
+
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.stateName, "completed");
+  assert.equal(retry.replayPayload.text, "a2a done");
+});
+
+test("reconciliation replays a successful A2A completion", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-start",
+    instruction: "finish in background",
+    requestedContextId: "ctx-a2a",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      contextId: "ctx-a2a",
+      taskId: "task-a2a",
+      stateName: "working",
+    },
+    traceId: "trace-a2a-start",
+    contextId: "ctx-a2a",
+    taskId: "task-a2a",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "working",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-retry",
+    instruction: "finish   in background",
+    requestedContextId: "ctx-a2a",
+    reconcileActive: async () => ({
+      terminal: true,
+      contextId: "ctx-a2a",
+      replayPayload: {
+        ok: true,
+        contextId: "ctx-a2a",
+        taskId: "task-a2a",
+        stateName: "completed",
+        text: "finished",
+      },
+    }),
+  });
+
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.text, "finished");
+});
+
+test("ambiguous A2A submission permits only an identical idempotent recovery retry", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-first",
+    instruction: "same a2a request",
+    requestedContextId: "ctx-a2a",
+  });
+  await coordinator.markSubmissionUnknown(
+    scope,
+    first.operationId,
+    "a2a",
+  );
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "continue-context",
+      tool: "continue_with_hermes",
+      traceId: "trace-a2a-other",
+      instruction: "different a2a request",
+      requestedContextId: "ctx-a2a",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-retry",
+    instruction: "same   a2a request",
+    requestedContextId: "ctx-a2a",
+  });
+
+  assert.equal(retry.replay, false);
+  assert.notEqual(retry.operationId, first.operationId);
+  assert.equal(retry.idempotencyKey, first.idempotencyKey);
+
+  await coordinator.fail(scope, retry.operationId);
+  const restored = await coordinator.inspect(scope);
+  assert.equal(restored.active?.kind, "a2a-submission-unknown");
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
