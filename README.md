@@ -81,7 +81,7 @@ The persisted coordinator state is stored under:
 .runtime/chatgpt-session-coordinator.json
 ```
 
-Legacy version-1 state is migrated on load. Native session/run state is preserved; old A2A context/task state is discarded because the current runtime no longer supports that execution path.
+Legacy version-1 mixed-route state and version-2 native single-replay state are migrated on load. Native session/run state is preserved; old A2A context/task state is discarded. Version 3 stores every live replay result by operation fingerprint until the time-based deduplication window expires.
 
 ## Requirements
 
