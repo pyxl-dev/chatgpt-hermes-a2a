@@ -56,3 +56,33 @@ test("native idempotency key keeps durable session and instruction boundaries", 
     ),
   );
 });
+
+test("scoped native idempotency remains stable across minute boundaries", () => {
+  const first = controlIdempotencyKey(
+    "session-a",
+    "same instruction",
+    "operation-token",
+    1_800_000,
+  );
+  const later = controlIdempotencyKey(
+    "session-a",
+    "same instruction",
+    "operation-token",
+    1_920_000,
+  );
+  assert.equal(first, later);
+
+  const unscopedFirst = controlIdempotencyKey(
+    "session-a",
+    "same instruction",
+    "unscoped",
+    1_800_000,
+  );
+  const unscopedLater = controlIdempotencyKey(
+    "session-a",
+    "same instruction",
+    "unscoped",
+    1_920_000,
+  );
+  assert.notEqual(unscopedFirst, unscopedLater);
+});
