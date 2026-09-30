@@ -409,6 +409,206 @@ test("context drift during a resumable retry restores the original task lock", a
   );
 });
 
+test("rejects a returned context that differs from the first requested binding", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-first-context",
+    instruction: "continue exact context",
+    requestedContextId: "ctx-requested",
+  });
+
+  await assert.rejects(
+    coordinator.complete(scope, lease.operationId, {
+      payload: { ok: true, contextId: "ctx-returned" },
+      traceId: "trace-first-context",
+      contextId: "ctx-returned",
+    }),
+    (error) => error?.code === "HERMES_CONTEXT_DRIFT",
+  );
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalContextId, null);
+  assert.equal(snapshot.active, null);
+});
+
+test("rejects a returned session that differs from the first requested binding", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "continue-session",
+    tool: "continue_hermes_session",
+    traceId: "trace-first-session",
+    instruction: "continue exact session",
+    requestedSessionId: "session-requested",
+  });
+
+  await assert.rejects(
+    coordinator.complete(scope, lease.operationId, {
+      payload: { ok: true, sessionId: "session-returned" },
+      traceId: "trace-first-session",
+      sessionId: "session-returned",
+    }),
+    (error) => error?.code === "HERMES_NATIVE_SESSION_DRIFT",
+  );
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalSessionId, null);
+  assert.equal(snapshot.active, null);
+});
+
+test("observed session drift keeps the active run locked", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-run",
+    instruction: "run",
+    requestedSessionId: "session-a",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: { ok: true, runId: "run-1", sessionId: "session-a" },
+    traceId: "trace-run",
+    runId: "run-1",
+    sessionId: "session-a",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  await assert.rejects(
+    coordinator.observe(scope, {
+      kind: "run",
+      id: "run-1",
+      terminal: true,
+      sessionId: "session-b",
+    }),
+    (error) => error?.code === "HERMES_NATIVE_SESSION_DRIFT",
+  );
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalSessionId, "session-a");
+  assert.equal(snapshot.active?.runId, "run-1");
+});
+
+test("reconciliation session drift keeps the active run locked", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-run",
+    instruction: "run",
+    requestedSessionId: "session-a",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: { ok: true, runId: "run-1", sessionId: "session-a" },
+    traceId: "trace-run",
+    runId: "run-1",
+    sessionId: "session-a",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-next",
+      instruction: "next",
+      reconcileActive: async () => ({
+        terminal: true,
+        sessionId: "session-b",
+      }),
+    }),
+    (error) => error?.code === "HERMES_NATIVE_SESSION_DRIFT",
+  );
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.active?.runId, "run-1");
+});
+
+test("ambiguous native submission permits only an identical recovery retry", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-first",
+    instruction: "same native request",
+  });
+  await coordinator.markSubmissionUnknown(scope, first.operationId);
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-other",
+      instruction: "different native request",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-retry",
+    instruction: "same   native   request",
+  });
+  assert.equal(retry.replay, false);
+  assert.notEqual(retry.operationId, first.operationId);
+
+  await coordinator.fail(scope, retry.operationId);
+  const restored = await coordinator.inspect(scope);
+  assert.equal(restored.active?.kind, "native-submission-unknown");
+});
+
+test("bridge restart can retry the exact persisted native pending submission", async () => {
+  const { root, coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-before-crash",
+    instruction: "recover after wrapper crash",
+  });
+  assert.ok(first.operationId);
+
+  let counter = 0;
+  const restarted = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "restart-" + ++counter,
+  });
+  const restartedScope = restarted.scopeFromMeta(metaA);
+
+  const retry = await restarted.begin(restartedScope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-after-crash",
+    instruction: "recover   after wrapper crash",
+  });
+  assert.equal(retry.replay, false);
+  assert.ok(retry.operationId);
+
+  await assert.rejects(
+    restarted.begin(restartedScope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-different",
+      instruction: "different work",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
