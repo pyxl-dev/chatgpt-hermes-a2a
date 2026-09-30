@@ -1115,6 +1115,7 @@ async function executePublicTool(
             lease.idempotencyKey || "unscoped",
           );
           nativeRunId = requireNativeRunId(started, sessionScope);
+          nativeRunStarted = true;
           await sessionCoordinator.complete(
             sessionScope,
             lease.operationId,
@@ -1128,7 +1129,6 @@ async function executePublicTool(
               activeKind: "run",
             },
           );
-          nativeRunStarted = true;
 
           const completed = await waitForNativeRun(started.runId);
           if (!nativeRunSucceeded(completed)) {
@@ -1320,13 +1320,16 @@ async function executePublicTool(
       });
       if (lease.replay) return lease.replayPayload;
 
+      let runSubmitted = false;
+      let submittedRunId = null;
       try {
         const result = await control.startRun(
           instruction,
           lease.sessionIdToUse,
           lease.idempotencyKey || "unscoped",
         );
-        const runId = requireNativeRunId(result, sessionScope);
+        submittedRunId = requireNativeRunId(result, sessionScope);
+        runSubmitted = true;
         const keepActive = !runIsTerminal(result);
         await sessionCoordinator.complete(
           sessionScope,
@@ -1335,18 +1338,26 @@ async function executePublicTool(
             payload: result,
             traceId,
             sessionId: result.sessionId || lease.sessionIdToUse || null,
-            runId,
+            runId: submittedRunId,
             keepActive,
             activeKind: keepActive ? "run" : null,
           },
         );
         return result;
       } catch (error) {
-        await releaseOrPreserveSubmissionFailure(
-          sessionScope,
-          lease.operationId,
-          error,
-        );
+        if (!runSubmitted) {
+          await releaseOrPreserveSubmissionFailure(
+            sessionScope,
+            lease.operationId,
+            error,
+          );
+        } else if (!error?.details?.runId) {
+          error.details = {
+            ...(error?.details || {}),
+            runId: submittedRunId,
+            sessionHash: sessionScope?.sessionHash || null,
+          };
+        }
         throw error;
       }
     }
