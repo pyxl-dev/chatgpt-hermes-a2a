@@ -1201,6 +1201,8 @@ async function completeA2AOperation(
         () => null,
       );
       if (
+        error &&
+        typeof error === "object" &&
         snapshot?.active?.kind === "a2a-task" &&
         snapshot.active.taskId === taskId
       ) {
