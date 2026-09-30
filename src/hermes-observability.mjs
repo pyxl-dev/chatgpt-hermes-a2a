@@ -9,7 +9,6 @@ const INSTRUCTION_PREVIEW_MAX = 240;
 
 const TOOL_PURPOSE = {
   delegate_to_hermes: "new-mission",
-  continue_with_hermes: "continue-existing-context",
   list_hermes_sessions: "list-native-sessions",
   get_hermes_session: "read-native-session",
   continue_hermes_session: "continue-native-session",
@@ -17,8 +16,6 @@ const TOOL_PURPOSE = {
   get_hermes_run: "read-controllable-run",
   steer_hermes_run: "steer-controllable-run",
   stop_hermes_run: "stop-controllable-run",
-  get_hermes_task: "read-task-state",
-  cancel_hermes_task: "cancel-task",
   hermes_status: "health-check",
   hermes_activity: "read-local-activity",
 };
