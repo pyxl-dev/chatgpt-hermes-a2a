@@ -42,6 +42,11 @@ read_hermes_env_value() {
   ' "$file"
 }
 
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] &&
+    (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
 if [[ -z "${API_SERVER_KEY:-}" && -n "${HERMES_API_SERVER_KEY:-}" ]]; then
   export API_SERVER_KEY="$HERMES_API_SERVER_KEY"
 fi
@@ -58,18 +63,21 @@ if [[ -z "${API_SERVER_KEY:-}" ]]; then
   unset DETECTED_API_KEY HERMES_BIN_FOR_SECRET
 fi
 
-if [[ -z "${API_SERVER_PORT:-}" ]]; then
+if ! valid_port "${API_SERVER_PORT:-}"; then
+  unset API_SERVER_PORT
   DETECTED_API_PORT="$(read_hermes_env_value API_SERVER_PORT)"
   HERMES_BIN_FOR_CONFIG="$(command -v hermes || true)"
-  if [[ -z "$DETECTED_API_PORT" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+
+  if ! valid_port "$DETECTED_API_PORT" && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
     DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_PORT 2>/dev/null || true)"
   fi
-  if [[ -z "$DETECTED_API_PORT" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+  if ! valid_port "$DETECTED_API_PORT" && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
     DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get platforms.api_server.extra.port 2>/dev/null || true)"
   fi
-  if [[ "$DETECTED_API_PORT" =~ ^[0-9]+$ ]] &&
-     (( DETECTED_API_PORT >= 1 && DETECTED_API_PORT <= 65535 )); then
+  if valid_port "$DETECTED_API_PORT"; then
     export API_SERVER_PORT="$DETECTED_API_PORT"
+  else
+    export API_SERVER_PORT="8642"
   fi
   unset DETECTED_API_PORT HERMES_BIN_FOR_CONFIG
 fi
