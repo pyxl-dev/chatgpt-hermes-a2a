@@ -266,6 +266,23 @@ export function createHermesSessionCoordinator({
           : mode === "continue-context"
             ? "a2a"
             : "native";
+
+      if (
+        record.canonicalRoute === "native" &&
+        !record.canonicalSessionId &&
+        !requestedSessionId &&
+        (mode === "delegate" || mode === "start-run")
+      ) {
+        throw coordinatorError(
+          "HERMES_NATIVE_SESSION_UNRESOLVED",
+          "This ChatGPT conversation is already bound to the native Hermes route, but its durable sessionId has not been resolved yet. Inspect the previous run until Hermes returns a sessionId, or resume an explicitly known durable session.",
+          {
+            sessionHash: scope.sessionHash,
+            canonicalRoute: record.canonicalRoute,
+            active: activeSummary(record.active),
+          },
+        );
+      }
       if (record.canonicalRoute && record.canonicalRoute !== targetRoute) {
         throw coordinatorError(
           "HERMES_ROUTE_CONFLICT",
