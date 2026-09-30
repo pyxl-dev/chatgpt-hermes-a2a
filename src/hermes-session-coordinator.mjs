@@ -64,7 +64,9 @@ function isStalePending(active, stalePendingMs, now = Date.now()) {
     !active ||
     active.taskId ||
     active.runId ||
-    active.route === "native"
+    active.route === "native" ||
+    active.kind === "a2a-pending" ||
+    active.kind === "a2a-submission-unknown"
   ) return false;
   const startedAtMs = Date.parse(active.startedAt || "");
   return (
@@ -339,19 +341,22 @@ export function createHermesSessionCoordinator({
         record.active.taskId === requestedTaskId &&
         ["input-required", "auth-required"].includes(record.active.stateName);
 
-      const recoverableNativePending =
-        record.active?.route === "native" &&
-        ["native-pending", "native-submission-unknown"].includes(
-          record.active.kind,
-        ) &&
+      const recoverablePending =
+        record.active &&
+        [
+          "native-pending",
+          "native-submission-unknown",
+          "a2a-pending",
+          "a2a-submission-unknown",
+        ].includes(record.active.kind) &&
         fingerprint &&
         record.active.fingerprint === fingerprint &&
         (
-          record.active.kind === "native-submission-unknown" ||
+          record.active.kind.endsWith("-submission-unknown") ||
           record.active.ownerInstanceId !== instanceId
         );
 
-      if (record.active && !resumableTask && !recoverableNativePending) {
+      if (record.active && !resumableTask && !recoverablePending) {
         if (changed) {
           record.updatedAt = new Date().toISOString();
           await persist();
@@ -468,13 +473,13 @@ export function createHermesSessionCoordinator({
       }
 
       const restoreOnFailure =
-        resumableTask || recoverableNativePending
+        resumableTask || recoverablePending
           ? { ...record.active, restoreOnFailure: null }
           : null;
 
       const operationId = randomUUID();
       const idempotencyKey =
-        recoverableNativePending && record.active?.idempotencyKey
+        recoverablePending && record.active?.idempotencyKey
           ? record.active.idempotencyKey
           : sha256(scope.sessionHash + "\n" + operationId);
       record.active = {
@@ -688,7 +693,11 @@ export function createHermesSessionCoordinator({
     });
   }
 
-  async function markSubmissionUnknown(scope, operationId) {
+  async function markSubmissionUnknown(
+    scope,
+    operationId,
+    route = "native",
+  ) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
     await ensureLoaded();
     return withLock(scope.sessionHash, async () => {
@@ -696,7 +705,10 @@ export function createHermesSessionCoordinator({
       if (record.active?.operationId === operationId) {
         record.active = {
           ...record.active,
-          kind: "native-submission-unknown",
+          kind:
+            route === "a2a"
+              ? "a2a-submission-unknown"
+              : "native-submission-unknown",
           ownerInstanceId: instanceId,
         };
         record.updatedAt = new Date().toISOString();
@@ -714,6 +726,7 @@ export function createHermesSessionCoordinator({
       terminal,
       contextId = null,
       sessionId = null,
+      replayPayload = null,
     },
   ) {
     if (!scope?.tracked || !scope.sessionHash) return;
@@ -770,6 +783,19 @@ export function createHermesSessionCoordinator({
       }
       if (sessionId && !record.canonicalSessionId) {
         record.canonicalSessionId = sessionId;
+      }
+      if (
+        terminal === true &&
+        active.fingerprint &&
+        replayPayload &&
+        payloadIsReusable(replayPayload)
+      ) {
+        recentResults.set(scope.sessionHash, {
+          fingerprint: active.fingerprint,
+          settledAtMs: Date.now(),
+          traceId: active.traceId || null,
+          payload: replayPayload,
+        });
       }
       if (terminal === true) {
         record.active = null;
