@@ -277,6 +277,97 @@ test("terminal failure is never replayed and genuine retry is possible", async (
   assert.ok(retry.operationId);
 });
 
+test("successful sessionless completion retains unresolved binding and blocks different work", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "sessionless success",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-sessionless",
+      status: "completed",
+      text: "done",
+    },
+    runId: "run-sessionless",
+    sessionId: null,
+  });
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalSessionId, null);
+  assert.equal(snapshot.active?.kind, "native-session-unresolved");
+  assert.equal(snapshot.active?.runId, "run-sessionless");
+
+  const replay = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "sessionless   success",
+  });
+  assert.equal(replay.replay, true);
+  assert.equal(replay.replayPayload.runId, "run-sessionless");
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "different work",
+    }),
+    (error) => error?.code === "HERMES_NATIVE_SESSION_UNRESOLVED",
+  );
+});
+
+test("reconciliation can resolve a previously sessionless successful binding", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    instruction: "sessionless async success",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      operation: "start_hermes_run",
+      runId: "run-resolve-later",
+      status: "completed",
+    },
+    runId: "run-resolve-later",
+    sessionId: null,
+  });
+
+  const next = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "different after binding resolves",
+    reconcileActive: async (active) => {
+      assert.equal(active.kind, "native-session-unresolved");
+      assert.equal(active.runId, "run-resolve-later");
+      return {
+        terminal: true,
+        sessionId: "session-resolved",
+        replayPayload: {
+          ok: true,
+          operation: "start_hermes_run",
+          runId: "run-resolve-later",
+          sessionId: "session-resolved",
+          status: "completed",
+        },
+      };
+    },
+  });
+
+  assert.equal(next.sessionIdToUse, "session-resolved");
+  assert.ok(next.operationId);
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalSessionId, "session-resolved");
+});
+
 test("successful polled run caches recovered delegate replay", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
