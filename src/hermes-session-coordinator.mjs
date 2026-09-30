@@ -416,6 +416,55 @@ export function createHermesSessionCoordinator({
             ? "a2a"
             : "native";
 
+      let recent = getRecentResult(scope.sessionHash);
+      const now = Date.now();
+      if (
+        recent &&
+        (
+          !Number.isFinite(Number(recent.settledAtMs)) ||
+          now - Number(recent.settledAtMs) > dedupWindowMs
+        )
+      ) {
+        deleteRecentResult(scope.sessionHash);
+        recent = null;
+        changed = true;
+      }
+      if (
+        fingerprint &&
+        recent &&
+        recent.fingerprint === fingerprint &&
+        now - Number(recent.settledAtMs) <= dedupWindowMs
+      ) {
+        if (changed) {
+          record.updatedAt = new Date().toISOString();
+          await persist();
+          changed = false;
+        }
+        return {
+          tracked: true,
+          replay: true,
+          operationId: null,
+          canonicalRoute: record.canonicalRoute || targetRoute,
+          canonicalContextId: record.canonicalContextId || null,
+          canonicalSessionId: record.canonicalSessionId || null,
+          contextIdToUse:
+            requestedContextId || record.canonicalContextId || null,
+          sessionIdToUse:
+            requestedSessionId || record.canonicalSessionId || null,
+          replayPayload: {
+            ...recent.payload,
+            deduplicated: true,
+            duplicateOfTraceId: recent.traceId || null,
+            dedupWindowMs,
+          },
+        };
+      }
+      if (changed) {
+        record.updatedAt = new Date().toISOString();
+        await persist();
+        changed = false;
+      }
+
       if (
         record.canonicalRoute === "native" &&
         !record.canonicalSessionId &&
@@ -495,49 +544,6 @@ export function createHermesSessionCoordinator({
             requestedSessionId,
           },
         );
-      }
-
-      let recent = getRecentResult(scope.sessionHash);
-      const now = Date.now();
-      if (
-        recent &&
-        (
-          !Number.isFinite(Number(recent.settledAtMs)) ||
-          now - Number(recent.settledAtMs) > dedupWindowMs
-        )
-      ) {
-        deleteRecentResult(scope.sessionHash);
-        recent = null;
-        changed = true;
-      }
-      if (
-        fingerprint &&
-        recent &&
-        recent.fingerprint === fingerprint &&
-        now - Number(recent.settledAtMs) <= dedupWindowMs
-      ) {
-        if (changed) {
-          record.updatedAt = new Date().toISOString();
-          await persist();
-        }
-        return {
-          tracked: true,
-          replay: true,
-          operationId: null,
-          canonicalRoute: record.canonicalRoute || targetRoute,
-          canonicalContextId: record.canonicalContextId || null,
-          canonicalSessionId: record.canonicalSessionId || null,
-          contextIdToUse:
-            requestedContextId || record.canonicalContextId || null,
-          sessionIdToUse:
-            requestedSessionId || record.canonicalSessionId || null,
-          replayPayload: {
-            ...recent.payload,
-            deduplicated: true,
-            duplicateOfTraceId: recent.traceId || null,
-            dedupWindowMs,
-          },
-        };
       }
 
       const restoreOnFailure = resumableTask
