@@ -790,9 +790,14 @@ function normalizeTask(value, operation) {
   };
 }
 
-function makeUserMessage(instruction, contextId, taskId) {
+function makeUserMessage(
+  instruction,
+  contextId,
+  taskId,
+  messageId = randomUUID(),
+) {
   return {
-    messageId: randomUUID(),
+    messageId,
     ...(contextId ? { contextId } : {}),
     ...(taskId ? { taskId } : {}),
     role: "ROLE_USER",
@@ -820,11 +825,17 @@ async function continueContext(
   instruction,
   taskId,
   background = false,
+  messageId = null,
 ) {
   const raw = await callBackend("a2a_send_message", {
     agent: AGENT,
     request: {
-      message: makeUserMessage(instruction, contextId, taskId),
+      message: makeUserMessage(
+        instruction,
+        contextId,
+        taskId,
+        messageId || randomUUID(),
+      ),
       ...(background
         ? { configuration: { returnImmediately: true } }
         : {}),
@@ -916,6 +927,13 @@ const TERMINAL_RUN_STATUSES = new Set([
 function taskIsTerminal(result) {
   if (result?.kind === "message") return true;
   return TERMINAL_TASK_STATES.has(result?.stateName);
+}
+
+function taskSucceeded(result) {
+  return (
+    result?.kind === "message" ||
+    result?.stateName === "completed"
+  );
 }
 
 function runIsTerminal(result) {
@@ -1064,9 +1082,14 @@ async function reconcileCoordinatorActive(active) {
   }
   if (active?.kind === "a2a-task" && active.taskId) {
     const result = await getTask(active.taskId);
+    const terminal = taskIsTerminal(result);
     return {
-      terminal: taskIsTerminal(result),
+      terminal,
       contextId: result.contextId || active.contextId || null,
+      replayPayload:
+        terminal && taskSucceeded(result)
+          ? result
+          : null,
     };
   }
   return { terminal: false };
@@ -1113,6 +1136,8 @@ async function executePublicTool(
 
       let nativeRunStarted = false;
       let nativeRunId = null;
+      let a2aSubmissionAttempted = false;
+      let a2aResponseReceived = false;
       try {
         let result;
         if (lease.canonicalRoute === "native") {
@@ -1185,12 +1210,15 @@ async function executePublicTool(
         }
 
         if (lease.contextIdToUse) {
+          a2aSubmissionAttempted = true;
           result = await continueContext(
             lease.contextIdToUse,
             instruction,
             undefined,
             false,
+            lease.idempotencyKey || null,
           );
+          a2aResponseReceived = true;
           result = {
             ...result,
             operation: "delegate_to_hermes",
@@ -1211,7 +1239,20 @@ async function executePublicTool(
           traceId,
         );
       } catch (error) {
-        if (!nativeRunStarted) {
+        if (lease.canonicalRoute === "a2a") {
+          if (a2aSubmissionAttempted && !a2aResponseReceived) {
+            await sessionCoordinator.markSubmissionUnknown(
+              sessionScope,
+              lease.operationId,
+              "a2a",
+            );
+          } else if (!a2aSubmissionAttempted) {
+            await sessionCoordinator.fail(
+              sessionScope,
+              lease.operationId,
+            );
+          }
+        } else if (!nativeRunStarted) {
           await releaseOrPreserveSubmissionFailure(
             sessionScope,
             lease.operationId,
@@ -1248,13 +1289,18 @@ async function executePublicTool(
       });
       if (lease.replay) return lease.replayPayload;
 
+      let a2aSubmissionAttempted = false;
+      let a2aResponseReceived = false;
       try {
+        a2aSubmissionAttempted = true;
         const result = await continueContext(
           lease.contextIdToUse || contextId,
           instruction,
           taskId,
           args.background === true,
+          lease.idempotencyKey || null,
         );
+        a2aResponseReceived = true;
         return await completeA2AOperation(
           sessionScope,
           lease,
@@ -1262,7 +1308,18 @@ async function executePublicTool(
           traceId,
         );
       } catch (error) {
-        await sessionCoordinator.fail(sessionScope, lease.operationId);
+        if (a2aSubmissionAttempted && !a2aResponseReceived) {
+          await sessionCoordinator.markSubmissionUnknown(
+            sessionScope,
+            lease.operationId,
+            "a2a",
+          );
+        } else if (!a2aSubmissionAttempted) {
+          await sessionCoordinator.fail(
+            sessionScope,
+            lease.operationId,
+          );
+        }
         throw error;
       }
     }
@@ -1379,12 +1436,30 @@ async function executePublicTool(
 
     case "get_hermes_run": {
       const runId = requireString(args, "runId");
+      const before = await sessionCoordinator.inspect(sessionScope);
       const result = await control.getRun(runId);
+      const terminal = runIsTerminal(result);
+      const replayPayload =
+        terminal &&
+        nativeRunSucceeded(result) &&
+        before?.active?.kind === "run" &&
+        before.active.runId === runId &&
+        before.active.tool === "delegate_to_hermes"
+          ? nativeDelegateResult(
+              {
+                runId,
+                sessionId: before.active.sessionId || null,
+              },
+              result,
+              Boolean(before.active.sessionId),
+            )
+          : null;
       await sessionCoordinator.observe(sessionScope, {
         kind: "run",
         id: runId,
-        terminal: runIsTerminal(result),
+        terminal,
         sessionId: result.sessionId || null,
+        replayPayload,
       });
       return result;
     }
@@ -1427,11 +1502,16 @@ async function executePublicTool(
       }
       const taskId = requireString(args, "taskId");
       const result = await getTask(taskId, historyLength);
+      const terminal = taskIsTerminal(result);
       await sessionCoordinator.observe(sessionScope, {
         kind: "a2a-task",
         id: taskId,
-        terminal: taskIsTerminal(result),
+        terminal,
         contextId: result.contextId || null,
+        replayPayload:
+          terminal && taskSucceeded(result)
+            ? result
+            : null,
       });
       return result;
     }
