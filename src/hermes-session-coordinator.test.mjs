@@ -599,6 +599,7 @@ test("ambiguous native submission permits only an identical recovery retry", asy
   });
   assert.equal(retry.replay, false);
   assert.notEqual(retry.operationId, first.operationId);
+  assert.equal(retry.idempotencyKey, first.idempotencyKey);
 
   await coordinator.fail(scope, retry.operationId);
   const restored = await coordinator.inspect(scope);
@@ -632,6 +633,7 @@ test("bridge restart can retry the exact persisted native pending submission", a
   });
   assert.equal(retry.replay, false);
   assert.ok(retry.operationId);
+  assert.equal(retry.idempotencyKey, first.idempotencyKey);
 
   await assert.rejects(
     restarted.begin(restartedScope, {
