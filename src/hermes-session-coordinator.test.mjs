@@ -773,6 +773,99 @@ test("blocks a second native session when the durable session id is unresolved",
   assert.equal(recovered.sessionIdToUse, "native-recovered");
 });
 
+test("does not cache a provisional native run checkpoint after failure", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-native",
+    instruction: "native work",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-native",
+      sessionId: "session-native",
+      status: "started",
+    },
+    traceId: "trace-native",
+    runId: "run-native",
+    sessionId: "session-native",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  await coordinator.observe(scope, {
+    kind: "run",
+    id: "run-native",
+    terminal: true,
+    sessionId: "session-native",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-retry",
+    instruction: "native   work",
+  });
+
+  assert.equal(retry.replay, false);
+  assert.ok(retry.operationId);
+});
+
+test("caches the terminal native delegation result", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-native",
+    instruction: "native work",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-native",
+      sessionId: "session-native",
+      status: "started",
+    },
+    traceId: "trace-native",
+    runId: "run-native",
+    sessionId: "session-native",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-native",
+      sessionId: "session-native",
+      status: "completed",
+      text: "done",
+    },
+    traceId: "trace-native",
+    runId: "run-native",
+    sessionId: "session-native",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-retry",
+    instruction: "native   work",
+  });
+
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.status, "completed");
+  assert.equal(retry.replayPayload.text, "done");
+});
+
 test("tracks a controllable run until its terminal status is observed", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
