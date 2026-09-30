@@ -21,13 +21,52 @@ else
 fi
 rm -f /tmp/chatgpt-hermes-launchctl-status.$$
 
-if curl -fsS --max-time 3 http://127.0.0.1:9900/.well-known/agent-card.json >/dev/null 2>&1; then
-  echo "Hermes A2A: READY"
-else
-  echo "Hermes A2A: NOT READY"
+resolve_hermes_env_file() {
+  local hermes_bin resolved
+  hermes_bin="$(command -v hermes || true)"
+  if [[ -n "$hermes_bin" ]]; then
+    resolved="$("$hermes_bin" config env-path 2>/dev/null || true)"
+    if [[ -n "$resolved" && -f "$resolved" ]]; then
+      printf '%s\n' "$resolved"
+      return
+    fi
+  fi
+  printf '%s\n' "$HOME/.hermes/.env"
+}
+
+read_env_value() {
+  local key="$1" file="$2"
+  [[ -f "$file" ]] || return 0
+  /usr/bin/awk -F= -v wanted="$key" '
+    $1 ~ "^[[:space:]]*" wanted "[[:space:]]*$" {
+      sub(/^[^=]*=/, "")
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      gsub(/^["'"'"']|["'"'"']$/, "")
+      print
+      exit
+    }
+  ' "$file"
+}
+
+HERMES_ENV_FILE="$(resolve_hermes_env_file)"
+API_KEY="${API_SERVER_KEY:-$(read_env_value API_SERVER_KEY "$HERMES_ENV_FILE")}"
+API_PORT="${API_SERVER_PORT:-$(read_env_value API_SERVER_PORT "$HERMES_ENV_FILE")}"
+if [[ ! "$API_PORT" =~ ^[0-9]+$ ]]; then
+  API_PORT="$(hermes config get API_SERVER_PORT 2>/dev/null || true)"
+fi
+if [[ ! "$API_PORT" =~ ^[0-9]+$ ]]; then
+  API_PORT="8642"
 fi
 
-READY=0
+NATIVE_READY=0
+if [[ -n "$API_KEY" ]] &&    curl -fsS --max-time 3      -H "Authorization: Bearer $API_KEY"      "http://127.0.0.1:$API_PORT/v1/capabilities" >/dev/null 2>&1; then
+  echo "Hermes native Runs API: READY"
+  NATIVE_READY=1
+else
+  echo "Hermes native Runs API: NOT READY"
+fi
+
+TUNNEL_READY=0
 if [[ -s "$HEALTH_FILE" ]]; then
   HEALTH_URL="$(cat "$HEALTH_FILE" 2>/dev/null || true)"
   echo "Tunnel health URL: ${HEALTH_URL:-unknown}"
@@ -38,7 +77,7 @@ if [[ -s "$HEALTH_FILE" ]]; then
   fi
   if [[ -n "${HEALTH_URL:-}" ]] && curl -fsS --max-time 3 "$HEALTH_URL/readyz" >/dev/null 2>&1; then
     echo "Tunnel readyz: OK"
-    READY=1
+    TUNNEL_READY=1
   else
     echo "Tunnel readyz: FAIL"
   fi
@@ -46,8 +85,9 @@ else
   echo "Tunnel health URL: MISSING"
 fi
 
-if [[ "$READY" -eq 1 ]]; then
+if [[ "$NATIVE_READY" -eq 1 && "$TUNNEL_READY" -eq 1 ]]; then
   echo "Overall: READY"
+  RC=0
 else
   echo "Overall: NOT READY"
   echo
@@ -56,7 +96,8 @@ else
   echo
   echo "stdout tail:"
   tail -n 30 "$OUT_LOG" 2>/dev/null || true
+  RC=1
 fi
 
 echo "===== END STATUS ====="
-exit $((1-READY))
+exit "$RC"
