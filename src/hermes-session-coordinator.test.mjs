@@ -1742,6 +1742,64 @@ test("stop-like completed observation preserves delegate replay", async () => {
   assert.equal(retry.replayPayload.text, "finished before stop");
 });
 
+test("restart globally prunes expired replay payloads from inactive conversations", async () => {
+  const { root, coordinator } = await makeCoordinator({
+    dedupWindowMs: 60_000,
+  });
+  const scopeA = coordinator.scopeFromMeta(metaA);
+  const scopeB = coordinator.scopeFromMeta(metaB);
+
+  for (const [scope, suffix] of [
+    [scopeA, "a"],
+    [scopeB, "b"],
+  ]) {
+    const lease = await coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-" + suffix,
+      instruction: "persist replay " + suffix,
+    });
+    await coordinator.complete(scope, lease.operationId, {
+      payload: {
+        ok: true,
+        operation: "delegate_to_hermes",
+        sessionId: "session-" + suffix,
+        runId: "run-" + suffix,
+        status: "completed",
+        text: "done " + suffix,
+      },
+      traceId: "trace-" + suffix,
+      sessionId: "session-" + suffix,
+      runId: "run-" + suffix,
+    });
+  }
+
+  const statePath = path.join(
+    root,
+    ".runtime",
+    "chatgpt-session-coordinator.json",
+  );
+  const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  state.recentResults[scopeA.sessionHash].settledAtMs = 1;
+  state.recentResults[scopeB.sessionHash].settledAtMs = Date.now();
+  await fs.writeFile(statePath, JSON.stringify(state, null, 2) + "\n");
+
+  let counter = 0;
+  const restarted = createHermesSessionCoordinator({
+    root,
+    dedupWindowMs: 60_000,
+    randomUUID: () => "global-prune-" + ++counter,
+  });
+  await restarted.inspect(restarted.scopeFromMeta(metaB));
+
+  const prunedState = JSON.parse(await fs.readFile(statePath, "utf8"));
+  assert.equal(prunedState.recentResults?.[scopeA.sessionHash], undefined);
+  assert.equal(
+    prunedState.recentResults?.[scopeB.sessionHash]?.payload?.runId,
+    "run-b",
+  );
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
