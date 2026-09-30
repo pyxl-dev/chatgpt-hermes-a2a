@@ -214,7 +214,7 @@ A ChatGPT conversation may have only one mutating Hermes operation active at a t
 
 ChatGPT-scoped A2A background delegation is disabled; intentionally asynchronous work should use `start_hermes_run`, whose `runId` can be polled, steered and stopped. Active run/task state and canonical routing are persisted under `.runtime/chatgpt-session-coordinator.json`, so the bridge can reconcile work after a restart.
 
-Exact-instruction deduplication remains as a second line of defense for 60 seconds by default and is scoped by ChatGPT session. For native ChatGPT delegation, active `runId` state is persisted before synchronous polling begins, so a wrapper restart or polling failure does not unlock a still-running Hermes job. Failed pre-submission attempts are released so a genuine retry can execute.
+Exact-instruction deduplication remains as a second line of defense for 60 seconds by default and is scoped by ChatGPT session. Native ChatGPT submissions additionally use a persisted operation-scoped idempotency key. Active `runId` state is persisted before synchronous polling begins. If POST delivery is ambiguous, the lock is retained and only an exact retry may reuse the same idempotency key, including across a wrapper restart; unrelated work remains blocked. Failed requests known not to have been delivered are released so a genuine retry can execute.
 
 Clients that do not send `openai/session` keep the legacy behavior and are not forced into ChatGPT session coordination.
 
