@@ -622,7 +622,14 @@ export function createHermesSessionCoordinator({
         record.active = null;
       }
 
-      if (active.fingerprint && payload) {
+      const cacheableResult =
+        active.fingerprint &&
+        payload &&
+        !(
+          keepActive &&
+          (activeKind || active.kind) === "run"
+        );
+      if (cacheableResult) {
         recentResults.set(scope.sessionHash, {
           fingerprint: active.fingerprint,
           settledAtMs: Date.now(),
