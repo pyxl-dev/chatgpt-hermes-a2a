@@ -774,7 +774,7 @@ export function createHermesSessionCoordinator({
       const active = record.active;
       if (
         kind !== "run" ||
-        active?.kind !== "run" ||
+        !["run", "native-session-unresolved"].includes(active?.kind) ||
         active?.runId !== id
       ) {
         return snapshot(scope, record);
