@@ -96,9 +96,8 @@ export function createHermesSessionCoordinator({
     process.env.HERMES_SESSION_COORDINATOR_STATE ||
     path.join(runtimeDir, "chatgpt-session-coordinator.json");
 
-  const state = { version: 1, sessions: {} };
+  const state = { version: 1, sessions: {}, recentResults: {} };
   const instanceId = randomUUID();
-  const recentResults = new Map();
   const locks = new Map();
   let loaded = false;
   let loadPromise = null;
@@ -133,6 +132,13 @@ export function createHermesSessionCoordinator({
           !Array.isArray(parsed.sessions)
         ) {
           state.sessions = parsed.sessions;
+          if (
+            parsed.recentResults &&
+            typeof parsed.recentResults === "object" &&
+            !Array.isArray(parsed.recentResults)
+          ) {
+            state.recentResults = parsed.recentResults;
+          }
         }
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
@@ -198,6 +204,26 @@ export function createHermesSessionCoordinator({
       state.sessions[sessionHash] = record;
     }
     return record;
+  }
+
+  function getRecentResult(sessionHash) {
+    const recent = state.recentResults?.[sessionHash];
+    return recent && typeof recent === "object" && !Array.isArray(recent)
+      ? recent
+      : null;
+  }
+
+  function setRecentResult(sessionHash, value) {
+    if (!state.recentResults || typeof state.recentResults !== "object") {
+      state.recentResults = {};
+    }
+    state.recentResults[sessionHash] = value;
+  }
+
+  function deleteRecentResult(sessionHash) {
+    if (state.recentResults && typeof state.recentResults === "object") {
+      delete state.recentResults[sessionHash];
+    }
   }
 
   function snapshot(scope, record) {
@@ -310,16 +336,16 @@ export function createHermesSessionCoordinator({
               reconciled.replayPayload &&
               payloadIsReusable(reconciled.replayPayload)
             ) {
-              recentResults.set(scope.sessionHash, {
+              setRecentResult(scope.sessionHash, {
                 fingerprint: activeFingerprint,
                 settledAtMs: Date.now(),
                 traceId: record.active.traceId || null,
                 payload: reconciled.replayPayload,
               });
             } else if (activeFingerprint) {
-              const recent = recentResults.get(scope.sessionHash);
+              const recent = getRecentResult(scope.sessionHash);
               if (recent?.fingerprint === activeFingerprint) {
-                recentResults.delete(scope.sessionHash);
+                deleteRecentResult(scope.sessionHash);
               }
             }
             record.active = null;
@@ -450,7 +476,7 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      const recent = recentResults.get(scope.sessionHash);
+      const recent = getRecentResult(scope.sessionHash);
       const now = Date.now();
       if (
         fingerprint &&
@@ -478,9 +504,13 @@ export function createHermesSessionCoordinator({
         };
       }
 
-      const restoreOnFailure =
-        resumableTask || recoverablePending
-          ? { ...record.active, restoreOnFailure: null }
+      const restoreOnFailure = resumableTask
+        ? { ...record.active, restoreOnFailure: null }
+        : recoverablePending && record.active?.restoreOnFailure
+          ? {
+              ...record.active.restoreOnFailure,
+              restoreOnFailure: null,
+            }
           : null;
 
       const operationId = randomUUID();
@@ -672,12 +702,23 @@ export function createHermesSessionCoordinator({
           (activeKind || active.kind) === "run"
         );
       if (cacheableResult) {
-        recentResults.set(scope.sessionHash, {
+        setRecentResult(scope.sessionHash, {
           fingerprint: active.fingerprint,
           settledAtMs: Date.now(),
           traceId: traceId || active.traceId || null,
           payload,
         });
+      } else if (!keepActive) {
+        const recent = getRecentResult(scope.sessionHash);
+        const staleFingerprints = new Set(
+          [
+            active.fingerprint || null,
+            active.restoreOnFailure?.fingerprint || null,
+          ].filter(Boolean),
+        );
+        if (recent && staleFingerprints.has(recent.fingerprint)) {
+          deleteRecentResult(scope.sessionHash);
+        }
       }
       record.updatedAt = new Date().toISOString();
       await persist();
@@ -792,16 +833,16 @@ export function createHermesSessionCoordinator({
       }
       if (terminal === true && active.fingerprint) {
         if (replayPayload && payloadIsReusable(replayPayload)) {
-          recentResults.set(scope.sessionHash, {
+          setRecentResult(scope.sessionHash, {
             fingerprint: active.fingerprint,
             settledAtMs: Date.now(),
             traceId: active.traceId || null,
             payload: replayPayload,
           });
         } else {
-          const recent = recentResults.get(scope.sessionHash);
+          const recent = getRecentResult(scope.sessionHash);
           if (recent?.fingerprint === active.fingerprint) {
-            recentResults.delete(scope.sessionHash);
+            deleteRecentResult(scope.sessionHash);
           }
         }
       }
