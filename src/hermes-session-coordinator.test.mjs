@@ -1958,6 +1958,53 @@ test("terminal A2A failure without a resolved context releases the provisional r
   assert.ok(retry.operationId);
 });
 
+test("non-resumable A2A context drift retains the returned task lock", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-drift",
+    instruction: "continue once",
+    requestedContextId: "ctx-expected",
+  });
+
+  await assert.rejects(
+    coordinator.complete(scope, lease.operationId, {
+      payload: {
+        ok: true,
+        contextId: "ctx-other",
+        taskId: "task-drift",
+        stateName: "working",
+      },
+      traceId: "trace-a2a-drift",
+      contextId: "ctx-other",
+      taskId: "task-drift",
+      keepActive: true,
+      activeKind: "a2a-task",
+      activeStateName: "working",
+    }),
+    (error) => error?.code === "HERMES_CONTEXT_DRIFT",
+  );
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.active?.kind, "a2a-task");
+  assert.equal(snapshot.active?.taskId, "task-drift");
+  assert.equal(snapshot.active?.stateName, "working");
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "continue-context",
+      tool: "continue_with_hermes",
+      traceId: "trace-unrelated",
+      instruction: "unrelated work",
+      requestedContextId: "ctx-expected",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
