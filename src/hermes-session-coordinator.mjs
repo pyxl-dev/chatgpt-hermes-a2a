@@ -18,6 +18,24 @@ function sha256(value) {
   return createHash("sha256").update(String(value), "utf8").digest("hex");
 }
 
+const UNSUCCESSFUL_OUTCOMES = new Set([
+  "failed",
+  "rejected",
+  "cancelled",
+  "canceled",
+  "interrupted",
+]);
+
+function payloadIsReusable(payload) {
+  if (!payload || payload.ok === false || payload.error) return false;
+  const status = String(payload.status || "").toLowerCase();
+  const stateName = String(payload.stateName || "").toLowerCase();
+  return (
+    !UNSUCCESSFUL_OUTCOMES.has(status) &&
+    !UNSUCCESSFUL_OUTCOMES.has(stateName)
+  );
+}
+
 function coordinatorError(code, message, details = null) {
   const error = new Error(message);
   error.code = code;
@@ -284,6 +302,18 @@ export function createHermesSessionCoordinator({
             changed = true;
           }
           if (reconciled.terminal === true) {
+            if (
+              record.active.fingerprint &&
+              reconciled.replayPayload &&
+              payloadIsReusable(reconciled.replayPayload)
+            ) {
+              recentResults.set(scope.sessionHash, {
+                fingerprint: record.active.fingerprint,
+                settledAtMs: Date.now(),
+                traceId: record.active.traceId || null,
+                payload: reconciled.replayPayload,
+              });
+            }
             record.active = null;
             changed = true;
           }
@@ -625,6 +655,7 @@ export function createHermesSessionCoordinator({
       const cacheableResult =
         active.fingerprint &&
         payload &&
+        payloadIsReusable(payload) &&
         !(
           keepActive &&
           (activeKind || active.kind) === "run"
