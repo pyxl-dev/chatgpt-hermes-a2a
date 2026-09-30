@@ -461,6 +461,41 @@ test("rejects a returned session that differs from the first requested binding",
   assert.equal(snapshot.active, null);
 });
 
+test("completion session drift with a known run keeps the run locked", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-drift-start",
+    instruction: "run in exact session",
+    requestedSessionId: "session-a",
+  });
+
+  await assert.rejects(
+    coordinator.complete(scope, lease.operationId, {
+      payload: {
+        ok: true,
+        runId: "run-drift",
+        sessionId: "session-b",
+      },
+      traceId: "trace-drift-start",
+      runId: "run-drift",
+      sessionId: "session-b",
+      keepActive: true,
+      activeKind: "run",
+    }),
+    (error) => error?.code === "HERMES_NATIVE_SESSION_DRIFT",
+  );
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalSessionId, null);
+  assert.equal(snapshot.active?.kind, "run");
+  assert.equal(snapshot.active?.runId, "run-drift");
+  assert.equal(snapshot.active?.sessionId, "session-a");
+});
+
 test("observed session drift keeps the active run locked", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
