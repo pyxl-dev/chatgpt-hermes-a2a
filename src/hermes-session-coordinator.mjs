@@ -426,6 +426,21 @@ export function createHermesSessionCoordinator({
           },
         );
       }
+      if (
+        record.canonicalRoute === "a2a" &&
+        !record.canonicalContextId &&
+        mode === "delegate"
+      ) {
+        throw coordinatorError(
+          "HERMES_A2A_CONTEXT_UNRESOLVED",
+          "This ChatGPT conversation is already bound to the A2A route, but its canonical contextId has not been resolved. Continue an explicitly known context instead of creating a second A2A conversation.",
+          {
+            sessionHash: scope.sessionHash,
+            canonicalRoute: record.canonicalRoute,
+            active: activeSummary(record.active),
+          },
+        );
+      }
       if (record.canonicalRoute && record.canonicalRoute !== targetRoute) {
         throw coordinatorError(
           "HERMES_ROUTE_CONFLICT",
@@ -476,14 +491,29 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      const recent = getRecentResult(scope.sessionHash);
+      let recent = getRecentResult(scope.sessionHash);
       const now = Date.now();
+      if (
+        recent &&
+        (
+          !Number.isFinite(Number(recent.settledAtMs)) ||
+          now - Number(recent.settledAtMs) > dedupWindowMs
+        )
+      ) {
+        deleteRecentResult(scope.sessionHash);
+        recent = null;
+        changed = true;
+      }
       if (
         fingerprint &&
         recent &&
         recent.fingerprint === fingerprint &&
-        now - recent.settledAtMs <= dedupWindowMs
+        now - Number(recent.settledAtMs) <= dedupWindowMs
       ) {
+        if (changed) {
+          record.updatedAt = new Date().toISOString();
+          await persist();
+        }
         return {
           tracked: true,
           replay: true,
