@@ -174,8 +174,15 @@ try {
   const descriptions = Object.fromEntries(
     listed.tools.map((tool) => [tool.name, tool.description]),
   );
-  if (!/new/i.test(descriptions.delegate_to_hermes) || !/contextId/i.test(descriptions.delegate_to_hermes)) {
-    throw new Error("delegate_to_hermes description must identify a new mission and contextId handoff");
+  if (
+    !/canonical|same ChatGPT conversation|continue/i.test(
+      descriptions.delegate_to_hermes,
+    ) ||
+    !/context/i.test(descriptions.delegate_to_hermes)
+  ) {
+    throw new Error(
+      "delegate_to_hermes description must explain canonical-context reuse for ChatGPT-scoped calls",
+    );
   }
   if (!/existing|follow-up/i.test(descriptions.continue_with_hermes) || !/contextId/i.test(descriptions.continue_with_hermes)) {
     throw new Error("continue_with_hermes description must identify existing-context follow-ups");
