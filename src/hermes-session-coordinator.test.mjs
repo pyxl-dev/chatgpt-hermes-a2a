@@ -646,6 +646,136 @@ test("bridge restart can retry the exact persisted native pending submission", a
   );
 });
 
+test("replays a successfully reconciled native delegate instead of resubmitting", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-timeout",
+    instruction: "do the privileged thing once",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-timeout",
+      status: "started",
+    },
+    traceId: "trace-timeout",
+    runId: "run-timeout",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-retry",
+    instruction: "do   the privileged thing once",
+    reconcileActive: async () => ({
+      terminal: true,
+      sessionId: "session-timeout",
+      replayPayload: {
+        ok: true,
+        operation: "delegate_to_hermes",
+        runId: "run-timeout",
+        sessionId: "session-timeout",
+        status: "completed",
+        text: "done once",
+        nativeSession: true,
+      },
+    }),
+  });
+
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.runId, "run-timeout");
+  assert.equal(retry.replayPayload.sessionId, "session-timeout");
+  assert.equal(retry.replayPayload.text, "done once");
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalSessionId, "session-timeout");
+  assert.equal(snapshot.active, null);
+});
+
+test("failed reconciled native delegate is released for a genuine retry", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-failed",
+    instruction: "retryable native work",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-failed",
+      status: "started",
+    },
+    traceId: "trace-failed",
+    runId: "run-failed",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-retry",
+    instruction: "retryable   native work",
+    reconcileActive: async () => ({
+      terminal: true,
+      sessionId: "session-failed",
+      replayPayload: null,
+    }),
+  });
+
+  assert.equal(retry.replay, false);
+  assert.ok(retry.operationId);
+  assert.equal(retry.sessionIdToUse, "session-failed");
+});
+
+test("failed terminal A2A result is not cached for dedup replay", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-failed",
+    instruction: "retry this continuation",
+    requestedContextId: "ctx-a2a",
+  });
+
+  await coordinator.complete(scope, first.operationId, {
+    payload: {
+      ok: true,
+      contextId: "ctx-a2a",
+      taskId: "task-failed",
+      stateName: "failed",
+      text: "failed",
+    },
+    traceId: "trace-a2a-failed",
+    contextId: "ctx-a2a",
+    taskId: "task-failed",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-retry",
+    instruction: "retry   this continuation",
+    requestedContextId: "ctx-a2a",
+  });
+
+  assert.equal(retry.replay, false);
+  assert.ok(retry.operationId);
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
