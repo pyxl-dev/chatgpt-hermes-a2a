@@ -241,11 +241,12 @@ The coordinator enforces:
 
 The coordinator state schema is migrated automatically on first load.
 
-From old version-1 state:
+From old version-1 mixed-route state (and the intermediate version-2 native replay format):
 
 - native durable session and native Run state are retained;
 - A2A context/task state is discarded;
-- A2A replay payloads are discarded.
+- A2A replay payloads are discarded;
+- native single-slot replay entries are migrated into version 3's per-fingerprint replay map.
 
 Before switching the persistent runtime to the native-only build, stop any old A2A job you intentionally left running. The new bridge has no A2A task-control surface because A2A is no longer part of the architecture.
 
