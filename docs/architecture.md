@@ -43,10 +43,10 @@ macOS
 
 The public thirteen-tool surface consists of:
 
-- five A2A task/context operations: `delegate_to_hermes`, `continue_with_hermes`, `get_hermes_task`, `cancel_hermes_task`, `hermes_status`;
+- four explicit A2A task/context operations: `continue_with_hermes`, `get_hermes_task`, `cancel_hermes_task`, `hermes_status`;
 - one local observability tool: `hermes_activity`;
 - three durable Hermes-session operations: `list_hermes_sessions`, `get_hermes_session`, `continue_hermes_session`;
-- four controllable-run operations: `start_hermes_run`, `get_hermes_run`, `steer_hermes_run`, `stop_hermes_run`.
+- five native-run operations including the ordinary ChatGPT entrypoint: `delegate_to_hermes`, `start_hermes_run`, `get_hermes_run`, `steer_hermes_run`, `stop_hermes_run`.
 
 ## Trust boundaries
 
@@ -68,13 +68,14 @@ This means the tunnel gives ChatGPT access to the wrapper, not arbitrary direct 
 
 For each ChatGPT conversation it enforces these invariants:
 
-1. one canonical execution route: either A2A or native Hermes sessions/runs;
+1. one canonical execution route: native Hermes sessions/runs by default, or A2A only when explicitly bound;
 2. one mutating Hermes operation active at a time;
-3. one canonical A2A `contextId` or durable Hermes `sessionId`;
-4. later `delegate_to_hermes` calls automatically follow the canonical route, continuing either the A2A `contextId` or native Hermes `sessionId` instead of creating another conversation;
-5. a different explicit `contextId`, `sessionId`, execution route, or concurrent operation is rejected before a model call reaches Hermes.
+3. one canonical durable Hermes `sessionId` on the default route, or one canonical A2A `contextId` on the legacy route;
+4. a first scoped `delegate_to_hermes` call starts a native Run without inventing a session ID, then persists the durable `sessionId` returned by Hermes when the Run settles;
+5. later `delegate_to_hermes` calls submit new Runs into that same native session; existing explicitly A2A-bound chats stay on their original context instead of silently forking;
+6. a different explicit `contextId`, `sessionId`, execution route, or concurrent operation is rejected before a model call reaches Hermes.
 
-Controllable runs remain marked active until a terminal Runs API state is observed. Nonterminal A2A task envelopes are similarly retained when they occur. Before rejecting a new operation, the coordinator can reconcile a persisted run/task with Hermes so a bridge restart does not leave a completed operation permanently locked.
+Every native Run, including the synchronous Run underneath `delegate_to_hermes`, is persisted as active with its `runId` before polling continues. It remains active until a terminal Runs API state is observed. This means a wrapper restart, polling timeout, or transient status failure cannot unlock a Run that may still be executing. Nonterminal A2A task envelopes are similarly retained when they occur. Before rejecting a new operation, the coordinator can reconcile a persisted run/task with Hermes so a bridge restart does not leave a completed operation permanently locked.
 
 For scoped ChatGPT traffic, background A2A delegation is disabled in favor of `start_hermes_run`, because A2A cancellation only cancels the task envelope and cannot guarantee interruption of the underlying agent loop.
 
@@ -91,9 +92,11 @@ Calls from clients that do not provide `openai/session` keep the prior unscoped 
 - `@modelcontextprotocol/sdk` `1.30.0`.
 - OpenAI `tunnel-client`.
 
-The wrapper uses the installed MCP SDK `Client`/`StdioClientTransport` APIs to connect to the existing `a2a-mcp` child process, then maps `delegate_to_hermes` and `continue_with_hermes` to `a2a_send_message`, task reads to `a2a_get_task`, cancellation to `a2a_cancel_task`, and status to `a2a_get_agent_card`.
+The wrapper uses the installed MCP SDK `Client`/`StdioClientTransport` APIs to connect to the existing `a2a-mcp` child process for explicit A2A operations: `continue_with_hermes`, task reads/cancellation, and agent-card status.
 
-For controllable work, `src/hermes-control.mjs` calls the Hermes gateway's loopback Runs API. `start_hermes_run` submits an asynchronous run (optionally loading a durable `sessionId`), `get_hermes_run` polls it, `steer_hermes_run` queues guidance at a live tool boundary, and `stop_hermes_run` requests Hermes' cooperative hard-interrupt path. The API remains bound to loopback and bearer-authenticated.
+For normal ChatGPT-scoped work, `src/hermes-control.mjs` calls the Hermes gateway's loopback Runs API. `delegate_to_hermes` starts a Run, persists its `runId`, polls it synchronously, captures the durable `sessionId`, and reuses that session on later turns. `start_hermes_run` exposes the same native execution path asynchronously for work that needs polling, steering, or stopping. `get_hermes_run`, `steer_hermes_run`, and `stop_hermes_run` operate on that active Run. The API remains bound to loopback and bearer-authenticated.
+
+This default changed after runtime validation showed Hermes' A2A adapter enforces a five-turn anti-loop limit, while successive Runs attached to one native Hermes session preserve context beyond that boundary.
 
 Separately, `list_hermes_sessions` invokes Hermes' native `sessions list` command and parses its compact table into structured discovery metadata. `get_hermes_session` shells no user text: it invokes `hermes sessions export` via Node `execFile`, parses the redacted JSONL export, and removes it; `continue_hermes_session` invokes `hermes chat -q ... -Q --resume <sessionId>` via `execFile`.
 
