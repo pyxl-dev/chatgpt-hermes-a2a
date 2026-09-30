@@ -34,9 +34,9 @@ test("hashes ChatGPT session metadata without persisting the raw id", async () =
     instruction: "inspect the repository",
   });
   await coordinator.complete(scope, lease.operationId, {
-    payload: { ok: true, contextId: "ctx-1" },
+    payload: { ok: true, sessionId: "native-1" },
     traceId: "trace-1",
-    contextId: "ctx-1",
+    sessionId: "native-1",
   });
 
   const state = await fs.readFile(
@@ -70,7 +70,7 @@ test("rejects a second mutating operation while one is active", async () => {
   );
 });
 
-test("binds one canonical A2A context and reuses it for later delegate calls", async () => {
+test("defaults delegate to one canonical native session and reuses it", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
 
@@ -80,10 +80,14 @@ test("binds one canonical A2A context and reuses it for later delegate calls", a
     traceId: "trace-1",
     instruction: "first",
   });
+  assert.equal(first.canonicalRoute, "native");
+  assert.equal(first.sessionIdToUse, null);
+  assert.equal(first.contextIdToUse, null);
+
   await coordinator.complete(scope, first.operationId, {
-    payload: { ok: true, contextId: "ctx-canonical" },
+    payload: { ok: true, sessionId: "native-canonical" },
     traceId: "trace-1",
-    contextId: "ctx-canonical",
+    sessionId: "native-canonical",
   });
 
   const second = await coordinator.begin(scope, {
@@ -92,8 +96,9 @@ test("binds one canonical A2A context and reuses it for later delegate calls", a
     traceId: "trace-2",
     instruction: "follow up",
   });
-  assert.equal(second.contextIdToUse, "ctx-canonical");
-  assert.equal(second.canonicalRoute, "a2a");
+  assert.equal(second.sessionIdToUse, "native-canonical");
+  assert.equal(second.contextIdToUse, null);
+  assert.equal(second.canonicalRoute, "native");
 });
 
 test("replays an identical completed instruction inside the dedup window", async () => {
@@ -107,9 +112,9 @@ test("replays an identical completed instruction inside the dedup window", async
     instruction: "same instruction",
   });
   await coordinator.complete(scope, first.operationId, {
-    payload: { ok: true, contextId: "ctx-1", text: "done" },
+    payload: { ok: true, sessionId: "native-1", text: "done" },
     traceId: "trace-original",
-    contextId: "ctx-1",
+    sessionId: "native-1",
   });
 
   const replay = await coordinator.begin(scope, {
@@ -159,10 +164,11 @@ test("invalid resumable context keeps the original task locked", async () => {
   const scope = coordinator.scopeFromMeta(metaA);
 
   const lease = await coordinator.begin(scope, {
-    mode: "delegate",
-    tool: "delegate_to_hermes",
+    mode: "continue-context",
+    tool: "continue_with_hermes",
     traceId: "trace-input",
     instruction: "needs input",
+    requestedContextId: "ctx-canonical",
   });
   await coordinator.complete(scope, lease.operationId, {
     payload: {
@@ -202,10 +208,11 @@ test("deduplicated resumable retry preserves the active task lock", async () => 
   const scope = coordinator.scopeFromMeta(metaA);
 
   const initial = await coordinator.begin(scope, {
-    mode: "delegate",
-    tool: "delegate_to_hermes",
+    mode: "continue-context",
+    tool: "continue_with_hermes",
     traceId: "trace-initial",
     instruction: "needs input",
+    requestedContextId: "ctx-canonical",
   });
   await coordinator.complete(scope, initial.operationId, {
     payload: {
@@ -279,10 +286,11 @@ test("failed resumable retry restores the original active task lock", async () =
   const scope = coordinator.scopeFromMeta(metaA);
 
   const initial = await coordinator.begin(scope, {
-    mode: "delegate",
-    tool: "delegate_to_hermes",
+    mode: "continue-context",
+    tool: "continue_with_hermes",
     traceId: "trace-initial",
     instruction: "needs input",
+    requestedContextId: "ctx-canonical",
   });
   await coordinator.complete(scope, initial.operationId, {
     payload: {
@@ -393,10 +401,11 @@ test("prevents mixing A2A and native Hermes routes in one ChatGPT conversation",
   const scope = coordinator.scopeFromMeta(metaA);
 
   const first = await coordinator.begin(scope, {
-    mode: "delegate",
-    tool: "delegate_to_hermes",
+    mode: "continue-context",
+    tool: "continue_with_hermes",
     traceId: "trace-1",
     instruction: "start a2a",
+    requestedContextId: "ctx-1",
   });
   await coordinator.complete(scope, first.operationId, {
     payload: { ok: true, contextId: "ctx-1" },
