@@ -10,6 +10,10 @@ function requiredString(value, label) {
   return value.trim();
 }
 
+function normalizeInstruction(value) {
+  return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
+}
+
 export function controlIdempotencyKey(
   sessionId,
   instruction,
@@ -27,7 +31,7 @@ export function controlIdempotencyKey(
         "\n" +
         String(sessionId || "new") +
         "\n" +
-        instruction,
+        normalizeInstruction(instruction),
     )
     .digest("hex");
 }
