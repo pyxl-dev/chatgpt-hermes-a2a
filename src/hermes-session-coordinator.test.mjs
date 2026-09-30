@@ -368,6 +368,60 @@ test("reconciliation can resolve a previously sessionless successful binding", a
   assert.equal(snapshot.canonicalSessionId, "session-resolved");
 });
 
+test("observing a resolved sessionless run preserves exact replay", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "resolve via get run",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-get-resolve",
+      status: "completed",
+      text: "done",
+    },
+    runId: "run-get-resolve",
+    sessionId: null,
+  });
+
+  const unresolved = await coordinator.inspect(scope);
+  assert.equal(unresolved.active?.kind, "native-session-unresolved");
+
+  await coordinator.observe(scope, {
+    kind: "run",
+    id: "run-get-resolve",
+    terminal: true,
+    sessionId: "session-get-resolved",
+    replayPayload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-get-resolve",
+      sessionId: "session-get-resolved",
+      status: "completed",
+      text: "done",
+      nativeSession: true,
+    },
+  });
+
+  const resolved = await coordinator.inspect(scope);
+  assert.equal(resolved.canonicalSessionId, "session-get-resolved");
+  assert.equal(resolved.active, null);
+
+  const replay = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "resolve   via get run",
+  });
+  assert.equal(replay.replay, true);
+  assert.equal(replay.replayPayload.runId, "run-get-resolve");
+  assert.equal(replay.replayPayload.sessionId, "session-get-resolved");
+});
+
 test("successful polled run caches recovered delegate replay", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
