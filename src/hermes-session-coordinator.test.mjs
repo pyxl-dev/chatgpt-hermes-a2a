@@ -1119,6 +1119,170 @@ test("reconciled terminal A2A failure invalidates provisional replay", async () 
   assert.ok(retry.operationId);
 });
 
+test("definitive rejection after recovering unknown A2A submission releases the lock", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-unknown",
+    instruction: "recover exact a2a send",
+    requestedContextId: "ctx-a2a",
+  });
+  await coordinator.markSubmissionUnknown(
+    scope,
+    first.operationId,
+    "a2a",
+  );
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-retry",
+    instruction: "recover   exact a2a send",
+    requestedContextId: "ctx-a2a",
+  });
+  assert.equal(retry.replay, false);
+
+  await coordinator.fail(scope, retry.operationId);
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.active, null);
+
+  const unrelated = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-unrelated",
+    instruction: "different work now allowed",
+    requestedContextId: "ctx-a2a",
+  });
+  assert.ok(unrelated.operationId);
+});
+
+test("direct failed A2A resumption invalidates the earlier provisional replay", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const initial = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-initial",
+    instruction: "original task instruction",
+    requestedContextId: "ctx-a2a",
+  });
+  await coordinator.complete(scope, initial.operationId, {
+    payload: {
+      ok: true,
+      contextId: "ctx-a2a",
+      taskId: "task-a2a",
+      stateName: "input-required",
+      text: "need input",
+    },
+    traceId: "trace-initial",
+    contextId: "ctx-a2a",
+    taskId: "task-a2a",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "input-required",
+  });
+
+  const resume = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-resume",
+    instruction: "resume answer",
+    requestedContextId: "ctx-a2a",
+    requestedTaskId: "task-a2a",
+  });
+  await coordinator.complete(scope, resume.operationId, {
+    payload: {
+      ok: true,
+      contextId: "ctx-a2a",
+      taskId: "task-a2a",
+      stateName: "failed",
+      text: "failed",
+    },
+    traceId: "trace-resume",
+    contextId: "ctx-a2a",
+    taskId: "task-a2a",
+    keepActive: false,
+  });
+
+  const retryOriginal = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-retry-original",
+    instruction: "original   task instruction",
+    requestedContextId: "ctx-a2a",
+  });
+
+  assert.equal(retryOriginal.replay, false);
+  assert.ok(retryOriginal.operationId);
+});
+
+test("completed replay survives a coordinator restart inside the dedup window", async () => {
+  const { root, coordinator } = await makeCoordinator({
+    dedupWindowMs: 60_000,
+  });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-before-restart",
+    instruction: "persist this completed replay",
+  });
+  await coordinator.complete(scope, first.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      sessionId: "session-replay",
+      runId: "run-replay",
+      status: "completed",
+      text: "done",
+    },
+    traceId: "trace-before-restart",
+    sessionId: "session-replay",
+    runId: "run-replay",
+  });
+
+  let counter = 0;
+  const restarted = createHermesSessionCoordinator({
+    root,
+    dedupWindowMs: 60_000,
+    randomUUID: () => "restart-replay-" + ++counter,
+  });
+  const restartedScope = restarted.scopeFromMeta(metaA);
+
+  const replay = await restarted.begin(restartedScope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-after-restart",
+    instruction: "persist   this completed replay",
+  });
+
+  assert.equal(replay.replay, true);
+  assert.equal(replay.replayPayload.runId, "run-replay");
+  assert.equal(replay.replayPayload.sessionId, "session-replay");
+  assert.equal(replay.replayPayload.text, "done");
+
+  const state = JSON.parse(
+    await fs.readFile(
+      path.join(
+        root,
+        ".runtime",
+        "chatgpt-session-coordinator.json",
+      ),
+      "utf8",
+    ),
+  );
+  assert.equal(
+    state.recentResults?.[restartedScope.sessionHash]?.payload?.runId,
+    "run-replay",
+  );
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
