@@ -1196,18 +1196,16 @@ async function completeA2AOperation(
       activeStateName: keepActive ? result.stateName || null : null,
     });
   } catch (error) {
-    if (keepActive && taskId) {
-      const snapshot = await sessionCoordinator.inspect(sessionScope).catch(
-        () => null,
-      );
-      if (
-        error &&
-        typeof error === "object" &&
-        snapshot?.active?.kind === "a2a-task" &&
-        snapshot.active.taskId === taskId
-      ) {
-        error.coordinatorLockRetained = true;
-      }
+    if (
+      keepActive &&
+      taskId &&
+      error &&
+      typeof error === "object"
+    ) {
+      // Hermes returned a known nonterminal task. Even if local completion
+      // bookkeeping fails or rejects drift, clearing the lease could permit
+      // unrelated work while that task is still running.
+      error.coordinatorLockRetained = true;
     }
     throw error;
   }
