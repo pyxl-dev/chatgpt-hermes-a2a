@@ -2,21 +2,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const DEFAULT_STALE_PENDING_MS = 10 * 60 * 1000;
-const DEFAULT_DEDUP_WINDOW_MS = 60 * 1000;
-
-function positiveNumber(value, fallback, minimum = 1) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= minimum ? parsed : fallback;
-}
-
-function normalizeInstruction(value) {
-  return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
-}
-
-function sha256(value) {
-  return createHash("sha256").update(String(value), "utf8").digest("hex");
-}
+const DEFAULT_DEDUP_WINDOW_MS = 60_000;
 
 const UNSUCCESSFUL_OUTCOMES = new Set([
   "failed",
@@ -26,6 +12,14 @@ const UNSUCCESSFUL_OUTCOMES = new Set([
   "interrupted",
 ]);
 
+function sha256(value) {
+  return createHash("sha256").update(String(value), "utf8").digest("hex");
+}
+
+function normalizeInstruction(value) {
+  return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
+}
+
 function payloadIsReusable(payload) {
   if (!payload || payload.ok === false || payload.error) return false;
   const status = String(payload.status || "").toLowerCase();
@@ -34,26 +28,6 @@ function payloadIsReusable(payload) {
     !UNSUCCESSFUL_OUTCOMES.has(status) &&
     !UNSUCCESSFUL_OUTCOMES.has(stateName)
   );
-}
-
-function rollbackUnresolvedCanonicalRoute(record, active) {
-  if (
-    active?.route === "native" &&
-    record.canonicalRoute === "native" &&
-    !record.canonicalSessionId
-  ) {
-    record.canonicalRoute = null;
-    return true;
-  }
-  if (
-    active?.route === "a2a" &&
-    record.canonicalRoute === "a2a" &&
-    !record.canonicalContextId
-  ) {
-    record.canonicalRoute = null;
-    return true;
-  }
-  return false;
 }
 
 function coordinatorError(code, message, details = null) {
@@ -71,27 +45,21 @@ function activeSummary(active) {
     kind: active.kind || null,
     traceId: active.traceId || null,
     startedAt: active.startedAt || null,
-    contextId: active.contextId || null,
     sessionId: active.sessionId || null,
-    taskId: active.taskId || null,
     runId: active.runId || null,
-    stateName: active.stateName || null,
   };
 }
 
-function isStalePending(active, stalePendingMs, now = Date.now()) {
-  if (
-    !active ||
-    active.taskId ||
-    active.runId ||
-    active.route === "native" ||
-    active.kind === "a2a-pending" ||
-    active.kind === "a2a-submission-unknown"
-  ) return false;
-  const startedAtMs = Date.parse(active.startedAt || "");
-  return (
-    Number.isFinite(startedAtMs) &&
-    now - startedAtMs > stalePendingMs
+function nativeReplayPayload(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  return Boolean(
+    payload.runId ||
+      payload.sessionId ||
+      [
+        "delegate_to_hermes",
+        "start_hermes_run",
+        "continue_hermes_session",
+      ].includes(payload.operation),
   );
 }
 
@@ -99,15 +67,8 @@ export function createHermesSessionCoordinator({
   root,
   randomUUID,
   statePath = null,
-  stalePendingMs = positiveNumber(
-    process.env.HERMES_SESSION_STALE_PENDING_MS,
-    DEFAULT_STALE_PENDING_MS,
-    1000,
-  ),
-  dedupWindowMs = positiveNumber(
-    process.env.HERMES_DEDUP_WINDOW_MS,
-    DEFAULT_DEDUP_WINDOW_MS,
-    1000,
+  dedupWindowMs = Number(
+    process.env.HERMES_DEDUP_WINDOW_MS || DEFAULT_DEDUP_WINDOW_MS,
   ),
 }) {
   const runtimeDir = path.join(root, ".runtime");
@@ -116,9 +77,26 @@ export function createHermesSessionCoordinator({
     process.env.HERMES_SESSION_COORDINATOR_STATE ||
     path.join(runtimeDir, "chatgpt-session-coordinator.json");
 
-  const state = { version: 1, sessions: {}, recentResults: {} };
+  const state = { version: 2, sessions: {}, recentResults: {} };
   const instanceId = randomUUID();
   const locks = new Map();
+  let loaded = false;
+  let loadPromise = null;
+  let writeChain = Promise.resolve();
+
+  function scopeFromMeta(meta) {
+    const raw =
+      meta && typeof meta === "object"
+        ? meta["openai/session"]
+        : null;
+    if (typeof raw !== "string" || !raw.trim()) {
+      return { tracked: false, sessionHash: null };
+    }
+    return {
+      tracked: true,
+      sessionHash: sha256(raw.trim()),
+    };
+  }
 
   function pruneExpiredRecentResults(now = Date.now()) {
     if (
@@ -146,82 +124,120 @@ export function createHermesSessionCoordinator({
     }
     return changed;
   }
-  let loaded = false;
-  let loadPromise = null;
-  let writeChain = Promise.resolve();
 
-  function scopeFromMeta(meta) {
-    const raw =
-      meta && typeof meta === "object"
-        ? meta["openai/session"]
-        : null;
-    if (typeof raw !== "string" || !raw.trim()) {
-      return { tracked: false, sessionHash: null };
-    }
-    return {
-      tracked: true,
-      sessionHash: sha256(raw.trim()),
-    };
-  }
+  function migrateV1(parsed) {
+    const nextSessions = {};
+    const nextRecent = {};
 
-  async function ensureLoaded() {
-    if (loaded) return;
-    if (loadPromise) return loadPromise;
-    loadPromise = (async () => {
-      try {
-        const raw = await fs.readFile(filePath, "utf8");
-        const parsed = JSON.parse(raw);
-        if (
-          parsed &&
-          parsed.version === 1 &&
-          parsed.sessions &&
-          typeof parsed.sessions === "object" &&
-          !Array.isArray(parsed.sessions)
-        ) {
-          state.sessions = parsed.sessions;
-          if (
-            parsed.recentResults &&
-            typeof parsed.recentResults === "object" &&
-            !Array.isArray(parsed.recentResults)
-          ) {
-            state.recentResults = parsed.recentResults;
-          }
-        }
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
+    for (const [sessionHash, record] of Object.entries(parsed.sessions || {})) {
+      if (!record || typeof record !== "object" || Array.isArray(record)) {
+        continue;
       }
-      const pruned = pruneExpiredRecentResults();
-      loaded = true;
-      if (pruned) {
-        await persist();
+      const active = record.active;
+      const nativeActive =
+        active &&
+        (
+          active.route === "native" ||
+          active.kind === "run" ||
+          String(active.kind || "").startsWith("native-")
+        )
+          ? {
+              operationId: active.operationId || null,
+              tool: active.tool || null,
+              kind: active.kind || "native-pending",
+              traceId: active.traceId || null,
+              startedAt: active.startedAt || null,
+              sessionId: active.sessionId || null,
+              runId: active.runId || null,
+              fingerprint: active.fingerprint || null,
+              ownerInstanceId: active.ownerInstanceId || null,
+              idempotencyKey: active.idempotencyKey || null,
+            }
+          : null;
+
+      nextSessions[sessionHash] = {
+        canonicalSessionId:
+          record.canonicalSessionId ||
+          nativeActive?.sessionId ||
+          null,
+        active: nativeActive,
+        updatedAt: record.updatedAt || null,
+      };
+
+      const recent = parsed.recentResults?.[sessionHash];
+      if (recent?.payload && nativeReplayPayload(recent.payload)) {
+        nextRecent[sessionHash] = recent;
       }
-    })();
-    try {
-      await loadPromise;
-    } finally {
-      loadPromise = null;
     }
+
+    state.sessions = nextSessions;
+    state.recentResults = nextRecent;
+    state.version = 2;
   }
 
   async function persist() {
+    pruneExpiredRecentResults();
     writeChain = writeChain
       .catch(() => {})
       .then(async () => {
-        pruneExpiredRecentResults();
         await fs.mkdir(path.dirname(filePath), {
           recursive: true,
           mode: 0o700,
         });
         const tempPath = filePath + "." + randomUUID() + ".tmp";
-        const body = JSON.stringify(state, null, 2) + "\n";
-        await fs.writeFile(tempPath, body, {
-          encoding: "utf8",
-          mode: 0o600,
-        });
+        await fs.writeFile(
+          tempPath,
+          JSON.stringify(state, null, 2) + "\n",
+          { encoding: "utf8", mode: 0o600 },
+        );
         await fs.rename(tempPath, filePath);
         await fs.chmod(filePath, 0o600).catch(() => {});
       });
     await writeChain;
+  }
+
+  async function ensureLoaded() {
+    if (loaded) return;
+    if (loadPromise) return loadPromise;
+
+    loadPromise = (async () => {
+      let migrated = false;
+      try {
+        const raw = await fs.readFile(filePath, "utf8");
+        const parsed = JSON.parse(raw);
+        if (
+          parsed &&
+          parsed.sessions &&
+          typeof parsed.sessions === "object" &&
+          !Array.isArray(parsed.sessions)
+        ) {
+          if (parsed.version === 1) {
+            migrateV1(parsed);
+            migrated = true;
+          } else if (parsed.version === 2) {
+            state.sessions = parsed.sessions;
+            state.recentResults =
+              parsed.recentResults &&
+              typeof parsed.recentResults === "object" &&
+              !Array.isArray(parsed.recentResults)
+                ? parsed.recentResults
+                : {};
+          }
+        }
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+
+      const pruned = pruneExpiredRecentResults();
+      loaded = true;
+      if (migrated || pruned) await persist();
+    })();
+
+    try {
+      await loadPromise;
+    } finally {
+      loadPromise = null;
+    }
   }
 
   async function withLock(sessionHash, fn) {
@@ -237,9 +253,7 @@ export function createHermesSessionCoordinator({
       return await fn();
     } finally {
       release();
-      if (locks.get(sessionHash) === queued) {
-        locks.delete(sessionHash);
-      }
+      if (locks.get(sessionHash) === queued) locks.delete(sessionHash);
     }
   }
 
@@ -247,8 +261,6 @@ export function createHermesSessionCoordinator({
     let record = state.sessions[sessionHash];
     if (!record || typeof record !== "object" || Array.isArray(record)) {
       record = {
-        canonicalRoute: null,
-        canonicalContextId: null,
         canonicalSessionId: null,
         active: null,
         updatedAt: null,
@@ -266,52 +278,60 @@ export function createHermesSessionCoordinator({
   }
 
   function setRecentResult(sessionHash, value) {
-    if (!state.recentResults || typeof state.recentResults !== "object") {
-      state.recentResults = {};
-    }
     state.recentResults[sessionHash] = value;
   }
 
   function deleteRecentResult(sessionHash) {
-    if (state.recentResults && typeof state.recentResults === "object") {
-      delete state.recentResults[sessionHash];
-    }
+    delete state.recentResults[sessionHash];
   }
 
   function snapshot(scope, record) {
     return {
-      tracked: scope?.tracked === true,
+      tracked: Boolean(scope?.tracked),
       sessionHash: scope?.sessionHash || null,
-      canonicalRoute: record?.canonicalRoute || null,
-      canonicalContextId: record?.canonicalContextId || null,
       canonicalSessionId: record?.canonicalSessionId || null,
       active: activeSummary(record?.active),
     };
   }
 
+  async function inspect(scope) {
+    if (!scope?.tracked || !scope.sessionHash) {
+      return {
+        tracked: false,
+        sessionHash: null,
+        canonicalSessionId: null,
+        active: null,
+      };
+    }
+    await ensureLoaded();
+    return withLock(scope.sessionHash, async () =>
+      snapshot(scope, getRecord(scope.sessionHash)),
+    );
+  }
+
   async function begin(
     scope,
     {
-      mode,
+      mode = "delegate",
       tool,
-      traceId,
+      traceId = null,
       instruction,
-      requestedContextId = null,
       requestedSessionId = null,
-      requestedTaskId = null,
       reconcileActive = null,
     },
   ) {
+    const requested =
+      typeof requestedSessionId === "string" && requestedSessionId.trim()
+        ? requestedSessionId.trim()
+        : null;
+
     if (!scope?.tracked || !scope.sessionHash) {
       return {
         tracked: false,
         replay: false,
         operationId: null,
-        canonicalRoute: null,
-        canonicalContextId: requestedContextId || null,
-        canonicalSessionId: requestedSessionId || null,
-        contextIdToUse: requestedContextId || null,
-        sessionIdToUse: requestedSessionId || null,
+        canonicalSessionId: requested,
+        sessionIdToUse: requested,
         idempotencyKey: null,
       };
     }
@@ -321,39 +341,15 @@ export function createHermesSessionCoordinator({
       const record = getRecord(scope.sessionHash);
       let changed = false;
 
-      if (isStalePending(record.active, stalePendingMs)) {
-        record.active = record.active.restoreOnFailure || null;
-        changed = true;
-      }
-
       if (record.active && typeof reconcileActive === "function") {
         let reconciled = null;
         try {
           reconciled = await reconcileActive(activeSummary(record.active));
         } catch {
-          // A status failure must never make us assume an active Hermes job ended.
+          // A status failure is not evidence that the active Run ended.
         }
 
         if (reconciled) {
-          const expectedContextId =
-            record.canonicalContextId || record.active.contextId || null;
-          if (
-            reconciled.contextId &&
-            expectedContextId &&
-            reconciled.contextId !== expectedContextId
-          ) {
-            throw coordinatorError(
-              "HERMES_CONTEXT_DRIFT",
-              "Hermes reported a different contextId while reconciling the active operation.",
-              {
-                sessionHash: scope.sessionHash,
-                expectedContextId,
-                returnedContextId: reconciled.contextId,
-                active: activeSummary(record.active),
-              },
-            );
-          }
-
           const expectedSessionId =
             record.canonicalSessionId || record.active.sessionId || null;
           if (
@@ -363,7 +359,7 @@ export function createHermesSessionCoordinator({
           ) {
             throw coordinatorError(
               "HERMES_NATIVE_SESSION_DRIFT",
-              "Hermes reported a different sessionId while reconciling the active operation.",
+              "Hermes reported a different sessionId while reconciling the active Run.",
               {
                 sessionHash: scope.sessionHash,
                 expectedSessionId,
@@ -373,35 +369,29 @@ export function createHermesSessionCoordinator({
             );
           }
 
-          if (reconciled.contextId && !record.canonicalContextId) {
-            record.canonicalContextId = reconciled.contextId;
-            changed = true;
-          }
           if (reconciled.sessionId && !record.canonicalSessionId) {
             record.canonicalSessionId = reconciled.sessionId;
             changed = true;
           }
+
           if (reconciled.terminal === true) {
-            const activeFingerprint = record.active.fingerprint || null;
+            const fingerprint = record.active.fingerprint || null;
             if (
-              activeFingerprint &&
+              fingerprint &&
               reconciled.replayPayload &&
               payloadIsReusable(reconciled.replayPayload)
             ) {
               setRecentResult(scope.sessionHash, {
-                fingerprint: activeFingerprint,
+                fingerprint,
                 settledAtMs: Date.now(),
                 traceId: record.active.traceId || null,
                 payload: reconciled.replayPayload,
               });
-            } else {
-              if (activeFingerprint) {
-                const recent = getRecentResult(scope.sessionHash);
-                if (recent?.fingerprint === activeFingerprint) {
-                  deleteRecentResult(scope.sessionHash);
-                }
+            } else if (fingerprint) {
+              const recent = getRecentResult(scope.sessionHash);
+              if (recent?.fingerprint === fingerprint) {
+                deleteRecentResult(scope.sessionHash);
               }
-              rollbackUnresolvedCanonicalRoute(record, record.active);
             }
             record.active = null;
             changed = true;
@@ -412,7 +402,6 @@ export function createHermesSessionCoordinator({
       if (changed) {
         record.updatedAt = new Date().toISOString();
         await persist();
-        changed = false;
       }
 
       const fingerprint =
@@ -420,56 +409,33 @@ export function createHermesSessionCoordinator({
           ? sha256(
               [
                 mode,
-                requestedContextId || "",
-                requestedSessionId || "",
-                requestedTaskId || "",
+                requested || "",
                 normalizeInstruction(instruction),
               ].join("\n"),
             )
           : null;
 
-      const resumableTask =
-        record.active?.kind === "a2a-task" &&
-        requestedTaskId &&
-        record.active.taskId === requestedTaskId &&
-        ["input-required", "auth-required"].includes(record.active.stateName);
-
+      const active = record.active;
       const recoverablePending =
-        record.active &&
-        [
-          "native-pending",
-          "native-submission-unknown",
-          "a2a-pending",
-          "a2a-submission-unknown",
-        ].includes(record.active.kind) &&
+        active &&
+        ["native-pending", "native-submission-unknown"].includes(active.kind) &&
         fingerprint &&
-        record.active.fingerprint === fingerprint &&
+        active.fingerprint === fingerprint &&
         (
-          record.active.kind.endsWith("-submission-unknown") ||
-          record.active.ownerInstanceId !== instanceId
+          active.kind === "native-submission-unknown" ||
+          active.ownerInstanceId !== instanceId
         );
 
-      if (record.active && !resumableTask && !recoverablePending) {
-        if (changed) {
-          record.updatedAt = new Date().toISOString();
-          await persist();
-        }
+      if (active && !recoverablePending) {
         throw coordinatorError(
           "HERMES_SESSION_BUSY",
-          "Another Hermes operation is already active for this ChatGPT conversation. Reuse or inspect that operation instead of starting parallel work.",
+          "Another Hermes Run is already active for this ChatGPT conversation.",
           {
             sessionHash: scope.sessionHash,
-            active: activeSummary(record.active),
+            active: activeSummary(active),
           },
         );
       }
-
-      const targetRoute =
-        mode === "delegate"
-          ? record.canonicalRoute || "native"
-          : mode === "continue-context"
-            ? "a2a"
-            : "native";
 
       let recent = getRecentResult(scope.sessionHash);
       const now = Date.now();
@@ -482,113 +448,36 @@ export function createHermesSessionCoordinator({
       ) {
         deleteRecentResult(scope.sessionHash);
         recent = null;
-        changed = true;
+        record.updatedAt = new Date().toISOString();
+        await persist();
       }
+
       if (
         fingerprint &&
         recent &&
         recent.fingerprint === fingerprint &&
         now - Number(recent.settledAtMs) <= dedupWindowMs
       ) {
-        if (changed) {
-          record.updatedAt = new Date().toISOString();
-          await persist();
-          changed = false;
-        }
         return {
           tracked: true,
           replay: true,
           operationId: null,
-          canonicalRoute: record.canonicalRoute || targetRoute,
-          canonicalContextId: record.canonicalContextId || null,
           canonicalSessionId: record.canonicalSessionId || null,
-          contextIdToUse:
-            requestedContextId || record.canonicalContextId || null,
-          sessionIdToUse:
-            requestedSessionId || record.canonicalSessionId || null,
+          sessionIdToUse: requested || record.canonicalSessionId || null,
           replayPayload: {
             ...recent.payload,
             deduplicated: true,
             duplicateOfTraceId: recent.traceId || null,
             dedupWindowMs,
           },
+          idempotencyKey: null,
         };
       }
-      if (changed) {
-        record.updatedAt = new Date().toISOString();
-        await persist();
-        changed = false;
-      }
 
       if (
-        record.canonicalRoute === "native" &&
-        !record.canonicalSessionId &&
-        !requestedSessionId &&
-        (mode === "delegate" || mode === "start-run")
-      ) {
-        throw coordinatorError(
-          "HERMES_NATIVE_SESSION_UNRESOLVED",
-          "This ChatGPT conversation is already bound to the native Hermes route, but its durable sessionId has not been resolved yet. Inspect the previous run until Hermes returns a sessionId, or resume an explicitly known durable session.",
-          {
-            sessionHash: scope.sessionHash,
-            canonicalRoute: record.canonicalRoute,
-            active: activeSummary(record.active),
-          },
-        );
-      }
-      if (
-        record.canonicalRoute === "a2a" &&
-        !record.canonicalContextId &&
-        mode === "delegate"
-      ) {
-        throw coordinatorError(
-          "HERMES_A2A_CONTEXT_UNRESOLVED",
-          "This ChatGPT conversation is already bound to the A2A route, but its canonical contextId has not been resolved. Continue an explicitly known context instead of creating a second A2A conversation.",
-          {
-            sessionHash: scope.sessionHash,
-            canonicalRoute: record.canonicalRoute,
-            active: activeSummary(record.active),
-          },
-        );
-      }
-      if (record.canonicalRoute && record.canonicalRoute !== targetRoute) {
-        throw coordinatorError(
-          "HERMES_ROUTE_CONFLICT",
-          "This ChatGPT conversation is already bound to the " +
-            record.canonicalRoute +
-            " Hermes route. Starting work through " +
-            targetRoute +
-            " would create a second Hermes conversation.",
-          {
-            sessionHash: scope.sessionHash,
-            canonicalRoute: record.canonicalRoute,
-            requestedRoute: targetRoute,
-            canonicalContextId: record.canonicalContextId || null,
-            canonicalSessionId: record.canonicalSessionId || null,
-          },
-        );
-      }
-
-      if (
-        requestedContextId &&
-        record.canonicalContextId &&
-        requestedContextId !== record.canonicalContextId
-      ) {
-        throw coordinatorError(
-          "HERMES_CONTEXT_MISMATCH",
-          "The requested A2A contextId does not match the canonical Hermes context for this ChatGPT conversation.",
-          {
-            sessionHash: scope.sessionHash,
-            canonicalContextId: record.canonicalContextId,
-            requestedContextId,
-          },
-        );
-      }
-
-      if (
-        requestedSessionId &&
+        requested &&
         record.canonicalSessionId &&
-        requestedSessionId !== record.canonicalSessionId
+        requested !== record.canonicalSessionId
       ) {
         throw coordinatorError(
           "HERMES_NATIVE_SESSION_MISMATCH",
@@ -596,41 +485,26 @@ export function createHermesSessionCoordinator({
           {
             sessionHash: scope.sessionHash,
             canonicalSessionId: record.canonicalSessionId,
-            requestedSessionId,
+            requestedSessionId: requested,
           },
         );
       }
 
-      const restoreOnFailure = resumableTask
-        ? { ...record.active, restoreOnFailure: null }
-        : recoverablePending && record.active?.restoreOnFailure
-          ? {
-              ...record.active.restoreOnFailure,
-              restoreOnFailure: null,
-            }
-          : null;
-
       const operationId = randomUUID();
       const idempotencyKey =
-        recoverablePending && record.active?.idempotencyKey
-          ? record.active.idempotencyKey
+        recoverablePending && active?.idempotencyKey
+          ? active.idempotencyKey
           : sha256(scope.sessionHash + "\n" + operationId);
+
       record.active = {
         operationId,
         tool,
-        kind: targetRoute === "a2a" ? "a2a-pending" : "native-pending",
-        route: targetRoute,
-        traceId: traceId || null,
+        kind: "native-pending",
+        traceId,
         startedAt: new Date().toISOString(),
-        contextId:
-          requestedContextId || record.canonicalContextId || null,
-        sessionId:
-          requestedSessionId || record.canonicalSessionId || null,
-        taskId: requestedTaskId || null,
+        sessionId: requested || record.canonicalSessionId || null,
         runId: null,
-        stateName: null,
         fingerprint,
-        restoreOnFailure,
         ownerInstanceId: instanceId,
         idempotencyKey,
       };
@@ -641,13 +515,8 @@ export function createHermesSessionCoordinator({
         tracked: true,
         replay: false,
         operationId,
-        canonicalRoute: record.canonicalRoute || targetRoute,
-        canonicalContextId: record.canonicalContextId || null,
         canonicalSessionId: record.canonicalSessionId || null,
-        contextIdToUse:
-          requestedContextId || record.canonicalContextId || null,
-        sessionIdToUse:
-          requestedSessionId || record.canonicalSessionId || null,
+        sessionIdToUse: requested || record.canonicalSessionId || null,
         idempotencyKey,
       };
     });
@@ -659,18 +528,15 @@ export function createHermesSessionCoordinator({
     {
       payload,
       traceId = null,
-      contextId = null,
       sessionId = null,
-      taskId = null,
       runId = null,
       keepActive = false,
       activeKind = null,
-      activeStateName = null,
     } = {},
   ) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
-
     await ensureLoaded();
+
     return withLock(scope.sessionHash, async () => {
       const record = getRecord(scope.sessionHash);
       const active = record.active;
@@ -678,148 +544,81 @@ export function createHermesSessionCoordinator({
         return snapshot(scope, record);
       }
 
-      const driftRecoveryActive = () => {
-        if (active.restoreOnFailure) {
-          return active.restoreOnFailure;
-        }
+      const returnedSessionId =
+        typeof sessionId === "string" && sessionId.trim()
+          ? sessionId.trim()
+          : null;
+      const expectedSessionId =
+        record.canonicalSessionId || active.sessionId || null;
+
+      if (
+        returnedSessionId &&
+        expectedSessionId &&
+        returnedSessionId !== expectedSessionId
+      ) {
         if (runId) {
-          return {
+          record.active = {
             ...active,
             kind: activeKind || "run",
             runId,
-            taskId: taskId || active.taskId || null,
-            stateName: activeStateName || active.stateName || null,
-            restoreOnFailure: null,
+            sessionId: active.sessionId || null,
+            ownerInstanceId: instanceId,
           };
+          record.updatedAt = new Date().toISOString();
+          await persist();
         }
-        if (keepActive && taskId) {
-          return {
-            ...active,
-            kind: activeKind || "a2a-task",
-            taskId,
-            stateName: activeStateName || active.stateName || null,
-            restoreOnFailure: null,
-          };
-        }
-        return null;
-      };
-
-      if (
-        active.route &&
-        record.canonicalRoute &&
-        active.route !== record.canonicalRoute
-      ) {
-        record.active = driftRecoveryActive();
-        record.updatedAt = new Date().toISOString();
-        await persist();
-        throw coordinatorError(
-          "HERMES_ROUTE_DRIFT",
-          "Hermes operation completed through a different route than the canonical route for this ChatGPT conversation.",
-          {
-            sessionHash: scope.sessionHash,
-            canonicalRoute: record.canonicalRoute,
-            returnedRoute: active.route,
-          },
-        );
-      }
-
-      const expectedContextId =
-        record.canonicalContextId || active.contextId || null;
-      if (
-        contextId &&
-        expectedContextId &&
-        contextId !== expectedContextId
-      ) {
-        record.active = driftRecoveryActive();
-        record.updatedAt = new Date().toISOString();
-        await persist();
-        throw coordinatorError(
-          "HERMES_CONTEXT_DRIFT",
-          "Hermes returned a different contextId than the context requested or already bound for this ChatGPT conversation.",
-          {
-            sessionHash: scope.sessionHash,
-            expectedContextId,
-            returnedContextId: contextId,
-          },
-        );
-      }
-
-      const expectedSessionId =
-        record.canonicalSessionId || active.sessionId || null;
-      if (
-        sessionId &&
-        expectedSessionId &&
-        sessionId !== expectedSessionId
-      ) {
-        record.active = driftRecoveryActive();
-        record.updatedAt = new Date().toISOString();
-        await persist();
         throw coordinatorError(
           "HERMES_NATIVE_SESSION_DRIFT",
-          "Hermes returned a different sessionId than the session requested or already bound for this ChatGPT conversation.",
+          "Hermes returned a different sessionId than the requested or canonical durable session.",
           {
             sessionHash: scope.sessionHash,
             expectedSessionId,
-            returnedSessionId: sessionId,
+            returnedSessionId,
+            runId: runId || null,
           },
         );
       }
 
-      if (active.route && !record.canonicalRoute) {
-        record.canonicalRoute = active.route;
-      }
-      if (contextId && !record.canonicalContextId) {
-        record.canonicalContextId = contextId;
-      }
-      if (sessionId && !record.canonicalSessionId) {
-        record.canonicalSessionId = sessionId;
+      if (returnedSessionId && !record.canonicalSessionId) {
+        record.canonicalSessionId = returnedSessionId;
       }
 
       if (keepActive) {
         record.active = {
           ...active,
-          restoreOnFailure: null,
-          kind: activeKind || active.kind,
-          contextId: contextId || active.contextId || null,
-          sessionId: sessionId || active.sessionId || null,
-          taskId: taskId || active.taskId || null,
+          kind: activeKind || "run",
+          sessionId:
+            returnedSessionId ||
+            active.sessionId ||
+            record.canonicalSessionId ||
+            null,
           runId: runId || active.runId || null,
-          stateName: activeStateName || active.stateName || null,
+          ownerInstanceId: instanceId,
         };
       } else {
         record.active = null;
       }
 
-      const cacheableResult =
+      const cacheable =
         active.fingerprint &&
         payload &&
         payloadIsReusable(payload) &&
-        !(
-          keepActive &&
-          (activeKind || active.kind) === "run"
-        );
-      if (!keepActive && !payloadIsReusable(payload)) {
-        rollbackUnresolvedCanonicalRoute(record, active);
-      }
-      if (cacheableResult) {
+        !(keepActive && (activeKind || active.kind) === "run");
+
+      if (cacheable) {
         setRecentResult(scope.sessionHash, {
           fingerprint: active.fingerprint,
           settledAtMs: Date.now(),
           traceId: traceId || active.traceId || null,
           payload,
         });
-      } else if (!keepActive) {
+      } else if (!keepActive && active.fingerprint) {
         const recent = getRecentResult(scope.sessionHash);
-        const staleFingerprints = new Set(
-          [
-            active.fingerprint || null,
-            active.restoreOnFailure?.fingerprint || null,
-          ].filter(Boolean),
-        );
-        if (recent && staleFingerprints.has(recent.fingerprint)) {
+        if (recent?.fingerprint === active.fingerprint) {
           deleteRecentResult(scope.sessionHash);
         }
       }
+
       record.updatedAt = new Date().toISOString();
       await persist();
       return snapshot(scope, record);
@@ -832,7 +631,7 @@ export function createHermesSessionCoordinator({
     return withLock(scope.sessionHash, async () => {
       const record = getRecord(scope.sessionHash);
       if (record.active?.operationId === operationId) {
-        record.active = record.active.restoreOnFailure || null;
+        record.active = null;
         record.updatedAt = new Date().toISOString();
         await persist();
       }
@@ -840,11 +639,7 @@ export function createHermesSessionCoordinator({
     });
   }
 
-  async function markSubmissionUnknown(
-    scope,
-    operationId,
-    route = "native",
-  ) {
+  async function markSubmissionUnknown(scope, operationId) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
     await ensureLoaded();
     return withLock(scope.sessionHash, async () => {
@@ -852,10 +647,7 @@ export function createHermesSessionCoordinator({
       if (record.active?.operationId === operationId) {
         record.active = {
           ...record.active,
-          kind:
-            route === "a2a"
-              ? "a2a-submission-unknown"
-              : "native-submission-unknown",
+          kind: "native-submission-unknown",
           ownerInstanceId: instanceId,
         };
         record.updatedAt = new Date().toISOString();
@@ -871,87 +663,73 @@ export function createHermesSessionCoordinator({
       kind,
       id,
       terminal,
-      contextId = null,
       sessionId = null,
       replayPayload = null,
     },
   ) {
     if (!scope?.tracked || !scope.sessionHash) return;
     await ensureLoaded();
+
     return withLock(scope.sessionHash, async () => {
       const record = getRecord(scope.sessionHash);
       const active = record.active;
-      const matches =
-        kind === "run"
-          ? active?.kind === "run" && active?.runId === id
-          : active?.kind === "a2a-task" && active?.taskId === id;
-      if (!matches) return snapshot(scope, record);
-
-      const expectedContextId =
-        record.canonicalContextId || active.contextId || null;
       if (
-        contextId &&
-        expectedContextId &&
-        contextId !== expectedContextId
+        kind !== "run" ||
+        active?.kind !== "run" ||
+        active?.runId !== id
       ) {
-        throw coordinatorError(
-          "HERMES_CONTEXT_DRIFT",
-          "Hermes reported a different contextId while observing the active operation.",
-          {
-            sessionHash: scope.sessionHash,
-            expectedContextId,
-            returnedContextId: contextId,
-            active: activeSummary(active),
-          },
-        );
+        return snapshot(scope, record);
       }
 
+      const returnedSessionId =
+        typeof sessionId === "string" && sessionId.trim()
+          ? sessionId.trim()
+          : null;
       const expectedSessionId =
         record.canonicalSessionId || active.sessionId || null;
+
       if (
-        sessionId &&
+        returnedSessionId &&
         expectedSessionId &&
-        sessionId !== expectedSessionId
+        returnedSessionId !== expectedSessionId
       ) {
         throw coordinatorError(
           "HERMES_NATIVE_SESSION_DRIFT",
-          "Hermes reported a different sessionId while observing the active operation.",
+          "Hermes reported a different sessionId while observing the active Run.",
           {
             sessionHash: scope.sessionHash,
             expectedSessionId,
-            returnedSessionId: sessionId,
+            returnedSessionId,
             active: activeSummary(active),
           },
         );
       }
 
-      if (contextId && !record.canonicalContextId) {
-        record.canonicalContextId = contextId;
+      if (returnedSessionId && !record.canonicalSessionId) {
+        record.canonicalSessionId = returnedSessionId;
       }
-      if (sessionId && !record.canonicalSessionId) {
-        record.canonicalSessionId = sessionId;
-      }
-      if (terminal === true && active.fingerprint) {
-        if (replayPayload && payloadIsReusable(replayPayload)) {
+
+      if (terminal === true) {
+        if (
+          active.fingerprint &&
+          replayPayload &&
+          payloadIsReusable(replayPayload)
+        ) {
           setRecentResult(scope.sessionHash, {
             fingerprint: active.fingerprint,
             settledAtMs: Date.now(),
             traceId: active.traceId || null,
             payload: replayPayload,
           });
-        } else {
+        } else if (active.fingerprint) {
           const recent = getRecentResult(scope.sessionHash);
           if (recent?.fingerprint === active.fingerprint) {
             deleteRecentResult(scope.sessionHash);
           }
-          rollbackUnresolvedCanonicalRoute(record, active);
         }
-      } else if (terminal === true) {
-        rollbackUnresolvedCanonicalRoute(record, active);
-      }
-      if (terminal === true) {
         record.active = null;
       }
+
       record.updatedAt = new Date().toISOString();
       await persist();
       return snapshot(scope, record);
@@ -968,7 +746,7 @@ export function createHermesSessionCoordinator({
       }
       throw coordinatorError(
         "HERMES_RUN_MISMATCH",
-        "The requested runId is not the active Hermes run for this ChatGPT conversation.",
+        "The requested runId is not the active Hermes Run for this ChatGPT conversation.",
         {
           sessionHash: scope.sessionHash,
           requestedRunId: runId,
@@ -978,58 +756,14 @@ export function createHermesSessionCoordinator({
     });
   }
 
-  async function assertActiveTask(scope, taskId) {
-    if (!scope?.tracked || !scope.sessionHash) return;
-    await ensureLoaded();
-    return withLock(scope.sessionHash, async () => {
-      const record = getRecord(scope.sessionHash);
-      if (
-        record.active?.kind === "a2a-task" &&
-        record.active.taskId === taskId
-      ) {
-        return snapshot(scope, record);
-      }
-      throw coordinatorError(
-        "HERMES_TASK_MISMATCH",
-        "The requested taskId is not the active Hermes task for this ChatGPT conversation.",
-        {
-          sessionHash: scope.sessionHash,
-          requestedTaskId: taskId,
-          active: activeSummary(record.active),
-        },
-      );
-    });
-  }
-
-  async function inspect(scope) {
-    if (!scope?.tracked || !scope.sessionHash) {
-      return {
-        tracked: false,
-        sessionHash: null,
-        canonicalRoute: null,
-        canonicalContextId: null,
-        canonicalSessionId: null,
-        active: null,
-      };
-    }
-    await ensureLoaded();
-    return withLock(scope.sessionHash, async () =>
-      snapshot(scope, getRecord(scope.sessionHash)),
-    );
-  }
-
   return {
-    statePath: filePath,
-    stalePendingMs,
-    dedupWindowMs,
     scopeFromMeta,
+    inspect,
     begin,
     complete,
     fail,
     markSubmissionUnknown,
     observe,
     assertActiveRun,
-    assertActiveTask,
-    inspect,
   };
 }
