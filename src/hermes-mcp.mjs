@@ -1045,73 +1045,58 @@ async function executePublicTool(
       });
       if (lease.replay) return lease.replayPayload;
 
+      let nativeRunStarted = false;
+      let nativeRunId = null;
       try {
         let result;
         if (lease.canonicalRoute === "native") {
-          let runStarted = false;
-          let started = null;
-          try {
-            started = await control.startRun(
-              instruction,
-              lease.sessionIdToUse,
+          const started = await control.startRun(
+            instruction,
+            lease.sessionIdToUse,
+          );
+          if (!started?.runId) {
+            throw codedError(
+              "HERMES_NATIVE_RUN_ID_MISSING",
+              "Hermes accepted native delegation without returning a runId.",
+              { sessionHash: sessionScope?.sessionHash || null },
             );
-            if (!started?.runId) {
-              throw codedError(
-                "HERMES_NATIVE_RUN_ID_MISSING",
-                "Hermes accepted native delegation without returning a runId.",
-                { sessionHash: sessionScope?.sessionHash || null },
-              );
-            }
-
-            await sessionCoordinator.complete(
-              sessionScope,
-              lease.operationId,
-              {
-                payload: started,
-                traceId,
-                sessionId:
-                  started.sessionId || lease.sessionIdToUse || null,
-                runId: started.runId,
-                keepActive: true,
-                activeKind: "run",
-              },
-            );
-            runStarted = true;
-
-            const completed = await waitForNativeRun(started.runId);
-            result = nativeDelegateResult(
-              started,
-              completed,
-              Boolean(lease.sessionIdToUse),
-            );
-
-            await sessionCoordinator.complete(
-              sessionScope,
-              lease.operationId,
-              {
-                payload: result,
-                traceId,
-                sessionId:
-                  result.sessionId || lease.sessionIdToUse || null,
-                runId: result.runId || started.runId,
-              },
-            );
-            return result;
-          } catch (error) {
-            if (!runStarted) {
-              await sessionCoordinator.fail(
-                sessionScope,
-                lease.operationId,
-              );
-            } else if (!error?.details?.runId) {
-              error.details = {
-                ...(error?.details || {}),
-                runId: started?.runId || null,
-                sessionHash: sessionScope?.sessionHash || null,
-              };
-            }
-            throw error;
           }
+
+          nativeRunId = started.runId;
+          await sessionCoordinator.complete(
+            sessionScope,
+            lease.operationId,
+            {
+              payload: started,
+              traceId,
+              sessionId:
+                started.sessionId || lease.sessionIdToUse || null,
+              runId: started.runId,
+              keepActive: true,
+              activeKind: "run",
+            },
+          );
+          nativeRunStarted = true;
+
+          const completed = await waitForNativeRun(started.runId);
+          result = nativeDelegateResult(
+            started,
+            completed,
+            Boolean(lease.sessionIdToUse),
+          );
+
+          await sessionCoordinator.complete(
+            sessionScope,
+            lease.operationId,
+            {
+              payload: result,
+              traceId,
+              sessionId:
+                result.sessionId || lease.sessionIdToUse || null,
+              runId: result.runId || started.runId,
+            },
+          );
+          return result;
         }
 
         if (lease.contextIdToUse) {
@@ -1141,7 +1126,15 @@ async function executePublicTool(
           traceId,
         );
       } catch (error) {
-        await sessionCoordinator.fail(sessionScope, lease.operationId);
+        if (!nativeRunStarted) {
+          await sessionCoordinator.fail(sessionScope, lease.operationId);
+        } else if (!error?.details?.runId) {
+          error.details = {
+            ...(error?.details || {}),
+            runId: nativeRunId,
+            sessionHash: sessionScope?.sessionHash || null,
+          };
+        }
         throw error;
       }
     }
