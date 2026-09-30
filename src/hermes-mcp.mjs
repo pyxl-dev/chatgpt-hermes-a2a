@@ -1050,6 +1050,14 @@ async function executePublicTool(
       try {
         let result;
         if (lease.canonicalRoute === "native") {
+          if (!control.configured) {
+            throw codedError(
+              "HERMES_NATIVE_CONTROL_REQUIRED",
+              "ChatGPT-scoped delegation uses Hermes' native Runs API. Run scripts/setup-hermes-control.sh, restart the bridge, then retry.",
+              { sessionHash: sessionScope?.sessionHash || null },
+            );
+          }
+
           const started = await control.startRun(
             instruction,
             lease.sessionIdToUse,
