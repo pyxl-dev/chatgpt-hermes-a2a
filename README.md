@@ -167,7 +167,7 @@ The tunnel-facing server exposes exactly 13 tools. Generic `a2a_*` backend tools
 
 | Tool | Use it when | Inputs |
 | --- | --- | --- |
-| `delegate_to_hermes` | Start a new independent local Hermes mission | `instruction`, optional `background` |
+| `delegate_to_hermes` | Run ordinary Hermes work; in ChatGPT it creates the canonical context once, then reuses it for later calls | `instruction`, optional `background` |
 | `continue_with_hermes` | Continue an existing A2A conversation | `contextId`, `instruction`, optional `taskId`, optional `background` |
 | `list_hermes_sessions` | Discover recent durable Hermes conversations | optional `limit`, `source`, `workspace` |
 | `get_hermes_session` | Read a durable Hermes conversation | `sessionId`, optional `limit`, optional `includeTools` |
