@@ -6,52 +6,60 @@ import test from "node:test";
 
 import { createHermesObservability } from "./hermes-observability.mjs";
 
-test("delegate deduplication is isolated by ChatGPT session scope", async () => {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-observability-test-"));
+test("native activity traces are redacted, persisted and filterable", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-observability-"));
   let uuid = 0;
-  let calls = 0;
   const observability = createHermesObservability({
     root,
-    redactText: (value) => String(value),
+    redactText: (value) => String(value).replaceAll("SECRET", "[REDACTED]"),
     redactValue: (value) => value,
-    randomUUID: () => "uuid-" + ++uuid,
+    randomUUID: () => "trace-" + ++uuid,
   });
 
-  const delegate = observability.wrapDelegate(async () => {
-    calls += 1;
-    return {
+  const base = observability.beginTrace(
+    "delegate_to_hermes",
+    {
+      instruction: "inspect   SECRET",
+      sessionId: "session-1",
+    },
+    { chatgptSessionHash: "hash-1" },
+  );
+
+  const finished = observability.finishTrace(
+    base,
+    {
       ok: true,
-      taskId: "task-" + calls,
-      contextId: "ctx-" + calls,
-    };
+      operation: "delegate_to_hermes",
+      runId: "run-1",
+      sessionId: "session-1",
+      status: "completed",
+      deduplicated: true,
+      duplicateOfTraceId: "trace-original",
+    },
+    null,
+  );
+
+  await observability.appendTrace(finished);
+  await observability.flush();
+
+  const result = await observability.readActivity({
+    limit: 10,
+    tool: "delegate_to_hermes",
+    deduplicatedOnly: true,
   });
 
-  const sessionA = await delegate(
-    "same instruction",
-    false,
-    "trace-a",
-    "chatgpt-session-a",
-  );
-  const sessionB = await delegate(
-    "same instruction",
-    false,
-    "trace-b",
-    "chatgpt-session-b",
-  );
+  assert.equal(result.count, 1);
+  assert.equal(result.records[0].purpose, "delegate-native-session");
+  assert.equal(result.records[0].chatgptSessionHash, "hash-1");
+  assert.equal(result.records[0].inputSessionId, "session-1");
+  assert.equal(result.records[0].outputRunId, "run-1");
+  assert.equal(result.records[0].status, "completed");
+  assert.equal(result.records[0].instructionPreview.includes("SECRET"), false);
+  assert.equal(result.records[0].deduplicated, true);
 
-  assert.equal(calls, 2);
-  assert.notEqual(sessionA.contextId, sessionB.contextId);
-  assert.equal(sessionA.deduplicated, false);
-  assert.equal(sessionB.deduplicated, false);
-
-  const repeatedA = await delegate(
-    "same   instruction",
-    false,
-    "trace-a-retry",
-    "chatgpt-session-a",
+  const raw = await fs.readFile(
+    path.join(root, ".runtime", "hermes-activity.jsonl"),
+    "utf8",
   );
-  assert.equal(calls, 2);
-  assert.equal(repeatedA.contextId, sessionA.contextId);
-  assert.equal(repeatedA.deduplicated, true);
-  assert.equal(repeatedA.duplicateOfTraceId, "trace-a");
+  assert.equal(raw.includes("SECRET"), false);
 });
