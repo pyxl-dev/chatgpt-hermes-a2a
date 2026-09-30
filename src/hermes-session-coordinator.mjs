@@ -3,7 +3,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_DEDUP_WINDOW_MS = 60_000;
-const MAX_RECENT_RESULTS_PER_SESSION = 64;
 
 const UNSUCCESSFUL_OUTCOMES = new Set([
   "failed",
@@ -329,19 +328,6 @@ export function createHermesSessionCoordinator({
     }
     bucket[fingerprint] = value;
 
-    const entries = Object.entries(bucket);
-    if (entries.length > MAX_RECENT_RESULTS_PER_SESSION) {
-      entries
-        .sort(
-          (a, b) =>
-            Number(a[1]?.settledAtMs || 0) -
-            Number(b[1]?.settledAtMs || 0),
-        )
-        .slice(0, entries.length - MAX_RECENT_RESULTS_PER_SESSION)
-        .forEach(([oldFingerprint]) => {
-          delete bucket[oldFingerprint];
-        });
-    }
   }
 
   function deleteRecentResult(sessionHash, fingerprint) {
