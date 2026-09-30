@@ -1112,7 +1112,7 @@ async function executePublicTool(
           const started = await control.startRun(
             instruction,
             lease.sessionIdToUse,
-            sessionScope?.sessionHash || "unscoped",
+            lease.idempotencyKey || "unscoped",
           );
           nativeRunId = requireNativeRunId(started, sessionScope);
           await sessionCoordinator.complete(
@@ -1324,7 +1324,7 @@ async function executePublicTool(
         const result = await control.startRun(
           instruction,
           lease.sessionIdToUse,
-          sessionScope?.sessionHash || "unscoped",
+          lease.idempotencyKey || "unscoped",
         );
         const runId = requireNativeRunId(result, sessionScope);
         const keepActive = !runIsTerminal(result);
