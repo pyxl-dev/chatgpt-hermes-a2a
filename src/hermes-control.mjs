@@ -10,10 +10,23 @@ function requiredString(value, label) {
   return value.trim();
 }
 
-function controlIdempotencyKey(sessionId, instruction) {
-  const bucket = Math.floor(Date.now() / 60000);
+export function controlIdempotencyKey(
+  sessionId,
+  instruction,
+  scope = "unscoped",
+  nowMs = Date.now(),
+) {
+  const bucket = Math.floor(nowMs / 60000);
   return createHash("sha256")
-    .update(String(bucket) + "\n" + String(sessionId || "new") + "\n" + instruction)
+    .update(
+      String(bucket) +
+        "\n" +
+        String(scope || "unscoped") +
+        "\n" +
+        String(sessionId || "new") +
+        "\n" +
+        instruction,
+    )
     .digest("hex");
 }
 
@@ -42,6 +55,7 @@ export function createHermesControl({ redactText, redactValue }) {
 
   async function request(path, { method = "GET", body, headers = {} } = {}) {
     ensureConfigured();
+    const methodName = String(method || "GET").toUpperCase();
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
@@ -86,14 +100,25 @@ export function createHermesControl({ redactText, redactValue }) {
         );
         error.status = response.status;
         error.code = payload?.error?.code || payload?.code || null;
+        error.deliveryAmbiguous =
+          methodName !== "GET" && response.status >= 500;
         throw error;
       }
       return redactValue(payload || {});
     } catch (error) {
       if (error?.name === "AbortError") {
-        throw new Error(
+        const timeoutError = new Error(
           "Hermes control API request timed out after " + timeoutMs + "ms",
         );
+        timeoutError.deliveryAmbiguous = methodName !== "GET";
+        throw timeoutError;
+      }
+      if (
+        methodName !== "GET" &&
+        error?.deliveryAmbiguous === undefined &&
+        error?.status === undefined
+      ) {
+        error.deliveryAmbiguous = true;
       }
       throw error;
     } finally {
@@ -117,7 +142,11 @@ export function createHermesControl({ redactText, redactValue }) {
     };
   }
 
-  async function startRun(instruction, sessionId = null) {
+  async function startRun(
+    instruction,
+    sessionId = null,
+    idempotencyScope = "unscoped",
+  ) {
     const text = requiredString(instruction, "instruction");
     const durableSessionId =
       typeof sessionId === "string" && sessionId.trim()
@@ -126,7 +155,11 @@ export function createHermesControl({ redactText, redactValue }) {
     const payload = await request("/v1/runs", {
       method: "POST",
       headers: {
-        "Idempotency-Key": controlIdempotencyKey(durableSessionId, text),
+        "Idempotency-Key": controlIdempotencyKey(
+          durableSessionId,
+          text,
+          idempotencyScope,
+        ),
       },
       body: {
         input: text,
