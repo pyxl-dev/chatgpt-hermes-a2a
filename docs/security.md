@@ -1,65 +1,145 @@
 # Security notes
 
-This project gives a remote ChatGPT session a path to an agent that can act on the local Mac. Treat the bridge as privileged automation.
+This project gives a remote ChatGPT session a path to a local Hermes Agent. Treat the bridge as privileged automation.
 
-## Invariants
+The repository name and LaunchAgent identifiers still contain `a2a` for backward compatibility with existing installations. The current runtime is native-only and does not use Hermes A2A.
 
-1. Keep Hermes A2A bound to 127.0.0.1. Do not expose port 9900 directly to the public internet.
-2. Use OpenAI Secure MCP Tunnel for the ChatGPT-facing transport.
-3. Never commit .env, OpenAI API keys, A2A bearer tokens, or tunnel credentials.
-4. The runtime config references A2A_BEARER_TOKEN by environment-variable name; it does not write the token into the repo.
-5. The diagnostic script reads at most the single A2A_BEARER_TOKEN value from ~/.hermes/.env; it does not source the entire Hermes secret file.
-6. The diagnostic writes only /tmp/chatgpt-hermes-ux-proof.txt when testing Hermes tool execution.
-7. Reports and runtime logs are gitignored.
-8. `src/hermes-mcp.mjs` exposes exactly thirteen UX tools. It does not forward the generic backend's agent-list, stream, or push-notification tools to ChatGPT.
-9. The wrapper redacts secret-looking fields in backend fallbacks and never logs the A2A bearer-token value.
-10. `hermes_activity` is read-only with respect to Hermes: it reads local JSONL traces without calling the A2A backend.
-11. Activity traces do not store the full instruction; they store SHA-256 plus a redacted/truncated preview.
-12. `scripts/start-bridge.sh` uses `umask 077`; the wrapper attempts to keep `.runtime/hermes-activity.jsonl` at mode `0600`.
-13. `list_hermes_sessions` is read-only with respect to Hermes conversations: it invokes Hermes' native `sessions list` command and returns redacted compact metadata without loading message histories or contacting the model.
-14. `get_hermes_session` uses Hermes' native `sessions export` with `--redact`; its temporary JSONL lives under gitignored `.runtime/` and is removed in a `finally` block after parsing.
-15. Native session discovery/export and unscoped legacy continuation use Node `execFile` with argument arrays, not a shell command string, so a supplied `sessionId` or instruction is not shell-interpreted by the bridge. ChatGPT-scoped continuation uses the authenticated Runs API instead.
-16. `continue_hermes_session` resumes an existing privileged Hermes conversation and can therefore cause the same local actions that Hermes could perform in that session; treat it as an action tool, not a read-only history tool.
-17. Controllable runs use Hermes' authenticated API server on loopback only. `scripts/setup-hermes-control.sh` sets `API_SERVER_HOST=127.0.0.1` and never prints the bearer key.
-18. `scripts/start-bridge.sh` reads only the exact `API_SERVER_KEY` secret from `~/.hermes/.env`. For the non-secret API port it checks the exact env value first, then Hermes' resolved config via `hermes config get`; it never sources the full Hermes environment. The key is redacted from wrapper errors/results and is never written to the repository or activity log.
-19. `steer_hermes_run` can change live agent behavior and `stop_hermes_run` can interrupt active local work. Both require an exact `runId` created under the same authenticated Hermes API profile.
-20. ChatGPT's `_meta["openai/session"]` value is treated only as a correlation key, never as an authorization credential. The raw value is SHA-256 hashed immediately and is not persisted or written to activity traces.
-21. Session-coordination state is stored under gitignored `.runtime/chatgpt-session-coordinator.json` with restrictive permissions. It contains hashed ChatGPT session keys plus canonical Hermes context/session identifiers and active-operation metadata.
-22. For ChatGPT-scoped calls the wrapper defaults ordinary delegation to one durable native Hermes session through the authenticated Runs API, enforces one canonical route and one mutating operation at a time, and disables background A2A delegation. Explicit A2A continuation remains a compatibility path and is never silently mixed with an existing native session.
-23. Native Runs use a persisted operation-scoped idempotency key. Ambiguous POST delivery never releases the conversation lock; only an exact retry can reuse that key to reconcile the same submission. Returned context/session identifiers are checked against both the requested first binding and any established canonical binding before terminal state is accepted.
+## Runtime security invariants
 
-Native session exports are requested with Hermes' own secret redaction and are then passed through the bridge redaction layer before returning to ChatGPT. This is defense in depth, not a formal DLP boundary. The activity preview redaction is also only a safety aid. Do not intentionally put secrets in Hermes instructions. Canonical route, active-operation coordination, and bounded exact-retry replay records are persisted under the local coordinator state file so restart recovery does not repeat completed work.
+1. Use OpenAI Secure MCP Tunnel for the ChatGPT-facing transport.
+2. Keep the MCP wrapper local stdio; do not expose it as a public HTTP service.
+3. Keep Hermes' API server bound to loopback.
+4. Protect the Hermes API server with `API_SERVER_KEY`; do not commit or print it.
+5. Never commit OpenAI API keys, tunnel runtime keys or Hermes secrets.
+6. The wrapper reads only the specific Hermes configuration values it needs rather than sourcing the full Hermes environment.
+7. The OpenAI runtime key is stored in macOS Keychain by the persistent installer.
+8. `_meta["openai/session"]` is only a correlation key, never an authorization credential.
+9. The raw ChatGPT session value is SHA-256 hashed immediately and is never persisted or logged.
+10. The bridge exposes exactly 10 native/session/observability tools. No A2A context/task tools are exposed.
+11. Only one mutating Hermes Run is allowed per tracked ChatGPT conversation.
+12. A different explicit durable Hermes `sessionId` is rejected once a canonical session is bound.
+13. Known active `runId` state is persisted before polling continues.
+14. Ambiguous native POST delivery retains the conversation lock; only an exact retry can reuse the same operation idempotency key.
+15. Network/timeout/5xx ambiguity is distinguished from definitive request rejection.
+16. Successful terminal exact retries use bounded persisted replay rather than executing the action again.
+17. Failed/rejected/cancelled/interrupted terminal outcomes are never cached as successful replay.
+18. Replay payloads are globally pruned after the deduplication window.
+19. Returned `sessionId` values are checked against the requested/canonical session before terminal state is accepted.
+20. `steer_hermes_run` and `stop_hermes_run` require the exact active `runId` for a tracked ChatGPT conversation.
+
+## Native control API
+
+The bridge uses Hermes' authenticated loopback Runs API for mutating work:
+
+```text
+POST /v1/runs
+GET  /v1/runs/:id
+POST /v1/runs/:id/steer
+POST /v1/runs/:id/stop
+```
+
+`scripts/setup-hermes-control.sh` configures the API server on loopback and never prints the bearer key.
+
+`scripts/start-bridge.sh` resolves only:
+
+- `API_SERVER_KEY`
+- `API_SERVER_PORT`
+
+from Hermes configuration.
+
+## Native session access
+
+`list_hermes_sessions` invokes Hermes' native `sessions list` command.
+
+`get_hermes_session` uses `sessions export --redact`. The temporary JSONL file lives under the gitignored `.runtime/` directory and is deleted in a `finally` block.
+
+The bridge uses Node `execFile` with an argument array, not a shell command string, so supplied session IDs are not shell-interpreted.
+
+`continue_hermes_session` is mutating and uses the authenticated Runs API rather than the CLI continuation path.
+
+## Coordinator state
+
+Session coordination is persisted at:
+
+```text
+.runtime/chatgpt-session-coordinator.json
+```
+
+Permissions are restricted to the current user where supported.
+
+State version 2 contains hashed ChatGPT session keys, canonical Hermes session IDs, active native Run metadata and bounded replay payloads.
+
+When upgrading from the former mixed native/A2A state schema, native state is migrated and old A2A context/task state is discarded.
+
+Do not intentionally place secrets in Hermes instructions. Replay payload persistence is for delivery safety, not a data-loss-prevention boundary.
+
+## Activity traces
+
+Every public call writes a redacted JSONL trace to:
+
+```text
+.runtime/hermes-activity.jsonl
+```
+
+The trace stores:
+
+- timing;
+- tool name;
+- hashed ChatGPT session scope;
+- instruction SHA-256;
+- redacted/truncated instruction preview;
+- Run/session identifiers;
+- success/error and deduplication metadata.
+
+It does not intentionally store the full instruction.
+
+`hermes_activity` is read-only and only reads this local file.
 
 ## OpenAI tunnel credentials
 
-Keep the long-lived runtime key separate from any admin key. The runtime principal should have only the tunnel permissions required to read/use the target tunnel.
+Keep the long-lived runtime key separate from any administrative key.
 
-Expected environment variables for the launcher:
+Expected runtime values:
 
-~~~bash
+```bash
 CONTROL_PLANE_TUNNEL_ID=...
 CONTROL_PLANE_API_KEY=...
-~~~
+```
 
-The scripts never print the API key value.
+The persistent setup stores the runtime API key in macOS Keychain under the historical service name:
 
-## Before making the repo public
+```text
+chatgpt-hermes-a2a.runtime-api-key
+```
 
-- Review all files and Git history for secrets.
-- Remove generated reports/logs (they are already ignored).
-- Re-run secret scanning.
-- Document exactly what local actions Hermes is allowed to perform.
-- Keep the project framed as an explicit user-authorized local automation bridge, not a mechanism for bypassing ChatGPT product controls.
+The LaunchAgent label is also historical:
 
+```text
+com.pyxl.chatgpt-hermes-a2a
+```
 
-## Background runtime on macOS
+These names do not imply that A2A is still used.
 
-The persistent setup uses a per-user LaunchAgent. The plist contains only local paths and the command to start the runtime; it does not contain the OpenAI runtime API key.
+## Threat model
 
-The runtime API key is stored as a macOS Keychain generic password with service:
+The integration is powerful because Hermes can use local tools and permissions granted by the operator.
 
-`chatgpt-hermes-a2a.runtime-api-key`
+The main risks are therefore:
 
-At runtime, `scripts/daemon-run.sh` reads that single Keychain item, exports it only into the tunnel-client process environment, and then execs tunnel-client. The key is not written to the repository, LaunchAgent plist, reports, or logs by this project.
+- untrusted instructions reaching a privileged local agent;
+- overly broad Hermes tool permissions;
+- leaked tunnel or Hermes API credentials;
+- duplicate execution after network ambiguity;
+- concurrent local work from the same ChatGPT conversation;
+- stale local state after crash/restart.
 
-The LaunchAgent keeps the tunnel process alive and starts it again at user login. Hermes A2A remains loopback-only.
+The native-only coordinator is specifically designed to reduce the last three risks without maintaining a second A2A task/context state machine.
+
+## Before making the repository public
+
+- inspect repository files and Git history for secrets;
+- keep runtime files and logs ignored;
+- re-run secret scanning;
+- document which Hermes local tools are enabled;
+- retain loopback binding and bearer authentication for the Runs API;
+- do not frame the bridge as bypassing ChatGPT product controls.
