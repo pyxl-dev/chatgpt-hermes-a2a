@@ -57,6 +57,14 @@ function activeSummary(active) {
   };
 }
 
+function sessionBindingResolved(record, active, returnedSessionId = null) {
+  return Boolean(
+    returnedSessionId ||
+      record?.canonicalSessionId ||
+      active?.sessionId,
+  );
+}
+
 function nativeReplayPayload(payload) {
   if (!payload || typeof payload !== "object") return false;
   return Boolean(
@@ -437,21 +445,41 @@ export function createHermesSessionCoordinator({
           }
 
           if (reconciled.terminal === true) {
-            const fingerprint = record.active.fingerprint || null;
-            if (
+            const currentActive = record.active;
+            const fingerprint = currentActive.fingerprint || null;
+            const reusable =
               fingerprint &&
               reconciled.replayPayload &&
-              payloadIsReusable(reconciled.replayPayload)
-            ) {
+              payloadIsReusable(reconciled.replayPayload);
+
+            if (reusable) {
               setRecentResult(scope.sessionHash, fingerprint, {
                 settledAtMs: Date.now(),
-                traceId: record.active.traceId || null,
+                traceId: currentActive.traceId || null,
                 payload: reconciled.replayPayload,
               });
             } else if (fingerprint) {
               deleteRecentResult(scope.sessionHash, fingerprint);
             }
-            record.active = null;
+
+            if (
+              reusable &&
+              !sessionBindingResolved(
+                record,
+                currentActive,
+                reconciled.sessionId || null,
+              )
+            ) {
+              record.active = {
+                ...currentActive,
+                kind: "native-session-unresolved",
+                runId: currentActive.runId || null,
+                sessionId: null,
+                ownerInstanceId: instanceId,
+              };
+            } else {
+              record.active = null;
+            }
             changed = true;
           }
         }
@@ -484,24 +512,21 @@ export function createHermesSessionCoordinator({
           active.ownerInstanceId !== instanceId
         );
 
-      if (active && !recoverablePending) {
-        throw coordinatorError(
-          "HERMES_SESSION_BUSY",
-          "Another Hermes Run is already active for this ChatGPT conversation.",
-          {
-            sessionHash: scope.sessionHash,
-            active: activeSummary(active),
-          },
-        );
-      }
-
       const now = Date.now();
       const recent = getRecentResult(scope.sessionHash, fingerprint);
 
       if (
         fingerprint &&
         recent &&
-        now - Number(recent.settledAtMs) <= replayWindowMs
+        now - Number(recent.settledAtMs) <= replayWindowMs &&
+        (
+          !active ||
+          recoverablePending ||
+          (
+            active.kind === "native-session-unresolved" &&
+            active.fingerprint === fingerprint
+          )
+        )
       ) {
         return {
           tracked: true,
@@ -517,6 +542,28 @@ export function createHermesSessionCoordinator({
           },
           idempotencyKey: null,
         };
+      }
+
+      if (active?.kind === "native-session-unresolved") {
+        throw coordinatorError(
+          "HERMES_NATIVE_SESSION_UNRESOLVED",
+          "Hermes completed the previous sessionless Run without returning a durable sessionId. Exact retries can replay the completed result, but different work is blocked until Hermes exposes the durable session binding.",
+          {
+            sessionHash: scope.sessionHash,
+            active: activeSummary(active),
+          },
+        );
+      }
+
+      if (active && !recoverablePending) {
+        throw coordinatorError(
+          "HERMES_SESSION_BUSY",
+          "Another Hermes Run is already active for this ChatGPT conversation.",
+          {
+            sessionHash: scope.sessionHash,
+            active: activeSummary(active),
+          },
+        );
       }
 
       if (
@@ -628,6 +675,12 @@ export function createHermesSessionCoordinator({
         record.canonicalSessionId = returnedSessionId;
       }
 
+      const cacheable =
+        active.fingerprint &&
+        payload &&
+        payloadIsReusable(payload) &&
+        !(keepActive && (activeKind || active.kind) === "run");
+
       if (keepActive) {
         record.active = {
           ...active,
@@ -640,15 +693,20 @@ export function createHermesSessionCoordinator({
           runId: runId || active.runId || null,
           ownerInstanceId: instanceId,
         };
+      } else if (
+        cacheable &&
+        !sessionBindingResolved(record, active, returnedSessionId)
+      ) {
+        record.active = {
+          ...active,
+          kind: "native-session-unresolved",
+          sessionId: null,
+          runId: runId || active.runId || null,
+          ownerInstanceId: instanceId,
+        };
       } else {
         record.active = null;
       }
-
-      const cacheable =
-        active.fingerprint &&
-        payload &&
-        payloadIsReusable(payload) &&
-        !(keepActive && (activeKind || active.kind) === "run");
 
       if (cacheable) {
         setRecentResult(scope.sessionHash, active.fingerprint, {
@@ -751,11 +809,12 @@ export function createHermesSessionCoordinator({
       }
 
       if (terminal === true) {
-        if (
+        const reusable =
           active.fingerprint &&
           replayPayload &&
-          payloadIsReusable(replayPayload)
-        ) {
+          payloadIsReusable(replayPayload);
+
+        if (reusable) {
           setRecentResult(scope.sessionHash, active.fingerprint, {
             settledAtMs: Date.now(),
             traceId: active.traceId || null,
@@ -764,7 +823,20 @@ export function createHermesSessionCoordinator({
         } else if (active.fingerprint) {
           deleteRecentResult(scope.sessionHash, active.fingerprint);
         }
-        record.active = null;
+
+        if (
+          reusable &&
+          !sessionBindingResolved(record, active, returnedSessionId)
+        ) {
+          record.active = {
+            ...active,
+            kind: "native-session-unresolved",
+            sessionId: null,
+            ownerInstanceId: instanceId,
+          };
+        } else {
+          record.active = null;
+        }
       }
 
       record.updatedAt = new Date().toISOString();
