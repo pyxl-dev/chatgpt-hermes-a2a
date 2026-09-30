@@ -49,12 +49,21 @@ read_env_value() {
 }
 
 HERMES_ENV_FILE="$(resolve_hermes_env_file)"
+
 API_KEY="${HERMES_API_SERVER_KEY:-${API_SERVER_KEY:-$(read_env_value API_SERVER_KEY "$HERMES_ENV_FILE")}}"
-API_PORT="${API_SERVER_PORT:-$(read_env_value API_SERVER_PORT "$HERMES_ENV_FILE")}"
-if [[ ! "$API_PORT" =~ ^[0-9]+$ ]]; then
-  API_PORT="$(hermes config get API_SERVER_PORT 2>/dev/null || true)"
+HERMES_BIN_FOR_CONFIG="$(command -v hermes || true)"
+if [[ -z "$API_KEY" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+  API_KEY="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_KEY 2>/dev/null || true)"
 fi
-if [[ ! "$API_PORT" =~ ^[0-9]+$ ]]; then
+
+API_PORT="${API_SERVER_PORT:-$(read_env_value API_SERVER_PORT "$HERMES_ENV_FILE")}"
+if [[ ! "$API_PORT" =~ ^[0-9]+$ ]] && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+  API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_PORT 2>/dev/null || true)"
+fi
+if [[ ! "$API_PORT" =~ ^[0-9]+$ ]] && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+  API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get platforms.api_server.extra.port 2>/dev/null || true)"
+fi
+if [[ ! "$API_PORT" =~ ^[0-9]+$ ]] || (( API_PORT < 1 || API_PORT > 65535 )); then
   API_PORT="8642"
 fi
 API_URL="${HERMES_API_SERVER_URL:-}"
@@ -91,7 +100,7 @@ if [[ -n "$CAPABILITIES_JSON" ]] &&
 else
   echo "Hermes native Runs API: NOT READY"
 fi
-unset CAPABILITIES_JSON API_URL
+unset CAPABILITIES_JSON API_URL HERMES_BIN_FOR_CONFIG API_KEY API_PORT HERMES_ENV_FILE
 
 TUNNEL_READY=0
 if [[ -s "$HEALTH_FILE" ]]; then
