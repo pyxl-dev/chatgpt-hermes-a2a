@@ -36,6 +36,26 @@ function payloadIsReusable(payload) {
   );
 }
 
+function rollbackUnresolvedCanonicalRoute(record, active) {
+  if (
+    active?.route === "native" &&
+    record.canonicalRoute === "native" &&
+    !record.canonicalSessionId
+  ) {
+    record.canonicalRoute = null;
+    return true;
+  }
+  if (
+    active?.route === "a2a" &&
+    record.canonicalRoute === "a2a" &&
+    !record.canonicalContextId
+  ) {
+    record.canonicalRoute = null;
+    return true;
+  }
+  return false;
+}
+
 function coordinatorError(code, message, details = null) {
   const error = new Error(message);
   error.code = code;
@@ -374,11 +394,14 @@ export function createHermesSessionCoordinator({
                 traceId: record.active.traceId || null,
                 payload: reconciled.replayPayload,
               });
-            } else if (activeFingerprint) {
-              const recent = getRecentResult(scope.sessionHash);
-              if (recent?.fingerprint === activeFingerprint) {
-                deleteRecentResult(scope.sessionHash);
+            } else {
+              if (activeFingerprint) {
+                const recent = getRecentResult(scope.sessionHash);
+                if (recent?.fingerprint === activeFingerprint) {
+                  deleteRecentResult(scope.sessionHash);
+                }
               }
+              rollbackUnresolvedCanonicalRoute(record, record.active);
             }
             record.active = null;
             changed = true;
@@ -775,6 +798,9 @@ export function createHermesSessionCoordinator({
           keepActive &&
           (activeKind || active.kind) === "run"
         );
+      if (!keepActive && !payloadIsReusable(payload)) {
+        rollbackUnresolvedCanonicalRoute(record, active);
+      }
       if (cacheableResult) {
         setRecentResult(scope.sessionHash, {
           fingerprint: active.fingerprint,
@@ -918,7 +944,10 @@ export function createHermesSessionCoordinator({
           if (recent?.fingerprint === active.fingerprint) {
             deleteRecentResult(scope.sessionHash);
           }
+          rollbackUnresolvedCanonicalRoute(record, active);
         }
+      } else if (terminal === true) {
+        rollbackUnresolvedCanonicalRoute(record, active);
       }
       if (terminal === true) {
         record.active = null;
