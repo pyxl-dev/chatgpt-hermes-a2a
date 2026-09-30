@@ -443,7 +443,7 @@ export function createHermesSessionCoordinator({
         record.canonicalRoute &&
         active.route !== record.canonicalRoute
       ) {
-        record.active = null;
+        record.active = active.restoreOnFailure || null;
         record.updatedAt = new Date().toISOString();
         await persist();
         throw coordinatorError(
@@ -462,7 +462,7 @@ export function createHermesSessionCoordinator({
         record.canonicalContextId &&
         contextId !== record.canonicalContextId
       ) {
-        record.active = null;
+        record.active = active.restoreOnFailure || null;
         record.updatedAt = new Date().toISOString();
         await persist();
         throw coordinatorError(
@@ -481,7 +481,7 @@ export function createHermesSessionCoordinator({
         record.canonicalSessionId &&
         sessionId !== record.canonicalSessionId
       ) {
-        record.active = null;
+        record.active = active.restoreOnFailure || null;
         record.updatedAt = new Date().toISOString();
         await persist();
         throw coordinatorError(
