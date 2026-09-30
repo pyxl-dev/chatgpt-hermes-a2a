@@ -604,19 +604,24 @@ async function callBackend(name, args) {
     if (backend === client) backend = null;
     backendConnectPromise = null;
     await client.close().catch(() => {});
+    if (error && typeof error === "object") {
+      error.deliveryAmbiguous = true;
+    }
     throw error;
   }
 
   if (result?.isError) {
     const decoded = decodeBackendResult(result);
     const backendError = decoded?.error;
-    throw new Error(
+    const error = new Error(
       (typeof backendError === "string"
         ? backendError
         : backendError?.message) ||
         decoded?.text ||
         `Backend tool ${name} returned an MCP error`,
     );
+    error.deliveryAmbiguous = false;
+    throw error;
   }
 
   return decodeBackendResult(result);
@@ -1032,6 +1037,28 @@ function nativeRunFailureError(result, runId, sessionScope) {
   );
 }
 
+function recoveredNativeRunPayload(active, result) {
+  if (!nativeRunSucceeded(result)) return null;
+  if (active?.tool === "delegate_to_hermes") {
+    return nativeDelegateResult(
+      {
+        runId: active.runId,
+        sessionId: active.sessionId || null,
+      },
+      result,
+      Boolean(active.sessionId),
+    );
+  }
+  if (active?.tool === "start_hermes_run") {
+    return {
+      ...result,
+      operation: "start_hermes_run",
+      recovered: true,
+    };
+  }
+  return null;
+}
+
 async function releaseOrPreserveSubmissionFailure(
   sessionScope,
   operationId,
@@ -1062,17 +1089,8 @@ async function reconcileCoordinatorActive(active) {
     const result = await control.getRun(active.runId);
     const terminal = runIsTerminal(result);
     const replayPayload =
-      terminal &&
-      active.tool === "delegate_to_hermes" &&
-      nativeRunSucceeded(result)
-        ? nativeDelegateResult(
-            {
-              runId: active.runId,
-              sessionId: active.sessionId || null,
-            },
-            result,
-            Boolean(active.sessionId),
-          )
+      terminal
+        ? recoveredNativeRunPayload(active, result)
         : null;
     return {
       terminal,
@@ -1240,13 +1258,17 @@ async function executePublicTool(
         );
       } catch (error) {
         if (lease.canonicalRoute === "a2a") {
-          if (a2aSubmissionAttempted && !a2aResponseReceived) {
+          if (
+            a2aSubmissionAttempted &&
+            !a2aResponseReceived &&
+            error?.deliveryAmbiguous === true
+          ) {
             await sessionCoordinator.markSubmissionUnknown(
               sessionScope,
               lease.operationId,
               "a2a",
             );
-          } else if (!a2aSubmissionAttempted) {
+          } else {
             await sessionCoordinator.fail(
               sessionScope,
               lease.operationId,
@@ -1308,13 +1330,17 @@ async function executePublicTool(
           traceId,
         );
       } catch (error) {
-        if (a2aSubmissionAttempted && !a2aResponseReceived) {
+        if (
+          a2aSubmissionAttempted &&
+          !a2aResponseReceived &&
+          error?.deliveryAmbiguous === true
+        ) {
           await sessionCoordinator.markSubmissionUnknown(
             sessionScope,
             lease.operationId,
             "a2a",
           );
-        } else if (!a2aSubmissionAttempted) {
+        } else {
           await sessionCoordinator.fail(
             sessionScope,
             lease.operationId,
@@ -1441,18 +1467,9 @@ async function executePublicTool(
       const terminal = runIsTerminal(result);
       const replayPayload =
         terminal &&
-        nativeRunSucceeded(result) &&
         before?.active?.kind === "run" &&
-        before.active.runId === runId &&
-        before.active.tool === "delegate_to_hermes"
-          ? nativeDelegateResult(
-              {
-                runId,
-                sessionId: before.active.sessionId || null,
-              },
-              result,
-              Boolean(before.active.sessionId),
-            )
+        before.active.runId === runId
+          ? recoveredNativeRunPayload(before.active, result)
           : null;
       await sessionCoordinator.observe(sessionScope, {
         kind: "run",
