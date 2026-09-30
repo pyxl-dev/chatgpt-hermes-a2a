@@ -148,9 +148,9 @@ You can inspect it yourself:
 curl -fsS http://127.0.0.1:9900/.well-known/agent-card.json
 ```
 
-## 4. Optional: enable controllable Hermes runs
+## 4. Enable native Hermes runs
 
-The ordinary A2A tools are enough to delegate and continue work. If you also want ChatGPT to start a long-running Hermes run and later poll, steer or stop it, enable Hermes' authenticated loopback Runs API:
+ChatGPT-scoped `delegate_to_hermes` calls use Hermes' authenticated loopback Runs API by default. This is required for durable multi-turn continuity because Hermes' A2A adapter enforces a five-turn anti-loop limit. Enable the Runs API before connecting ChatGPT:
 
 ```bash
 bash scripts/setup-hermes-control.sh
@@ -159,14 +159,14 @@ npm run smoke:control
 
 This configures the Hermes API server on loopback, resolves or creates its bearer key through Hermes' own config surface, restarts the gateway, then checks the Runs API.
 
-It powers these four bridge tools:
+It powers ordinary ChatGPT-scoped `delegate_to_hermes` plus these four explicit control tools:
 
 - `start_hermes_run`
 - `get_hermes_run`
 - `steer_hermes_run`
 - `stop_hermes_run`
 
-If you do not need steer/stop, you can leave this step for later.
+Explicit A2A continuation remains available for compatibility/debugging, but it is not the normal ChatGPT path.
 
 ## 5. Install OpenAI `tunnel-client`
 
@@ -526,16 +526,16 @@ bash scripts/status.sh
 
 Make sure there is only one `tunnel-client` process using this tunnel ID. Overlapping stdio runtimes are unsupported.
 
-### `start_hermes_run` / `steer_hermes_run` / `stop_hermes_run` fail
+### `delegate_to_hermes` / native run tools fail
 
-Enable the Hermes control API and validate it:
+Enable the Hermes Runs API and validate it:
 
 ```bash
 bash scripts/setup-hermes-control.sh
 npm run smoke:control
 ```
 
-The ordinary A2A delegation tools can still work even if the optional control API is not configured.
+Normal ChatGPT-scoped delegation requires this Runs API. Explicit legacy A2A continuation can still work independently, but it is subject to Hermes' A2A anti-loop limit.
 
 ### The same mission did not execute twice
 
@@ -546,7 +546,7 @@ That can be intentional. `delegate_to_hermes` deduplicates identical normalized 
 The useful property of this architecture is that inbound access to the Mac is not required:
 
 - Hermes A2A stays on `127.0.0.1:9900`;
-- the optional Hermes Runs API stays on loopback and uses bearer auth;
+- the Hermes Runs API used for normal ChatGPT delegation stays on loopback and uses bearer auth;
 - the MCP wrapper is a local stdio child;
 - only `tunnel-client` establishes an outbound connection to OpenAI;
 - the long-lived OpenAI runtime key is stored in macOS Keychain by the background installer;
