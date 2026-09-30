@@ -10,9 +10,9 @@ OpenAI Secure MCP Tunnel
 openai/tunnel-client on your Mac
   ↓ MCP stdio
 Hermes UX MCP wrapper (13 tools)
-  ↓ private MCP stdio
-@cognicellai/a2a-mcp
-  ↓ A2A on 127.0.0.1:9900
+  ├─ native Runs API on 127.0.0.1:8642  ← default for ChatGPT-scoped work
+  └─ private @cognicellai/a2a-mcp → A2A on 127.0.0.1:9900  ← legacy/explicit A2A
+  ↓
 Hermes Agent
   ↓
 your local tools / files / browser / workflows
@@ -157,7 +157,7 @@ bash scripts/uninstall-background.sh
 - `scripts/connect-openai.sh` — guided OpenAI + ChatGPT first connection.
 - `scripts/run-all.sh` — setup, diagnostics, local smoke test and report generation.
 - `scripts/install-background.sh` — persistent macOS LaunchAgent installer.
-- `scripts/setup-hermes-control.sh` — enables the optional authenticated Hermes Runs API for steer/stop.
+- `scripts/setup-hermes-control.sh` — enables the authenticated Hermes Runs API used by normal ChatGPT-scoped delegation and by steer/stop.
 
 Hermes A2A remains bound to loopback. The project does not expose port `9900` to the public internet.
 
@@ -167,7 +167,7 @@ The tunnel-facing server exposes exactly 13 tools. Generic `a2a_*` backend tools
 
 | Tool | Use it when | Inputs |
 | --- | --- | --- |
-| `delegate_to_hermes` | Run ordinary Hermes work; in ChatGPT it creates the canonical context once, then reuses it for later calls | `instruction`, optional `background` |
+| `delegate_to_hermes` | Run ordinary Hermes work; ChatGPT-scoped calls create/reuse one durable native Hermes session through the Runs API | `instruction`, optional `background` |
 | `continue_with_hermes` | Continue an existing A2A conversation | `contextId`, `instruction`, optional `taskId`, optional `background` |
 | `list_hermes_sessions` | Discover recent durable Hermes conversations | optional `limit`, `source`, `workspace` |
 | `get_hermes_session` | Read a durable Hermes conversation | `sessionId`, optional `limit`, optional `includeTools` |
@@ -181,11 +181,11 @@ The tunnel-facing server exposes exactly 13 tools. Generic `a2a_*` backend tools
 | `hermes_status` | Check whether the local Hermes alias is reachable | no inputs |
 | `hermes_activity` | Read recent local bridge traces without contacting Hermes | optional filters |
 
-Normal A2A delegation waits for Hermes to finish. Use `background: true` only for intentionally long-running work, then poll with `get_hermes_task`.
+For ChatGPT-scoped traffic, `delegate_to_hermes` is synchronous but uses Hermes' native Runs API underneath. The first successful run establishes a durable `sessionId`; later calls automatically submit new Runs into that same session. This avoids the A2A adapter's five-turn anti-loop limit.
 
-For durable Hermes conversations, use `list_hermes_sessions` → `get_hermes_session` → `continue_hermes_session`. These use Hermes' native persisted session surfaces rather than creating a new A2A conversation.
+Explicit A2A continuation remains available through `continue_with_hermes` for compatibility/debugging. Unscoped local clients also retain the legacy A2A behavior. ChatGPT-scoped A2A background delegation remains disabled.
 
-For work that may need intervention while running, use `start_hermes_run`; retain its `runId`, then call `get_hermes_run`, `steer_hermes_run` or `stop_hermes_run`.
+For durable Hermes conversations, use `list_hermes_sessions` → `get_hermes_session` → `continue_hermes_session`. For work that may need intervention while running, use `start_hermes_run`; retain its `runId`, then call `get_hermes_run`, `steer_hermes_run` or `stop_hermes_run`.
 
 ## Observability and duplicate-call protection
 
@@ -205,22 +205,22 @@ For ChatGPT calls, the wrapper now uses `_meta["openai/session"]` as a conversat
 
 The first mutating Hermes call in a ChatGPT conversation binds that conversation to one canonical route:
 
-- **A2A route** — `delegate_to_hermes` creates the first context, then later `delegate_to_hermes` calls automatically continue the same canonical `contextId`.
-- **Native-session route** — `continue_hermes_session` or `start_hermes_run` binds the conversation to a durable Hermes session. Later controllable runs reuse that session when Hermes returned a `sessionId`.
+- **Native-session route (default)** — `delegate_to_hermes`, `continue_hermes_session`, or `start_hermes_run` uses Hermes' durable native session model. A first `delegate_to_hermes` call may initially have no `sessionId`; once the Run completes, the returned durable `sessionId` is persisted and reused automatically.
+- **A2A route (explicit/legacy)** — `continue_with_hermes` can bind a fresh ChatGPT conversation to an existing A2A `contextId`. Existing conversations already bound to A2A stay on that route rather than silently forking into a second native conversation.
 
-After either route is established, ordinary `delegate_to_hermes` calls follow that canonical route automatically: they continue the A2A `contextId` or the durable native `sessionId` rather than creating another Hermes conversation.
+After either route is established, ordinary `delegate_to_hermes` calls follow that canonical route. New ChatGPT conversations default to native Runs rather than A2A.
 
 A ChatGPT conversation may have only one mutating Hermes operation active at a time. A second instruction is rejected before it reaches Hermes instead of being queued or launched in parallel. Switching between A2A and native-session routes is also rejected because it would create a second Hermes conversation.
 
 ChatGPT-scoped A2A background delegation is disabled; intentionally asynchronous work should use `start_hermes_run`, whose `runId` can be polled, steered and stopped. Active run/task state and canonical routing are persisted under `.runtime/chatgpt-session-coordinator.json`, so the bridge can reconcile work after a restart.
 
-Exact-instruction deduplication remains as a second line of defense for 60 seconds by default, but is now scoped by ChatGPT session so two unrelated ChatGPT conversations can never share a cached A2A context merely because their instructions are identical. Failed backend attempts are removed from the cache so a genuine retry can execute.
+Exact-instruction deduplication remains as a second line of defense for 60 seconds by default and is scoped by ChatGPT session. For native ChatGPT delegation, active `runId` state is persisted before synchronous polling begins, so a wrapper restart or polling failure does not unlock a still-running Hermes job. Failed pre-submission attempts are released so a genuine retry can execute.
 
 Clients that do not send `openai/session` keep the legacy behavior and are not forced into ChatGPT session coordination.
 
-## Enable controllable runs
+## Enable native Hermes runs
 
-The steer/stop tools use Hermes' authenticated loopback Runs API. Configure it once:
+Normal ChatGPT-scoped `delegate_to_hermes` calls and the steer/stop tools use Hermes' authenticated loopback Runs API. Configure it once:
 
 ```bash
 bash scripts/setup-hermes-control.sh
@@ -229,14 +229,14 @@ npm run smoke:control
 
 The setup resolves the active Hermes profile, reuses or creates `API_SERVER_KEY` through Hermes configuration, forces the API bind to `127.0.0.1`, restarts the gateway and verifies the Runs API.
 
-The normal A2A delegation surface remains usable without this optional control API.
+This Runs API is required for normal ChatGPT-scoped delegation. Explicit/legacy A2A tools remain available independently, but they are not the default ChatGPT path because Hermes' A2A adapter enforces a five-turn anti-loop limit.
 
 ## Security notes
 
 The bridge is intentionally layered so that:
 
 - Hermes A2A stays on loopback;
-- the optional Hermes Runs API stays on loopback and bearer-authenticated;
+- the Hermes Runs API used for ChatGPT-scoped delegation stays on loopback and bearer-authenticated;
 - the MCP wrapper is local stdio;
 - only OpenAI `tunnel-client` makes an outbound connection;
 - the generic A2A MCP backend is private to the wrapper;
