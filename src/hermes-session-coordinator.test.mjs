@@ -490,8 +490,8 @@ test("expired replays are pruned globally on restart", async () => {
   assert.equal(pruned.recentResults[scopeA.sessionHash], undefined);
 });
 
-test("per-session replay storage is bounded", async () => {
-  const { root, coordinator } = await makeCoordinator({
+test("all live replay results remain available inside the dedup window", async () => {
+  const { coordinator } = await makeCoordinator({
     dedupWindowMs: 600_000,
   });
   const scope = coordinator.scopeFromMeta(metaA);
@@ -500,31 +500,38 @@ test("per-session replay storage is bounded", async () => {
     const lease = await coordinator.begin(scope, {
       mode: "delegate",
       tool: "delegate_to_hermes",
-      instruction: "bounded-" + i,
+      instruction: "live-replay-" + i,
     });
     await coordinator.complete(scope, lease.operationId, {
       payload: {
         ok: true,
         operation: "delegate_to_hermes",
         runId: "run-" + i,
-        sessionId: "session-bounded",
+        sessionId: "session-replay",
         status: "completed",
+        text: "done-" + i,
       },
       runId: "run-" + i,
-      sessionId: "session-bounded",
+      sessionId: "session-replay",
     });
   }
 
-  const disk = JSON.parse(
-    await fs.readFile(
-      path.join(root, ".runtime", "chatgpt-session-coordinator.json"),
-      "utf8",
-    ),
-  );
-  assert.equal(
-    Object.keys(disk.recentResults[scope.sessionHash]).length,
-    64,
-  );
+  const firstReplay = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "live-replay-0",
+  });
+  assert.equal(firstReplay.replay, true);
+  assert.equal(firstReplay.replayPayload.runId, "run-0");
+  assert.equal(firstReplay.replayPayload.text, "done-0");
+
+  const lastReplay = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "live-replay-69",
+  });
+  assert.equal(lastReplay.replay, true);
+  assert.equal(lastReplay.replayPayload.runId, "run-69");
 });
 
 test("v1 native state migrates and v1 A2A state is dropped", async () => {
