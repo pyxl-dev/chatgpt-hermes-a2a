@@ -488,7 +488,10 @@ async function waitForNativeRun(runId) {
 }
 
 async function reconcileCoordinatorActive(active) {
-  if (active?.kind === "run" && active.runId) {
+  if (
+    ["run", "native-session-unresolved"].includes(active?.kind) &&
+    active.runId
+  ) {
     const result = await control.getRun(active.runId);
     const terminal = runIsTerminal(result);
     return {
