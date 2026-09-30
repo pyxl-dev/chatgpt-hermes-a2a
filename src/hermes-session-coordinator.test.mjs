@@ -348,6 +348,64 @@ test("restart reconciles active run before accepting new work", async () => {
   assert.equal(next.sessionIdToUse, "s1");
 });
 
+test("multiple successful results remain independently replayable", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "operation A",
+  });
+  await coordinator.complete(scope, first.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-a",
+      sessionId: "session-1",
+      status: "completed",
+      text: "A done",
+    },
+    runId: "run-a",
+    sessionId: "session-1",
+  });
+
+  const second = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "operation B",
+  });
+  await coordinator.complete(scope, second.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-b",
+      sessionId: "session-1",
+      status: "completed",
+      text: "B done",
+    },
+    runId: "run-b",
+    sessionId: "session-1",
+  });
+
+  const replayA = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "operation   A",
+  });
+  assert.equal(replayA.replay, true);
+  assert.equal(replayA.replayPayload.runId, "run-a");
+  assert.equal(replayA.replayPayload.text, "A done");
+
+  const replayB = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "operation B",
+  });
+  assert.equal(replayB.replay, true);
+  assert.equal(replayB.replayPayload.runId, "run-b");
+});
+
 test("completed replay survives restart", async () => {
   const { root, coordinator } = await makeCoordinator({
     dedupWindowMs: 60_000,
@@ -416,7 +474,9 @@ test("expired replays are pruned globally on restart", async () => {
   );
   const state = JSON.parse(await fs.readFile(statePath, "utf8"));
   const scopeA = coordinator.scopeFromMeta(metaA);
-  state.recentResults[scopeA.sessionHash].settledAtMs = 1;
+  const bucketA = state.recentResults[scopeA.sessionHash];
+  const fingerprintA = Object.keys(bucketA)[0];
+  bucketA[fingerprintA].settledAtMs = 1;
   await fs.writeFile(statePath, JSON.stringify(state, null, 2) + "\n");
 
   let n = 0;
@@ -428,6 +488,43 @@ test("expired replays are pruned globally on restart", async () => {
   await restarted.inspect(restarted.scopeFromMeta(metaB));
   const pruned = JSON.parse(await fs.readFile(statePath, "utf8"));
   assert.equal(pruned.recentResults[scopeA.sessionHash], undefined);
+});
+
+test("per-session replay storage is bounded", async () => {
+  const { root, coordinator } = await makeCoordinator({
+    dedupWindowMs: 600_000,
+  });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  for (let i = 0; i < 70; i += 1) {
+    const lease = await coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "bounded-" + i,
+    });
+    await coordinator.complete(scope, lease.operationId, {
+      payload: {
+        ok: true,
+        operation: "delegate_to_hermes",
+        runId: "run-" + i,
+        sessionId: "session-bounded",
+        status: "completed",
+      },
+      runId: "run-" + i,
+      sessionId: "session-bounded",
+    });
+  }
+
+  const disk = JSON.parse(
+    await fs.readFile(
+      path.join(root, ".runtime", "chatgpt-session-coordinator.json"),
+      "utf8",
+    ),
+  );
+  assert.equal(
+    Object.keys(disk.recentResults[scope.sessionHash]).length,
+    64,
+  );
 });
 
 test("v1 native state migrates and v1 A2A state is dropped", async () => {
@@ -486,7 +583,7 @@ test("v1 native state migrates and v1 A2A state is dropped", async () => {
   assert.equal(b.active, null);
 
   const disk = JSON.parse(await fs.readFile(statePath, "utf8"));
-  assert.equal(disk.version, 2);
+  assert.equal(disk.version, 3);
 });
 
 test("independent ChatGPT conversations remain independent", async () => {
