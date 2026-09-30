@@ -14,6 +14,26 @@ function normalizeInstruction(value) {
   return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
 }
 
+function normalizedApiPort(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/u.test(text)) return null;
+  const port = Number(text);
+  return Number.isInteger(port) && port >= 1 && port <= 65535
+    ? String(port)
+    : null;
+}
+
+export function resolveHermesApiUrl(
+  apiServerUrl = process.env.HERMES_API_SERVER_URL,
+  apiServerPort = process.env.API_SERVER_PORT,
+) {
+  const explicitUrl = String(apiServerUrl || "").trim();
+  if (explicitUrl) return explicitUrl.replace(/\/+$/u, "");
+
+  const port = normalizedApiPort(apiServerPort);
+  return port ? "http://127.0.0.1:" + port : DEFAULT_API_URL;
+}
+
 export function controlIdempotencyKey(
   sessionId,
   instruction,
@@ -37,12 +57,7 @@ export function controlIdempotencyKey(
 }
 
 export function createHermesControl({ redactText, redactValue }) {
-  const apiUrl = String(
-    process.env.HERMES_API_SERVER_URL ||
-      (process.env.API_SERVER_PORT
-        ? "http://127.0.0.1:" + process.env.API_SERVER_PORT
-        : DEFAULT_API_URL),
-  ).replace(/\/+$/u, "");
+  const apiUrl = resolveHermesApiUrl();
   const apiKey =
     process.env.HERMES_API_SERVER_KEY || process.env.API_SERVER_KEY || "";
   const configuredTimeout = Number(process.env.HERMES_CONTROL_TIMEOUT_MS);
