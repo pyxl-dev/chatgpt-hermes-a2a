@@ -1003,6 +1003,34 @@ function nativeDelegateResult(started, completed, reusedSession) {
   };
 }
 
+function nativeSessionContinuationResult(
+  started,
+  completed,
+  requestedSessionId,
+) {
+  const output = completed?.output ?? null;
+  return {
+    ...completed,
+    ok: nativeRunSucceeded(completed),
+    operation: "continue_hermes_session",
+    agent: AGENT,
+    requestedSessionId,
+    runId: completed?.runId || started?.runId || null,
+    sessionId:
+      completed?.sessionId ||
+      started?.sessionId ||
+      requestedSessionId ||
+      null,
+    state: 3,
+    stateName: "completed",
+    text:
+      typeof output === "string"
+        ? cleanHermesText(output) || null
+        : null,
+    nativeSession: true,
+  };
+}
+
 function requireNativeRunId(result, sessionScope) {
   if (typeof result?.runId === "string" && result.runId.trim()) {
     return result.runId;
@@ -1053,6 +1081,19 @@ function recoveredNativeRunPayload(active, result) {
     return {
       ...result,
       operation: "start_hermes_run",
+      recovered: true,
+    };
+  }
+  if (active?.tool === "continue_hermes_session") {
+    return {
+      ...nativeSessionContinuationResult(
+        {
+          runId: active.runId,
+          sessionId: active.sessionId || null,
+        },
+        result,
+        active.sessionId || result?.sessionId || null,
+      ),
       recovered: true,
     };
   }
@@ -1380,11 +1421,76 @@ async function executePublicTool(
       });
       if (lease.replay) return lease.replayPayload;
 
-      try {
-        const result = await continueNativeSession(
-          lease.sessionIdToUse || sessionId,
+      if (!sessionScope?.tracked) {
+        return continueNativeSession(
+          sessionId,
           instruction,
           traceId,
+        );
+      }
+
+      if (!control.configured) {
+        await sessionCoordinator.fail(
+          sessionScope,
+          lease.operationId,
+        );
+        throw codedError(
+          "HERMES_NATIVE_CONTROL_REQUIRED",
+          "ChatGPT-scoped native session continuation uses Hermes' Runs API. Run scripts/setup-hermes-control.sh, restart the bridge, then retry.",
+          { sessionHash: sessionScope?.sessionHash || null },
+        );
+      }
+
+      let runSubmitted = false;
+      let runId = null;
+      try {
+        const started = await control.startRun(
+          instruction,
+          lease.sessionIdToUse || sessionId,
+          lease.idempotencyKey || "unscoped",
+        );
+        runId = requireNativeRunId(started, sessionScope);
+        runSubmitted = true;
+
+        await sessionCoordinator.complete(
+          sessionScope,
+          lease.operationId,
+          {
+            payload: started,
+            traceId,
+            sessionId:
+              started.sessionId ||
+              lease.sessionIdToUse ||
+              sessionId,
+            runId,
+            keepActive: true,
+            activeKind: "run",
+          },
+        );
+
+        const completed = await waitForNativeRun(runId);
+        if (!nativeRunSucceeded(completed)) {
+          await sessionCoordinator.observe(sessionScope, {
+            kind: "run",
+            id: runId,
+            terminal: true,
+            sessionId:
+              completed.sessionId ||
+              started.sessionId ||
+              lease.sessionIdToUse ||
+              sessionId,
+          });
+          throw nativeRunFailureError(
+            completed,
+            runId,
+            sessionScope,
+          );
+        }
+
+        const result = nativeSessionContinuationResult(
+          started,
+          completed,
+          lease.sessionIdToUse || sessionId,
         );
         await sessionCoordinator.complete(
           sessionScope,
@@ -1392,12 +1498,25 @@ async function executePublicTool(
           {
             payload: result,
             traceId,
-            sessionId: result.sessionId || lease.sessionIdToUse || sessionId,
+            sessionId: result.sessionId,
+            runId,
           },
         );
         return result;
       } catch (error) {
-        await sessionCoordinator.fail(sessionScope, lease.operationId);
+        if (!runSubmitted) {
+          await releaseOrPreserveSubmissionFailure(
+            sessionScope,
+            lease.operationId,
+            error,
+          );
+        } else if (!error?.details?.runId) {
+          error.details = {
+            ...(error?.details || {}),
+            runId,
+            sessionHash: sessionScope?.sessionHash || null,
+          };
+        }
         throw error;
       }
     }
