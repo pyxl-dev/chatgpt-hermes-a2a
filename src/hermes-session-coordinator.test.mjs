@@ -1569,6 +1569,179 @@ test("blocks ordinary delegation from an unresolved persisted A2A route", async 
   );
 });
 
+test("exact replay wins over unresolved native session guard", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-unresolved-native",
+    instruction: "completed without session id",
+  });
+  await coordinator.complete(scope, first.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-no-session",
+      status: "completed",
+      text: "already done",
+    },
+    traceId: "trace-unresolved-native",
+    runId: "run-no-session",
+  });
+
+  const replay = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-unresolved-native-retry",
+    instruction: "completed   without session id",
+  });
+  assert.equal(replay.replay, true);
+  assert.equal(replay.replayPayload.runId, "run-no-session");
+  assert.equal(replay.replayPayload.text, "already done");
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-unresolved-native-different",
+      instruction: "different work",
+    }),
+    (error) => error?.code === "HERMES_NATIVE_SESSION_UNRESOLVED",
+  );
+});
+
+test("exact replay wins over unresolved A2A context guard", async () => {
+  const { root, coordinator } = await makeCoordinator({
+    dedupWindowMs: 60_000,
+  });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const firstContext = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-bind-a2a",
+    instruction: "bind a2a",
+    requestedContextId: "ctx-a2a",
+  });
+  await coordinator.complete(scope, firstContext.operationId, {
+    payload: {
+      ok: true,
+      contextId: "ctx-a2a",
+      stateName: "completed",
+      text: "bound",
+    },
+    traceId: "trace-bind-a2a",
+    contextId: "ctx-a2a",
+  });
+
+  const delegated = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-a2a-delegate",
+    instruction: "a2a delegate result",
+  });
+  await coordinator.complete(scope, delegated.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      contextId: "ctx-a2a",
+      stateName: "completed",
+      text: "done",
+    },
+    traceId: "trace-a2a-delegate",
+    contextId: "ctx-a2a",
+  });
+
+  const statePath = path.join(
+    root,
+    ".runtime",
+    "chatgpt-session-coordinator.json",
+  );
+  const state = JSON.parse(await fs.readFile(statePath, "utf8"));
+  state.sessions[scope.sessionHash].canonicalContextId = null;
+  await fs.writeFile(statePath, JSON.stringify(state, null, 2) + "\n");
+
+  let counter = 0;
+  const restarted = createHermesSessionCoordinator({
+    root,
+    dedupWindowMs: 60_000,
+    randomUUID: () => "unresolved-a2a-replay-" + ++counter,
+  });
+  const restartedScope = restarted.scopeFromMeta(metaA);
+
+  const replay = await restarted.begin(restartedScope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-a2a-delegate-retry",
+    instruction: "a2a   delegate result",
+  });
+  assert.equal(replay.replay, true);
+  assert.equal(replay.replayPayload.text, "done");
+
+  await assert.rejects(
+    restarted.begin(restartedScope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-a2a-different",
+      instruction: "different a2a work",
+    }),
+    (error) => error?.code === "HERMES_A2A_CONTEXT_UNRESOLVED",
+  );
+});
+
+test("stop-like completed observation preserves delegate replay", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-stop-race",
+    instruction: "work that finishes during stop",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-stop-race",
+      sessionId: "session-stop-race",
+      status: "started",
+    },
+    traceId: "trace-stop-race",
+    runId: "run-stop-race",
+    sessionId: "session-stop-race",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  await coordinator.observe(scope, {
+    kind: "run",
+    id: "run-stop-race",
+    terminal: true,
+    sessionId: "session-stop-race",
+    replayPayload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-stop-race",
+      sessionId: "session-stop-race",
+      status: "completed",
+      text: "finished before stop",
+      nativeSession: true,
+    },
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-stop-race-retry",
+    instruction: "work   that finishes during stop",
+  });
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.runId, "run-stop-race");
+  assert.equal(retry.replayPayload.text, "finished before stop");
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
