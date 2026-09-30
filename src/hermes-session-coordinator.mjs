@@ -510,12 +510,38 @@ export function createHermesSessionCoordinator({
         return snapshot(scope, record);
       }
 
+      const driftRecoveryActive = () => {
+        if (active.restoreOnFailure) {
+          return active.restoreOnFailure;
+        }
+        if (runId) {
+          return {
+            ...active,
+            kind: activeKind || "run",
+            runId,
+            taskId: taskId || active.taskId || null,
+            stateName: activeStateName || active.stateName || null,
+            restoreOnFailure: null,
+          };
+        }
+        if (keepActive && taskId) {
+          return {
+            ...active,
+            kind: activeKind || "a2a-task",
+            taskId,
+            stateName: activeStateName || active.stateName || null,
+            restoreOnFailure: null,
+          };
+        }
+        return null;
+      };
+
       if (
         active.route &&
         record.canonicalRoute &&
         active.route !== record.canonicalRoute
       ) {
-        record.active = active.restoreOnFailure || null;
+        record.active = driftRecoveryActive();
         record.updatedAt = new Date().toISOString();
         await persist();
         throw coordinatorError(
@@ -536,7 +562,7 @@ export function createHermesSessionCoordinator({
         expectedContextId &&
         contextId !== expectedContextId
       ) {
-        record.active = active.restoreOnFailure || null;
+        record.active = driftRecoveryActive();
         record.updatedAt = new Date().toISOString();
         await persist();
         throw coordinatorError(
@@ -557,7 +583,7 @@ export function createHermesSessionCoordinator({
         expectedSessionId &&
         sessionId !== expectedSessionId
       ) {
-        record.active = active.restoreOnFailure || null;
+        record.active = driftRecoveryActive();
         record.updatedAt = new Date().toISOString();
         await persist();
         throw coordinatorError(
