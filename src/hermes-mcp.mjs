@@ -1042,9 +1042,24 @@ function rejectScopedBackground(sessionScope, background) {
 async function reconcileCoordinatorActive(active) {
   if (active?.kind === "run" && active.runId) {
     const result = await control.getRun(active.runId);
+    const terminal = runIsTerminal(result);
+    const replayPayload =
+      terminal &&
+      active.tool === "delegate_to_hermes" &&
+      nativeRunSucceeded(result)
+        ? nativeDelegateResult(
+            {
+              runId: active.runId,
+              sessionId: active.sessionId || null,
+            },
+            result,
+            Boolean(active.sessionId),
+          )
+        : null;
     return {
-      terminal: runIsTerminal(result),
+      terminal,
       sessionId: result.sessionId || active.sessionId || null,
+      replayPayload,
     };
   }
   if (active?.kind === "a2a-task" && active.taskId) {
