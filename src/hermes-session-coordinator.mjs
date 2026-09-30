@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_DEDUP_WINDOW_MS = 60_000;
+const MAX_RECENT_RESULTS_PER_SESSION = 64;
 
 const UNSUCCESSFUL_OUTCOMES = new Set([
   "failed",
@@ -77,7 +78,7 @@ export function createHermesSessionCoordinator({
     process.env.HERMES_SESSION_COORDINATOR_STATE ||
     path.join(runtimeDir, "chatgpt-session-coordinator.json");
 
-  const state = { version: 2, sessions: {}, recentResults: {} };
+  const state = { version: 3, sessions: {}, recentResults: {} };
   const instanceId = randomUUID();
   const locks = new Map();
   let loaded = false;
@@ -109,15 +110,28 @@ export function createHermesSessionCoordinator({
     }
 
     let changed = false;
-    for (const [sessionHash, recent] of Object.entries(state.recentResults)) {
-      const settledAtMs = Number(recent?.settledAtMs);
-      if (
-        !recent ||
-        typeof recent !== "object" ||
-        Array.isArray(recent) ||
-        !Number.isFinite(settledAtMs) ||
-        now - settledAtMs > dedupWindowMs
-      ) {
+    for (const [sessionHash, bucket] of Object.entries(state.recentResults)) {
+      if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) {
+        delete state.recentResults[sessionHash];
+        changed = true;
+        continue;
+      }
+
+      for (const [fingerprint, recent] of Object.entries(bucket)) {
+        const settledAtMs = Number(recent?.settledAtMs);
+        if (
+          !recent ||
+          typeof recent !== "object" ||
+          Array.isArray(recent) ||
+          !Number.isFinite(settledAtMs) ||
+          now - settledAtMs > dedupWindowMs
+        ) {
+          delete bucket[fingerprint];
+          changed = true;
+        }
+      }
+
+      if (Object.keys(bucket).length === 0) {
         delete state.recentResults[sessionHash];
         changed = true;
       }
@@ -125,9 +139,33 @@ export function createHermesSessionCoordinator({
     return changed;
   }
 
+  function migrateLegacyRecentResults(input) {
+    const next = {};
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      return next;
+    }
+
+    for (const [sessionHash, recent] of Object.entries(input)) {
+      if (
+        recent?.fingerprint &&
+        recent?.payload &&
+        nativeReplayPayload(recent.payload)
+      ) {
+        next[sessionHash] = {
+          [recent.fingerprint]: {
+            settledAtMs: recent.settledAtMs,
+            traceId: recent.traceId || null,
+            payload: recent.payload,
+          },
+        };
+      }
+    }
+    return next;
+  }
+
   function migrateV1(parsed) {
     const nextSessions = {};
-    const nextRecent = {};
+    const nextRecent = migrateLegacyRecentResults(parsed.recentResults);
 
     for (const [sessionHash, record] of Object.entries(parsed.sessions || {})) {
       if (!record || typeof record !== "object" || Array.isArray(record)) {
@@ -164,15 +202,11 @@ export function createHermesSessionCoordinator({
         updatedAt: record.updatedAt || null,
       };
 
-      const recent = parsed.recentResults?.[sessionHash];
-      if (recent?.payload && nativeReplayPayload(recent.payload)) {
-        nextRecent[sessionHash] = recent;
-      }
     }
 
     state.sessions = nextSessions;
     state.recentResults = nextRecent;
-    state.version = 2;
+    state.version = 3;
   }
 
   async function persist() {
@@ -215,6 +249,13 @@ export function createHermesSessionCoordinator({
             migrateV1(parsed);
             migrated = true;
           } else if (parsed.version === 2) {
+            state.sessions = parsed.sessions;
+            state.recentResults = migrateLegacyRecentResults(
+              parsed.recentResults,
+            );
+            state.version = 3;
+            migrated = true;
+          } else if (parsed.version === 3) {
             state.sessions = parsed.sessions;
             state.recentResults =
               parsed.recentResults &&
@@ -270,19 +311,47 @@ export function createHermesSessionCoordinator({
     return record;
   }
 
-  function getRecentResult(sessionHash) {
-    const recent = state.recentResults?.[sessionHash];
+  function getRecentResult(sessionHash, fingerprint) {
+    if (!fingerprint) return null;
+    const bucket = state.recentResults?.[sessionHash];
+    const recent = bucket?.[fingerprint];
     return recent && typeof recent === "object" && !Array.isArray(recent)
       ? recent
       : null;
   }
 
-  function setRecentResult(sessionHash, value) {
-    state.recentResults[sessionHash] = value;
+  function setRecentResult(sessionHash, fingerprint, value) {
+    if (!fingerprint) return;
+    let bucket = state.recentResults[sessionHash];
+    if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) {
+      bucket = {};
+      state.recentResults[sessionHash] = bucket;
+    }
+    bucket[fingerprint] = value;
+
+    const entries = Object.entries(bucket);
+    if (entries.length > MAX_RECENT_RESULTS_PER_SESSION) {
+      entries
+        .sort(
+          (a, b) =>
+            Number(a[1]?.settledAtMs || 0) -
+            Number(b[1]?.settledAtMs || 0),
+        )
+        .slice(0, entries.length - MAX_RECENT_RESULTS_PER_SESSION)
+        .forEach(([oldFingerprint]) => {
+          delete bucket[oldFingerprint];
+        });
+    }
   }
 
-  function deleteRecentResult(sessionHash) {
-    delete state.recentResults[sessionHash];
+  function deleteRecentResult(sessionHash, fingerprint) {
+    if (!fingerprint) return;
+    const bucket = state.recentResults?.[sessionHash];
+    if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) return;
+    delete bucket[fingerprint];
+    if (Object.keys(bucket).length === 0) {
+      delete state.recentResults[sessionHash];
+    }
   }
 
   function snapshot(scope, record) {
@@ -381,17 +450,13 @@ export function createHermesSessionCoordinator({
               reconciled.replayPayload &&
               payloadIsReusable(reconciled.replayPayload)
             ) {
-              setRecentResult(scope.sessionHash, {
-                fingerprint,
+              setRecentResult(scope.sessionHash, fingerprint, {
                 settledAtMs: Date.now(),
                 traceId: record.active.traceId || null,
                 payload: reconciled.replayPayload,
               });
             } else if (fingerprint) {
-              const recent = getRecentResult(scope.sessionHash);
-              if (recent?.fingerprint === fingerprint) {
-                deleteRecentResult(scope.sessionHash);
-              }
+              deleteRecentResult(scope.sessionHash, fingerprint);
             }
             record.active = null;
             changed = true;
@@ -437,25 +502,12 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      let recent = getRecentResult(scope.sessionHash);
       const now = Date.now();
-      if (
-        recent &&
-        (
-          !Number.isFinite(Number(recent.settledAtMs)) ||
-          now - Number(recent.settledAtMs) > dedupWindowMs
-        )
-      ) {
-        deleteRecentResult(scope.sessionHash);
-        recent = null;
-        record.updatedAt = new Date().toISOString();
-        await persist();
-      }
+      const recent = getRecentResult(scope.sessionHash, fingerprint);
 
       if (
         fingerprint &&
         recent &&
-        recent.fingerprint === fingerprint &&
         now - Number(recent.settledAtMs) <= dedupWindowMs
       ) {
         return {
@@ -606,17 +658,13 @@ export function createHermesSessionCoordinator({
         !(keepActive && (activeKind || active.kind) === "run");
 
       if (cacheable) {
-        setRecentResult(scope.sessionHash, {
-          fingerprint: active.fingerprint,
+        setRecentResult(scope.sessionHash, active.fingerprint, {
           settledAtMs: Date.now(),
           traceId: traceId || active.traceId || null,
           payload,
         });
       } else if (!keepActive && active.fingerprint) {
-        const recent = getRecentResult(scope.sessionHash);
-        if (recent?.fingerprint === active.fingerprint) {
-          deleteRecentResult(scope.sessionHash);
-        }
+        deleteRecentResult(scope.sessionHash, active.fingerprint);
       }
 
       record.updatedAt = new Date().toISOString();
@@ -715,17 +763,13 @@ export function createHermesSessionCoordinator({
           replayPayload &&
           payloadIsReusable(replayPayload)
         ) {
-          setRecentResult(scope.sessionHash, {
-            fingerprint: active.fingerprint,
+          setRecentResult(scope.sessionHash, active.fingerprint, {
             settledAtMs: Date.now(),
             traceId: active.traceId || null,
             payload: replayPayload,
           });
         } else if (active.fingerprint) {
-          const recent = getRecentResult(scope.sessionHash);
-          if (recent?.fingerprint === active.fingerprint) {
-            deleteRecentResult(scope.sessionHash);
-          }
+          deleteRecentResult(scope.sessionHash, active.fingerprint);
         }
         record.active = null;
       }
