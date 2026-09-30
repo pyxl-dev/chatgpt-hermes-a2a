@@ -339,6 +339,76 @@ test("failed resumable retry restores the original active task lock", async () =
   );
 });
 
+test("context drift during a resumable retry restores the original task lock", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const initial = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-initial",
+    instruction: "needs input",
+    requestedContextId: "ctx-canonical",
+  });
+  await coordinator.complete(scope, initial.operationId, {
+    payload: {
+      ok: true,
+      taskId: "task-input",
+      contextId: "ctx-canonical",
+      stateName: "input-required",
+    },
+    traceId: "trace-initial",
+    taskId: "task-input",
+    contextId: "ctx-canonical",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "input-required",
+  });
+
+  const resume = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-resume",
+    instruction: "resume",
+    requestedContextId: "ctx-canonical",
+    requestedTaskId: "task-input",
+  });
+
+  await assert.rejects(
+    coordinator.complete(scope, resume.operationId, {
+      payload: {
+        ok: true,
+        taskId: "task-input",
+        contextId: "ctx-drifted",
+        stateName: "input-required",
+      },
+      traceId: "trace-resume",
+      taskId: "task-input",
+      contextId: "ctx-drifted",
+      keepActive: true,
+      activeKind: "a2a-task",
+      activeStateName: "input-required",
+    }),
+    (error) => error?.code === "HERMES_CONTEXT_DRIFT",
+  );
+
+  const restored = await coordinator.inspect(scope);
+  assert.equal(restored.active?.kind, "a2a-task");
+  assert.equal(restored.active?.taskId, "task-input");
+  assert.equal(restored.active?.stateName, "input-required");
+  assert.equal(restored.active?.contextId, "ctx-canonical");
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-parallel",
+      instruction: "parallel work must remain blocked",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
