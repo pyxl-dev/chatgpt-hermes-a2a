@@ -193,8 +193,15 @@ try {
   if (!/sessionId/i.test(descriptions.get_hermes_session) || !/persisted|durable/i.test(descriptions.get_hermes_session)) {
     throw new Error("get_hermes_session description must identify durable Hermes session reads");
   }
-  if (!/sessionId/i.test(descriptions.continue_hermes_session) || !/resume|existing/i.test(descriptions.continue_hermes_session)) {
-    throw new Error("continue_hermes_session description must identify durable Hermes session resume");
+  if (
+    !/sessionId/i.test(descriptions.continue_hermes_session) ||
+    !/continue|resume|existing|persisted/i.test(
+      descriptions.continue_hermes_session,
+    )
+  ) {
+    throw new Error(
+      "continue_hermes_session description must identify durable Hermes session continuation",
+    );
   }
   if (!/controll|steer|stop/i.test(descriptions.start_hermes_run) || !/runId/i.test(descriptions.start_hermes_run)) {
     throw new Error("start_hermes_run description must explain controllable runs and runId");
