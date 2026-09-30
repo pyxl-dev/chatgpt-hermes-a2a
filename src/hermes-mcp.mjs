@@ -736,7 +736,7 @@ async function executePublicTool(name, args, traceId, sessionScope) {
       const terminal = runIsTerminal(result);
       const replayPayload =
         terminal &&
-        before?.active?.kind === "run" &&
+        ["run", "native-session-unresolved"].includes(before?.active?.kind) &&
         before.active.runId === runId
           ? recoveredNativeRunPayload(before.active, result)
           : null;
