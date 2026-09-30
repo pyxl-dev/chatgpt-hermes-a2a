@@ -214,6 +214,7 @@ export function createHermesSessionCoordinator({
         canonicalSessionId: requestedSessionId || null,
         contextIdToUse: requestedContextId || null,
         sessionIdToUse: requestedSessionId || null,
+        idempotencyKey: null,
       };
     }
 
@@ -442,6 +443,10 @@ export function createHermesSessionCoordinator({
           : null;
 
       const operationId = randomUUID();
+      const idempotencyKey =
+        recoverableNativePending && record.active?.idempotencyKey
+          ? record.active.idempotencyKey
+          : sha256(scope.sessionHash + "\n" + operationId);
       record.active = {
         operationId,
         tool,
@@ -459,6 +464,7 @@ export function createHermesSessionCoordinator({
         fingerprint,
         restoreOnFailure,
         ownerInstanceId: instanceId,
+        idempotencyKey,
       };
       record.updatedAt = new Date().toISOString();
       await persist();
@@ -474,6 +480,7 @@ export function createHermesSessionCoordinator({
           requestedContextId || record.canonicalContextId || null,
         sessionIdToUse:
           requestedSessionId || record.canonicalSessionId || null,
+        idempotencyKey,
       };
     });
   }
