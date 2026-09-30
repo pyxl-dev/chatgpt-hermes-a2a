@@ -79,7 +79,6 @@ try {
 
   const listed = await client.listTools();
   summary.tools = (listed.tools || []).map((tool) => tool.name);
-  assert.deepEqual?.;
   const actual = [...summary.tools].sort();
   const expected = [...expectedTools].sort();
   if (
