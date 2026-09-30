@@ -1800,6 +1800,164 @@ test("restart globally prunes expired replay payloads from inactive conversation
   );
 });
 
+test("sessionless native failure observed after polling releases the provisional route", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-sessionless-fail",
+    instruction: "first native attempt",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-sessionless-fail",
+      status: "started",
+    },
+    traceId: "trace-sessionless-fail",
+    runId: "run-sessionless-fail",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  await coordinator.observe(scope, {
+    kind: "run",
+    id: "run-sessionless-fail",
+    terminal: true,
+    sessionId: null,
+    replayPayload: null,
+  });
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalRoute, null);
+  assert.equal(snapshot.canonicalSessionId, null);
+  assert.equal(snapshot.active, null);
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-sessionless-retry",
+    instruction: "retry after terminal failure",
+  });
+  assert.equal(retry.replay, false);
+  assert.ok(retry.operationId);
+});
+
+test("sessionless native failure found by reconciliation releases the provisional route", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-reconcile-sessionless",
+    instruction: "async native attempt",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-reconcile-sessionless",
+      status: "started",
+    },
+    traceId: "trace-reconcile-sessionless",
+    runId: "run-reconcile-sessionless",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-after-reconcile-failure",
+    instruction: "new work after failed run",
+    reconcileActive: async () => ({
+      terminal: true,
+      sessionId: null,
+      replayPayload: null,
+    }),
+  });
+
+  assert.equal(retry.replay, false);
+  assert.ok(retry.operationId);
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalRoute, null);
+  assert.equal(snapshot.canonicalSessionId, null);
+});
+
+test("immediate terminal native failure releases a sessionless provisional route", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-immediate-failure",
+    instruction: "fail immediately",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: false,
+      runId: "run-immediate-failure",
+      status: "failed",
+      error: "boom",
+    },
+    traceId: "trace-immediate-failure",
+    runId: "run-immediate-failure",
+    keepActive: false,
+  });
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalRoute, null);
+  assert.equal(snapshot.canonicalSessionId, null);
+  assert.equal(snapshot.active, null);
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-immediate-retry",
+    instruction: "fresh work",
+  });
+  assert.ok(retry.operationId);
+});
+
+test("terminal A2A failure without a resolved context releases the provisional route", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-terminal-failure",
+    instruction: "a2a attempt",
+    requestedContextId: "ctx-requested",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      stateName: "failed",
+      text: "failed",
+    },
+    traceId: "trace-a2a-terminal-failure",
+    keepActive: false,
+  });
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalRoute, null);
+  assert.equal(snapshot.canonicalContextId, null);
+  assert.equal(snapshot.active, null);
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-retry-after-failure",
+    instruction: "a2a retry",
+    requestedContextId: "ctx-requested",
+  });
+  assert.ok(retry.operationId);
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
