@@ -424,6 +424,48 @@ test("prevents mixing A2A and native Hermes routes in one ChatGPT conversation",
   );
 });
 
+test("blocks a second native session when the durable session id is unresolved", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    traceId: "trace-native-first",
+    instruction: "first native run",
+  });
+  await coordinator.complete(scope, first.operationId, {
+    payload: { ok: true, runId: "run-first", status: "completed" },
+    traceId: "trace-native-first",
+    runId: "run-first",
+  });
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.canonicalRoute, "native");
+  assert.equal(snapshot.canonicalSessionId, null);
+  assert.equal(snapshot.active, null);
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      traceId: "trace-native-second",
+      instruction: "must not create another native session",
+    }),
+    (error) => error?.code === "HERMES_NATIVE_SESSION_UNRESOLVED",
+  );
+
+  const recovered = await coordinator.begin(scope, {
+    mode: "continue-session",
+    tool: "continue_hermes_session",
+    traceId: "trace-native-recover",
+    instruction: "recover known session",
+    requestedSessionId: "native-recovered",
+  });
+  assert.equal(recovered.canonicalRoute, "native");
+  assert.equal(recovered.sessionIdToUse, "native-recovered");
+});
+
 test("tracks a controllable run until its terminal status is observed", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
