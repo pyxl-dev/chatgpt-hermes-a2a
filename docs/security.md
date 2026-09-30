@@ -67,9 +67,9 @@ Session coordination is persisted at:
 
 Permissions are restricted to the current user where supported.
 
-State version 2 contains hashed ChatGPT session keys, canonical Hermes session IDs, active native Run metadata and bounded replay payloads.
+State version 3 contains hashed ChatGPT session keys, canonical Hermes session IDs, active native Run metadata and a time-bounded replay map keyed by operation fingerprint. All still-live replay entries are retained until expiry so a later successful operation cannot make an earlier exact retry execute again.
 
-When upgrading from the former mixed native/A2A state schema, native state is migrated and old A2A context/task state is discarded.
+When upgrading from the former mixed native/A2A schema or the intermediate native version-2 schema, native state is migrated, old A2A context/task state is discarded, and legacy single-slot replay is converted to the version-3 per-fingerprint map.
 
 Do not intentionally place secrets in Hermes instructions. Replay payload persistence is for delivery safety, not a data-loss-prevention boundary.
 
