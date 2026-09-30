@@ -304,17 +304,23 @@ export function createHermesSessionCoordinator({
             changed = true;
           }
           if (reconciled.terminal === true) {
+            const activeFingerprint = record.active.fingerprint || null;
             if (
-              record.active.fingerprint &&
+              activeFingerprint &&
               reconciled.replayPayload &&
               payloadIsReusable(reconciled.replayPayload)
             ) {
               recentResults.set(scope.sessionHash, {
-                fingerprint: record.active.fingerprint,
+                fingerprint: activeFingerprint,
                 settledAtMs: Date.now(),
                 traceId: record.active.traceId || null,
                 payload: reconciled.replayPayload,
               });
+            } else if (activeFingerprint) {
+              const recent = recentResults.get(scope.sessionHash);
+              if (recent?.fingerprint === activeFingerprint) {
+                recentResults.delete(scope.sessionHash);
+              }
             }
             record.active = null;
             changed = true;
@@ -784,18 +790,20 @@ export function createHermesSessionCoordinator({
       if (sessionId && !record.canonicalSessionId) {
         record.canonicalSessionId = sessionId;
       }
-      if (
-        terminal === true &&
-        active.fingerprint &&
-        replayPayload &&
-        payloadIsReusable(replayPayload)
-      ) {
-        recentResults.set(scope.sessionHash, {
-          fingerprint: active.fingerprint,
-          settledAtMs: Date.now(),
-          traceId: active.traceId || null,
-          payload: replayPayload,
-        });
+      if (terminal === true && active.fingerprint) {
+        if (replayPayload && payloadIsReusable(replayPayload)) {
+          recentResults.set(scope.sessionHash, {
+            fingerprint: active.fingerprint,
+            settledAtMs: Date.now(),
+            traceId: active.traceId || null,
+            payload: replayPayload,
+          });
+        } else {
+          const recent = recentResults.get(scope.sessionHash);
+          if (recent?.fingerprint === active.fingerprint) {
+            recentResults.delete(scope.sessionHash);
+          }
+        }
       }
       if (terminal === true) {
         record.active = null;
