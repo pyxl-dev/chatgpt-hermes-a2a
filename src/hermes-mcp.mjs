@@ -780,12 +780,14 @@ async function executePublicTool(name, args, traceId, sessionScope) {
     }
 
     case "hermes_status": {
-      const status = await control.status();
+      const controlStatus = await control.status();
       return {
-        ...status,
+        ok: true,
         operation: "hermes_status",
+        agent: AGENT,
         reachable: true,
         nativeOnly: true,
+        control: controlStatus,
       };
     }
 
