@@ -48,6 +48,11 @@ read_env_value() {
   ' "$file"
 }
 
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] &&
+    (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
 HERMES_ENV_FILE="$(resolve_hermes_env_file)"
 
 API_KEY="${HERMES_API_SERVER_KEY:-${API_SERVER_KEY:-$(read_env_value API_SERVER_KEY "$HERMES_ENV_FILE")}}"
@@ -56,14 +61,17 @@ if [[ -z "$API_KEY" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
   API_KEY="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_KEY 2>/dev/null || true)"
 fi
 
-API_PORT="${API_SERVER_PORT:-$(read_env_value API_SERVER_PORT "$HERMES_ENV_FILE")}"
-if [[ ! "$API_PORT" =~ ^[0-9]+$ ]] && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+API_PORT="${API_SERVER_PORT:-}"
+if ! valid_port "$API_PORT"; then
+  API_PORT="$(read_env_value API_SERVER_PORT "$HERMES_ENV_FILE")"
+fi
+if ! valid_port "$API_PORT" && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
   API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_PORT 2>/dev/null || true)"
 fi
-if [[ ! "$API_PORT" =~ ^[0-9]+$ ]] && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+if ! valid_port "$API_PORT" && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
   API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get platforms.api_server.extra.port 2>/dev/null || true)"
 fi
-if [[ ! "$API_PORT" =~ ^[0-9]+$ ]] || (( API_PORT < 1 || API_PORT > 65535 )); then
+if ! valid_port "$API_PORT"; then
   API_PORT="8642"
 fi
 API_URL="${HERMES_API_SERVER_URL:-}"
