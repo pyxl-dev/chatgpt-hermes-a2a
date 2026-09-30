@@ -16,12 +16,14 @@ export function controlIdempotencyKey(
   scope = "unscoped",
   nowMs = Date.now(),
 ) {
-  const bucket = Math.floor(nowMs / 60000);
+  const normalizedScope = String(scope || "unscoped");
+  const prefix =
+    normalizedScope === "unscoped"
+      ? "minute:" + Math.floor(nowMs / 60000)
+      : "operation:" + normalizedScope;
   return createHash("sha256")
     .update(
-      String(bucket) +
-        "\n" +
-        String(scope || "unscoped") +
+      prefix +
         "\n" +
         String(sessionId || "new") +
         "\n" +
