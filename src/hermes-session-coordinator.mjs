@@ -262,7 +262,7 @@ export function createHermesSessionCoordinator({
 
       const targetRoute =
         mode === "delegate"
-          ? record.canonicalRoute || "a2a"
+          ? record.canonicalRoute || "native"
           : mode === "continue-context"
             ? "a2a"
             : "native";
