@@ -42,7 +42,12 @@ function activeSummary(active) {
 }
 
 function isStalePending(active, stalePendingMs, now = Date.now()) {
-  if (!active || active.taskId || active.runId) return false;
+  if (
+    !active ||
+    active.taskId ||
+    active.runId ||
+    active.route === "native"
+  ) return false;
   const startedAtMs = Date.parse(active.startedAt || "");
   return (
     Number.isFinite(startedAtMs) &&
@@ -72,6 +77,7 @@ export function createHermesSessionCoordinator({
     path.join(runtimeDir, "chatgpt-session-coordinator.json");
 
   const state = { version: 1, sessions: {} };
+  const instanceId = randomUUID();
   const recentResults = new Map();
   const locks = new Map();
   let loaded = false;
@@ -222,22 +228,79 @@ export function createHermesSessionCoordinator({
       }
 
       if (record.active && typeof reconcileActive === "function") {
+        let reconciled = null;
         try {
-          const reconciled = await reconcileActive(activeSummary(record.active));
-          if (reconciled?.terminal === true) {
-            if (reconciled.contextId && !record.canonicalContextId) {
-              record.canonicalContextId = reconciled.contextId;
-            }
-            if (reconciled.sessionId && !record.canonicalSessionId) {
-              record.canonicalSessionId = reconciled.sessionId;
-            }
-            record.active = null;
-            changed = true;
-          }
+          reconciled = await reconcileActive(activeSummary(record.active));
         } catch {
           // A status failure must never make us assume an active Hermes job ended.
         }
+
+        if (reconciled) {
+          const expectedContextId =
+            record.canonicalContextId || record.active.contextId || null;
+          if (
+            reconciled.contextId &&
+            expectedContextId &&
+            reconciled.contextId !== expectedContextId
+          ) {
+            throw coordinatorError(
+              "HERMES_CONTEXT_DRIFT",
+              "Hermes reported a different contextId while reconciling the active operation.",
+              {
+                sessionHash: scope.sessionHash,
+                expectedContextId,
+                returnedContextId: reconciled.contextId,
+                active: activeSummary(record.active),
+              },
+            );
+          }
+
+          const expectedSessionId =
+            record.canonicalSessionId || record.active.sessionId || null;
+          if (
+            reconciled.sessionId &&
+            expectedSessionId &&
+            reconciled.sessionId !== expectedSessionId
+          ) {
+            throw coordinatorError(
+              "HERMES_NATIVE_SESSION_DRIFT",
+              "Hermes reported a different sessionId while reconciling the active operation.",
+              {
+                sessionHash: scope.sessionHash,
+                expectedSessionId,
+                returnedSessionId: reconciled.sessionId,
+                active: activeSummary(record.active),
+              },
+            );
+          }
+
+          if (reconciled.contextId && !record.canonicalContextId) {
+            record.canonicalContextId = reconciled.contextId;
+            changed = true;
+          }
+          if (reconciled.sessionId && !record.canonicalSessionId) {
+            record.canonicalSessionId = reconciled.sessionId;
+            changed = true;
+          }
+          if (reconciled.terminal === true) {
+            record.active = null;
+            changed = true;
+          }
+        }
       }
+
+      const fingerprint =
+        typeof instruction === "string" && instruction.trim()
+          ? sha256(
+              [
+                mode,
+                requestedContextId || "",
+                requestedSessionId || "",
+                requestedTaskId || "",
+                normalizeInstruction(instruction),
+              ].join("\n"),
+            )
+          : null;
 
       const resumableTask =
         record.active?.kind === "a2a-task" &&
@@ -245,7 +308,19 @@ export function createHermesSessionCoordinator({
         record.active.taskId === requestedTaskId &&
         ["input-required", "auth-required"].includes(record.active.stateName);
 
-      if (record.active && !resumableTask) {
+      const recoverableNativePending =
+        record.active?.route === "native" &&
+        ["native-pending", "native-submission-unknown"].includes(
+          record.active.kind,
+        ) &&
+        fingerprint &&
+        record.active.fingerprint === fingerprint &&
+        (
+          record.active.kind === "native-submission-unknown" ||
+          record.active.ownerInstanceId !== instanceId
+        );
+
+      if (record.active && !resumableTask && !recoverableNativePending) {
         if (changed) {
           record.updatedAt = new Date().toISOString();
           await persist();
@@ -333,18 +408,6 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      const fingerprint =
-        typeof instruction === "string" && instruction.trim()
-          ? sha256(
-              [
-                mode,
-                requestedContextId || "",
-                requestedSessionId || "",
-                requestedTaskId || "",
-                normalizeInstruction(instruction),
-              ].join("\n"),
-            )
-          : null;
       const recent = recentResults.get(scope.sessionHash);
       const now = Date.now();
       if (
@@ -373,9 +436,10 @@ export function createHermesSessionCoordinator({
         };
       }
 
-      const restoreOnFailure = resumableTask
-        ? { ...record.active, restoreOnFailure: null }
-        : null;
+      const restoreOnFailure =
+        resumableTask || recoverableNativePending
+          ? { ...record.active, restoreOnFailure: null }
+          : null;
 
       const operationId = randomUUID();
       record.active = {
@@ -394,6 +458,7 @@ export function createHermesSessionCoordinator({
         stateName: null,
         fingerprint,
         restoreOnFailure,
+        ownerInstanceId: instanceId,
       };
       record.updatedAt = new Date().toISOString();
       await persist();
@@ -457,39 +522,43 @@ export function createHermesSessionCoordinator({
         );
       }
 
+      const expectedContextId =
+        record.canonicalContextId || active.contextId || null;
       if (
         contextId &&
-        record.canonicalContextId &&
-        contextId !== record.canonicalContextId
+        expectedContextId &&
+        contextId !== expectedContextId
       ) {
         record.active = active.restoreOnFailure || null;
         record.updatedAt = new Date().toISOString();
         await persist();
         throw coordinatorError(
           "HERMES_CONTEXT_DRIFT",
-          "Hermes returned a different contextId than the canonical context for this ChatGPT conversation.",
+          "Hermes returned a different contextId than the context requested or already bound for this ChatGPT conversation.",
           {
             sessionHash: scope.sessionHash,
-            canonicalContextId: record.canonicalContextId,
+            expectedContextId,
             returnedContextId: contextId,
           },
         );
       }
 
+      const expectedSessionId =
+        record.canonicalSessionId || active.sessionId || null;
       if (
         sessionId &&
-        record.canonicalSessionId &&
-        sessionId !== record.canonicalSessionId
+        expectedSessionId &&
+        sessionId !== expectedSessionId
       ) {
         record.active = active.restoreOnFailure || null;
         record.updatedAt = new Date().toISOString();
         await persist();
         throw coordinatorError(
           "HERMES_NATIVE_SESSION_DRIFT",
-          "Hermes returned a different sessionId than the canonical durable session for this ChatGPT conversation.",
+          "Hermes returned a different sessionId than the session requested or already bound for this ChatGPT conversation.",
           {
             sessionHash: scope.sessionHash,
-            canonicalSessionId: record.canonicalSessionId,
+            expectedSessionId,
             returnedSessionId: sessionId,
           },
         );
@@ -548,6 +617,24 @@ export function createHermesSessionCoordinator({
     });
   }
 
+  async function markSubmissionUnknown(scope, operationId) {
+    if (!scope?.tracked || !scope.sessionHash || !operationId) return;
+    await ensureLoaded();
+    return withLock(scope.sessionHash, async () => {
+      const record = getRecord(scope.sessionHash);
+      if (record.active?.operationId === operationId) {
+        record.active = {
+          ...record.active,
+          kind: "native-submission-unknown",
+          ownerInstanceId: instanceId,
+        };
+        record.updatedAt = new Date().toISOString();
+        await persist();
+      }
+      return snapshot(scope, record);
+    });
+  }
+
   async function observe(
     scope,
     {
@@ -568,6 +655,44 @@ export function createHermesSessionCoordinator({
           ? active?.kind === "run" && active?.runId === id
           : active?.kind === "a2a-task" && active?.taskId === id;
       if (!matches) return snapshot(scope, record);
+
+      const expectedContextId =
+        record.canonicalContextId || active.contextId || null;
+      if (
+        contextId &&
+        expectedContextId &&
+        contextId !== expectedContextId
+      ) {
+        throw coordinatorError(
+          "HERMES_CONTEXT_DRIFT",
+          "Hermes reported a different contextId while observing the active operation.",
+          {
+            sessionHash: scope.sessionHash,
+            expectedContextId,
+            returnedContextId: contextId,
+            active: activeSummary(active),
+          },
+        );
+      }
+
+      const expectedSessionId =
+        record.canonicalSessionId || active.sessionId || null;
+      if (
+        sessionId &&
+        expectedSessionId &&
+        sessionId !== expectedSessionId
+      ) {
+        throw coordinatorError(
+          "HERMES_NATIVE_SESSION_DRIFT",
+          "Hermes reported a different sessionId while observing the active operation.",
+          {
+            sessionHash: scope.sessionHash,
+            expectedSessionId,
+            returnedSessionId: sessionId,
+            active: activeSummary(active),
+          },
+        );
+      }
 
       if (contextId && !record.canonicalContextId) {
         record.canonicalContextId = contextId;
@@ -652,6 +777,7 @@ export function createHermesSessionCoordinator({
     begin,
     complete,
     fail,
+    markSubmissionUnknown,
     observe,
     assertActiveRun,
     assertActiveTask,
