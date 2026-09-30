@@ -80,8 +80,7 @@ active:
   fingerprint
   ownerInstanceId
   idempotencyKey
-recentResult:
-  fingerprint
+recentResults[fingerprint]:
   settledAtMs
   traceId
   payload
@@ -118,7 +117,7 @@ After a bridge restart, `begin()` reconciles the persisted active Run through `G
 
 ### Exact replay
 
-Successful terminal results are persisted for a bounded deduplication window. The fingerprint uses normalized NFKC/trim/collapsed-whitespace instruction text plus operation mode and explicit session binding.
+Every successful terminal result remains persisted under its own operation fingerprint for the full deduplication window. A later success does not overwrite an earlier live replay. The fingerprint uses normalized NFKC/trim/collapsed-whitespace instruction text plus operation mode and explicit session binding.
 
 Exact retries inside the window return the prior result rather than resubmitting work, including after a bridge restart.
 
@@ -146,13 +145,14 @@ This ensures a retry the coordinator considers exact also reaches Hermes with th
 
 ## Persisted-state migration
 
-Coordinator state version 2 is native-only.
+Coordinator state version 3 is native-only and stores replay results by fingerprint.
 
-When loading version-1 mixed-route state:
+When loading version-1 mixed-route state or version-2 native state:
 
 - native canonical `sessionId` and native Run state are retained;
 - legacy A2A contexts/tasks are discarded;
-- only native-looking replay payloads are retained.
+- only native-looking replay payloads are retained;
+- legacy single-slot replay entries are migrated into the version-3 per-fingerprint replay map.
 
 This migration exists so existing installations can move to the native-only bridge without keeping the old A2A state machine alive.
 
