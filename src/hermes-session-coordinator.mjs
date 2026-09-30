@@ -354,6 +354,12 @@ export function createHermesSessionCoordinator({
         }
       }
 
+      if (changed) {
+        record.updatedAt = new Date().toISOString();
+        await persist();
+        changed = false;
+      }
+
       const fingerprint =
         typeof instruction === "string" && instruction.trim()
           ? sha256(
