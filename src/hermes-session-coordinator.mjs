@@ -99,6 +99,33 @@ export function createHermesSessionCoordinator({
   const state = { version: 1, sessions: {}, recentResults: {} };
   const instanceId = randomUUID();
   const locks = new Map();
+
+  function pruneExpiredRecentResults(now = Date.now()) {
+    if (
+      !state.recentResults ||
+      typeof state.recentResults !== "object" ||
+      Array.isArray(state.recentResults)
+    ) {
+      state.recentResults = {};
+      return true;
+    }
+
+    let changed = false;
+    for (const [sessionHash, recent] of Object.entries(state.recentResults)) {
+      const settledAtMs = Number(recent?.settledAtMs);
+      if (
+        !recent ||
+        typeof recent !== "object" ||
+        Array.isArray(recent) ||
+        !Number.isFinite(settledAtMs) ||
+        now - settledAtMs > dedupWindowMs
+      ) {
+        delete state.recentResults[sessionHash];
+        changed = true;
+      }
+    }
+    return changed;
+  }
   let loaded = false;
   let loadPromise = null;
   let writeChain = Promise.resolve();
@@ -143,7 +170,11 @@ export function createHermesSessionCoordinator({
       } catch (error) {
         if (error?.code !== "ENOENT") throw error;
       }
+      const pruned = pruneExpiredRecentResults();
       loaded = true;
+      if (pruned) {
+        await persist();
+      }
     })();
     try {
       await loadPromise;
@@ -156,6 +187,7 @@ export function createHermesSessionCoordinator({
     writeChain = writeChain
       .catch(() => {})
       .then(async () => {
+        pruneExpiredRecentResults();
         await fs.mkdir(path.dirname(filePath), {
           recursive: true,
           mode: 0o700,
