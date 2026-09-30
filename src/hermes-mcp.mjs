@@ -29,6 +29,21 @@ const BACKEND_TIMEOUT_MS =
   Number.isFinite(configuredTimeout) && configuredTimeout > 0
     ? configuredTimeout
     : 330000;
+const configuredNativeDelegateTimeout = Number(
+  process.env.HERMES_NATIVE_DELEGATE_TIMEOUT_MS,
+);
+const NATIVE_DELEGATE_TIMEOUT_MS =
+  Number.isFinite(configuredNativeDelegateTimeout) &&
+  configuredNativeDelegateTimeout >= 1000
+    ? configuredNativeDelegateTimeout
+    : BACKEND_TIMEOUT_MS;
+const configuredNativePollMs = Number(
+  process.env.HERMES_NATIVE_DELEGATE_POLL_MS,
+);
+const NATIVE_DELEGATE_POLL_MS =
+  Number.isFinite(configuredNativePollMs) && configuredNativePollMs >= 100
+    ? configuredNativePollMs
+    : 750;
 const REQUIRED_BACKEND_TOOLS = [
   "a2a_get_agent_card",
   "a2a_send_message",
@@ -113,7 +128,7 @@ const TOOLS = [
   {
     name: "delegate_to_hermes",
     description:
-      "Run ordinary Hermes work for this ChatGPT conversation. The first call creates the canonical A2A context; later calls from the same ChatGPT conversation automatically continue that exact context instead of starting a second Hermes conversation. Do not use background mode from ChatGPT; use start_hermes_run when live steering or stopping is required.",
+      "Run ordinary Hermes work for this ChatGPT conversation. ChatGPT-scoped calls use Hermes' native Runs API and one durable native session by default, so later calls continue the same session without the A2A five-turn cap. Legacy unscoped clients keep A2A behavior. Do not use background mode from ChatGPT; use start_hermes_run when live steering or stopping is required.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -137,7 +152,7 @@ const TOOLS = [
   {
     name: "continue_with_hermes",
     description:
-      "Explicitly continue the canonical A2A Hermes context for this ChatGPT conversation. The wrapper rejects a different contextId and rejects parallel work. Ordinary follow-ups can use delegate_to_hermes, which automatically reuses the canonical context.",
+      "Explicitly continue an existing A2A Hermes context. This is a legacy/compatibility path; ordinary ChatGPT work should use delegate_to_hermes, which defaults to a durable native Hermes session and avoids the A2A five-turn cap. The wrapper rejects a different contextId and parallel work.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -909,6 +924,60 @@ function runIsTerminal(result) {
   );
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForNativeRun(runId) {
+  const deadline = Date.now() + NATIVE_DELEGATE_TIMEOUT_MS;
+  let lastResult = null;
+  let lastError = null;
+
+  while (Date.now() < deadline) {
+    try {
+      lastResult = await control.getRun(runId);
+      lastError = null;
+      if (runIsTerminal(lastResult)) return lastResult;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(NATIVE_DELEGATE_POLL_MS);
+  }
+
+  throw codedError(
+    "HERMES_NATIVE_RUN_TIMEOUT",
+    "Hermes native run did not reach a terminal state before the synchronous delegation timeout.",
+    {
+      runId,
+      timeoutMs: NATIVE_DELEGATE_TIMEOUT_MS,
+      lastStatus: lastResult?.status || null,
+      lastError: lastError ? errorMessage(lastError) : null,
+    },
+  );
+}
+
+function nativeDelegateResult(started, completed, reusedSession) {
+  const output = completed?.output ?? null;
+  return {
+    ...completed,
+    ok: completed?.ok !== false,
+    operation: "delegate_to_hermes",
+    agent: AGENT,
+    runId: completed?.runId || started?.runId || null,
+    sessionId:
+      completed?.sessionId || started?.sessionId || null,
+    text:
+      typeof output === "string"
+        ? cleanHermesText(output) || null
+        : null,
+    nativeSession: true,
+    continuedCanonicalSession: reusedSession === true,
+    createdCanonicalSession:
+      reusedSession !== true &&
+      Boolean(completed?.sessionId || started?.sessionId),
+  };
+}
+
 function rejectScopedBackground(sessionScope, background) {
   if (sessionScope?.tracked && background === true) {
     throw codedError(
@@ -979,33 +1048,70 @@ async function executePublicTool(
       try {
         let result;
         if (lease.canonicalRoute === "native") {
-          if (!lease.sessionIdToUse) {
-            throw codedError(
-              "HERMES_NATIVE_SESSION_UNRESOLVED",
-              "This ChatGPT conversation is bound to the native Hermes route, but no durable sessionId is available yet. Inspect the active/previous controllable run before starting more work.",
-              { sessionHash: sessionScope?.sessionHash || null },
+          let runStarted = false;
+          let started = null;
+          try {
+            started = await control.startRun(
+              instruction,
+              lease.sessionIdToUse,
             );
+            if (!started?.runId) {
+              throw codedError(
+                "HERMES_NATIVE_RUN_ID_MISSING",
+                "Hermes accepted native delegation without returning a runId.",
+                { sessionHash: sessionScope?.sessionHash || null },
+              );
+            }
+
+            await sessionCoordinator.complete(
+              sessionScope,
+              lease.operationId,
+              {
+                payload: started,
+                traceId,
+                sessionId:
+                  started.sessionId || lease.sessionIdToUse || null,
+                runId: started.runId,
+                keepActive: true,
+                activeKind: "run",
+              },
+            );
+            runStarted = true;
+
+            const completed = await waitForNativeRun(started.runId);
+            result = nativeDelegateResult(
+              started,
+              completed,
+              Boolean(lease.sessionIdToUse),
+            );
+
+            await sessionCoordinator.complete(
+              sessionScope,
+              lease.operationId,
+              {
+                payload: result,
+                traceId,
+                sessionId:
+                  result.sessionId || lease.sessionIdToUse || null,
+                runId: result.runId || started.runId,
+              },
+            );
+            return result;
+          } catch (error) {
+            if (!runStarted) {
+              await sessionCoordinator.fail(
+                sessionScope,
+                lease.operationId,
+              );
+            } else if (!error?.details?.runId) {
+              error.details = {
+                ...(error?.details || {}),
+                runId: started?.runId || null,
+                sessionHash: sessionScope?.sessionHash || null,
+              };
+            }
+            throw error;
           }
-          result = await continueNativeSession(
-            lease.sessionIdToUse,
-            instruction,
-            traceId,
-          );
-          result = {
-            ...result,
-            operation: "delegate_to_hermes",
-            continuedCanonicalSession: true,
-          };
-          await sessionCoordinator.complete(
-            sessionScope,
-            lease.operationId,
-            {
-              payload: result,
-              traceId,
-              sessionId: result.sessionId || lease.sessionIdToUse,
-            },
-          );
-          return result;
         }
 
         if (lease.contextIdToUse) {
@@ -1249,7 +1355,7 @@ async function executePublicTool(
 }
 
 const server = new Server(
-  { name: "hermes-mac", version: "0.7.0" },
+  { name: "hermes-mac", version: "0.8.0" },
   { capabilities: { tools: {} } },
 );
 
