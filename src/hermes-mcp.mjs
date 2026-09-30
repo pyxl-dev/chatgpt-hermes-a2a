@@ -1161,15 +1161,54 @@ async function completeA2AOperation(
   traceId,
 ) {
   const keepActive = !taskIsTerminal(result);
-  await sessionCoordinator.complete(sessionScope, lease.operationId, {
-    payload: result,
-    traceId,
-    contextId: result.contextId || lease.contextIdToUse || null,
-    taskId: result.taskId || null,
-    keepActive,
-    activeKind: keepActive ? "a2a-task" : null,
-    activeStateName: keepActive ? result.stateName || null : null,
-  });
+  const taskId =
+    typeof result?.taskId === "string" && result.taskId.trim()
+      ? result.taskId
+      : null;
+
+  if (keepActive && !taskId) {
+    await sessionCoordinator.markSubmissionUnknown(
+      sessionScope,
+      lease.operationId,
+      "a2a",
+    );
+    const error = codedError(
+      "HERMES_A2A_TASK_ID_MISSING",
+      "Hermes returned a nonterminal A2A response without a taskId. The submission may still be running, so this ChatGPT conversation remains locked and only an exact idempotent retry is allowed.",
+      {
+        sessionHash: sessionScope?.sessionHash || null,
+        contextId: result?.contextId || lease.contextIdToUse || null,
+        stateName: result?.stateName || null,
+      },
+    );
+    error.coordinatorLockRetained = true;
+    throw error;
+  }
+
+  try {
+    await sessionCoordinator.complete(sessionScope, lease.operationId, {
+      payload: result,
+      traceId,
+      contextId: result.contextId || lease.contextIdToUse || null,
+      taskId,
+      keepActive,
+      activeKind: keepActive ? "a2a-task" : null,
+      activeStateName: keepActive ? result.stateName || null : null,
+    });
+  } catch (error) {
+    if (keepActive && taskId) {
+      const snapshot = await sessionCoordinator.inspect(sessionScope).catch(
+        () => null,
+      );
+      if (
+        snapshot?.active?.kind === "a2a-task" &&
+        snapshot.active.taskId === taskId
+      ) {
+        error.coordinatorLockRetained = true;
+      }
+    }
+    throw error;
+  }
   return result;
 }
 
@@ -1299,7 +1338,9 @@ async function executePublicTool(
         );
       } catch (error) {
         if (lease.canonicalRoute === "a2a") {
-          if (
+          if (error?.coordinatorLockRetained === true) {
+            // completeA2AOperation already retained a recoverable lock.
+          } else if (
             a2aSubmissionAttempted &&
             !a2aResponseReceived &&
             error?.deliveryAmbiguous === true
@@ -1371,7 +1412,9 @@ async function executePublicTool(
           traceId,
         );
       } catch (error) {
-        if (
+        if (error?.coordinatorLockRetained === true) {
+          // completeA2AOperation already retained a recoverable lock.
+        } else if (
           a2aSubmissionAttempted &&
           !a2aResponseReceived &&
           error?.deliveryAmbiguous === true
