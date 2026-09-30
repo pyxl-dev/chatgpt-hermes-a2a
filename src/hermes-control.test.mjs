@@ -57,6 +57,30 @@ test("native idempotency key keeps durable session and instruction boundaries", 
   );
 });
 
+test("native idempotency key is stable across normalized retry text", () => {
+  const base = controlIdempotencyKey(
+    "session-a",
+    "do  x",
+    "operation-token",
+    1_800_000,
+  );
+  const retry = controlIdempotencyKey(
+    "session-a",
+    "do x",
+    "operation-token",
+    1_920_000,
+  );
+  const unicodeRetry = controlIdempotencyKey(
+    "session-a",
+    "do\u00a0x",
+    "operation-token",
+    1_920_000,
+  );
+
+  assert.equal(base, retry);
+  assert.equal(base, unicodeRetry);
+});
+
 test("scoped native idempotency remains stable across minute boundaries", () => {
   const first = controlIdempotencyKey(
     "session-a",
