@@ -42,6 +42,10 @@ read_hermes_env_value() {
   ' "$file"
 }
 
+if [[ -z "${API_SERVER_KEY:-}" && -n "${HERMES_API_SERVER_KEY:-}" ]]; then
+  export API_SERVER_KEY="$HERMES_API_SERVER_KEY"
+fi
+
 if [[ -z "${API_SERVER_KEY:-}" ]]; then
   DETECTED_API_KEY="$(read_hermes_env_value API_SERVER_KEY)"
   HERMES_BIN_FOR_SECRET="$(command -v hermes || true)"
