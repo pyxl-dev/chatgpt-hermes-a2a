@@ -1664,7 +1664,15 @@ async function executePublicTool(
     case "cancel_hermes_task": {
       const taskId = requireString(args, "taskId");
       await sessionCoordinator.assertActiveTask(sessionScope, taskId);
-      return cancelTask(taskId);
+      const result = await cancelTask(taskId);
+      await sessionCoordinator.observe(sessionScope, {
+        kind: "a2a-task",
+        id: taskId,
+        terminal: taskIsTerminal(result),
+        contextId: result.contextId || null,
+        replayPayload: null,
+      });
+      return result;
     }
 
     case "hermes_status":
