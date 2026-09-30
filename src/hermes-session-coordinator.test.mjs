@@ -569,7 +569,7 @@ test("reconciliation session drift keeps the active run locked", async () => {
   assert.equal(snapshot.active?.runId, "run-1");
 });
 
-test("ambiguous native submission permits only an identical recovery retry", async () => {
+test("ambiguous native submission permits only an identical recovery retry and releases on definitive failure", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
 
@@ -603,7 +603,7 @@ test("ambiguous native submission permits only an identical recovery retry", asy
 
   await coordinator.fail(scope, retry.operationId);
   const restored = await coordinator.inspect(scope);
-  assert.equal(restored.active?.kind, "native-submission-unknown");
+  assert.equal(restored.active, null);
 });
 
 test("bridge restart can retry the exact persisted native pending submission", async () => {
@@ -931,7 +931,7 @@ test("reconciliation replays a successful A2A completion", async () => {
   assert.equal(retry.replayPayload.text, "finished");
 });
 
-test("ambiguous A2A submission permits only an identical idempotent recovery retry", async () => {
+test("ambiguous A2A submission permits only an identical idempotent recovery retry and releases on definitive failure", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
 
@@ -973,7 +973,7 @@ test("ambiguous A2A submission permits only an identical idempotent recovery ret
 
   await coordinator.fail(scope, retry.operationId);
   const restored = await coordinator.inspect(scope);
-  assert.equal(restored.active?.kind, "a2a-submission-unknown");
+  assert.equal(restored.active, null);
 });
 
 test("replays a successfully reconciled async native start", async () => {
