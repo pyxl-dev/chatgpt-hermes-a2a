@@ -976,6 +976,149 @@ test("ambiguous A2A submission permits only an identical idempotent recovery ret
   assert.equal(restored.active?.kind, "a2a-submission-unknown");
 });
 
+test("replays a successfully reconciled async native start", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-async-start",
+    instruction: "async work once",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      operation: "start_hermes_run",
+      runId: "run-async",
+      status: "started",
+    },
+    traceId: "trace-async-start",
+    runId: "run-async",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "start-run",
+    tool: "start_hermes_run",
+    traceId: "trace-async-retry",
+    instruction: "async   work once",
+    reconcileActive: async () => ({
+      terminal: true,
+      sessionId: "session-async",
+      replayPayload: {
+        ok: true,
+        operation: "start_hermes_run",
+        runId: "run-async",
+        sessionId: "session-async",
+        status: "completed",
+        output: "done",
+        recovered: true,
+      },
+    }),
+  });
+
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.operation, "start_hermes_run");
+  assert.equal(retry.replayPayload.runId, "run-async");
+  assert.equal(retry.replayPayload.status, "completed");
+});
+
+test("polling terminal A2A failure invalidates provisional replay", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-working",
+    instruction: "a2a retry after failure",
+    requestedContextId: "ctx-a2a-failure",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      contextId: "ctx-a2a-failure",
+      taskId: "task-a2a-failure",
+      stateName: "working",
+      text: "still working",
+    },
+    traceId: "trace-a2a-working",
+    contextId: "ctx-a2a-failure",
+    taskId: "task-a2a-failure",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "working",
+  });
+
+  await coordinator.observe(scope, {
+    kind: "a2a-task",
+    id: "task-a2a-failure",
+    terminal: true,
+    contextId: "ctx-a2a-failure",
+    replayPayload: null,
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-after-failure",
+    instruction: "a2a   retry after failure",
+    requestedContextId: "ctx-a2a-failure",
+  });
+
+  assert.equal(retry.replay, false);
+  assert.ok(retry.operationId);
+});
+
+test("reconciled terminal A2A failure invalidates provisional replay", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const lease = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-working",
+    instruction: "reconcile failed a2a",
+    requestedContextId: "ctx-a2a-reconcile",
+  });
+
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      contextId: "ctx-a2a-reconcile",
+      taskId: "task-a2a-reconcile",
+      stateName: "input-required",
+      text: "need input",
+    },
+    traceId: "trace-a2a-working",
+    contextId: "ctx-a2a-reconcile",
+    taskId: "task-a2a-reconcile",
+    keepActive: true,
+    activeKind: "a2a-task",
+    activeStateName: "input-required",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "continue-context",
+    tool: "continue_with_hermes",
+    traceId: "trace-a2a-after-reconcile",
+    instruction: "reconcile   failed a2a",
+    requestedContextId: "ctx-a2a-reconcile",
+    reconcileActive: async () => ({
+      terminal: true,
+      contextId: "ctx-a2a-reconcile",
+      replayPayload: null,
+    }),
+  });
+
+  assert.equal(retry.replay, false);
+  assert.ok(retry.operationId);
+});
+
 test("rejects a different A2A context for the same ChatGPT conversation", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
