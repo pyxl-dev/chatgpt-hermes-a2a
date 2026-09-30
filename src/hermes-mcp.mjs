@@ -1612,12 +1612,21 @@ async function executePublicTool(
     case "stop_hermes_run": {
       const runId = requireString(args, "runId");
       await sessionCoordinator.assertActiveRun(sessionScope, runId);
+      const before = await sessionCoordinator.inspect(sessionScope);
       const result = await control.stopRun(runId);
+      const terminal = runIsTerminal(result);
+      const replayPayload =
+        terminal &&
+        before?.active?.kind === "run" &&
+        before.active.runId === runId
+          ? recoveredNativeRunPayload(before.active, result)
+          : null;
       await sessionCoordinator.observe(sessionScope, {
         kind: "run",
         id: runId,
-        terminal: runIsTerminal(result),
+        terminal,
         sessionId: result.sessionId || null,
+        replayPayload,
       });
       return result;
     }
