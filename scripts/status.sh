@@ -49,7 +49,7 @@ read_env_value() {
 }
 
 HERMES_ENV_FILE="$(resolve_hermes_env_file)"
-API_KEY="${API_SERVER_KEY:-$(read_env_value API_SERVER_KEY "$HERMES_ENV_FILE")}"
+API_KEY="${API_SERVER_KEY:-${HERMES_API_SERVER_KEY:-$(read_env_value API_SERVER_KEY "$HERMES_ENV_FILE")}}"
 API_PORT="${API_SERVER_PORT:-$(read_env_value API_SERVER_PORT "$HERMES_ENV_FILE")}"
 if [[ ! "$API_PORT" =~ ^[0-9]+$ ]]; then
   API_PORT="$(hermes config get API_SERVER_PORT 2>/dev/null || true)"
@@ -59,12 +59,34 @@ if [[ ! "$API_PORT" =~ ^[0-9]+$ ]]; then
 fi
 
 NATIVE_READY=0
-if [[ -n "$API_KEY" ]] &&    curl -fsS --max-time 3      -H "Authorization: Bearer $API_KEY"      "http://127.0.0.1:$API_PORT/v1/capabilities" >/dev/null 2>&1; then
+CAPABILITIES_JSON=""
+if [[ -n "$API_KEY" ]]; then
+  CAPABILITIES_JSON="$(
+    curl -fsS --max-time 3       -H "Authorization: Bearer $API_KEY"       "http://127.0.0.1:$API_PORT/v1/capabilities" 2>/dev/null || true
+  )"
+fi
+
+if [[ -n "$CAPABILITIES_JSON" ]] &&
+   printf '%s' "$CAPABILITIES_JSON" | node -e '
+     const fs = require("fs");
+     try {
+       const payload = JSON.parse(fs.readFileSync(0, "utf8"));
+       process.exit(
+         payload?.features?.run_submission === true &&
+         payload?.features?.run_status === true
+           ? 0
+           : 1
+       );
+     } catch {
+       process.exit(1);
+     }
+   '; then
   echo "Hermes native Runs API: READY"
   NATIVE_READY=1
 else
   echo "Hermes native Runs API: NOT READY"
 fi
+unset CAPABILITIES_JSON
 
 TUNNEL_READY=0
 if [[ -s "$HEALTH_FILE" ]]; then
