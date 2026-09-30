@@ -175,13 +175,12 @@ try {
     listed.tools.map((tool) => [tool.name, tool.description]),
   );
   if (
-    !/canonical|same ChatGPT conversation|continue/i.test(
-      descriptions.delegate_to_hermes,
-    ) ||
-    !/context/i.test(descriptions.delegate_to_hermes)
+    !/native|durable/i.test(descriptions.delegate_to_hermes) ||
+    !/session/i.test(descriptions.delegate_to_hermes) ||
+    !/A2A five-turn cap|A2A/i.test(descriptions.delegate_to_hermes)
   ) {
     throw new Error(
-      "delegate_to_hermes description must explain canonical-context reuse for ChatGPT-scoped calls",
+      "delegate_to_hermes description must explain durable native-session routing for ChatGPT-scoped calls",
     );
   }
   if (!/existing|follow-up/i.test(descriptions.continue_with_hermes) || !/contextId/i.test(descriptions.continue_with_hermes)) {
