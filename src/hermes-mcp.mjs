@@ -982,7 +982,7 @@ function rejectScopedBackground(sessionScope, background) {
   if (sessionScope?.tracked && background === true) {
     throw codedError(
       "HERMES_SCOPED_BACKGROUND_DISABLED",
-      "Background A2A delegation is disabled for ChatGPT-scoped calls because it can leave an uncontrolled Hermes job running in parallel. Use start_hermes_run instead.",
+      "The background flag is disabled for ChatGPT-scoped delegation. Use start_hermes_run for asynchronous work that must remain pollable, steerable, or stoppable.",
       { sessionHash: sessionScope.sessionHash },
     );
   }
