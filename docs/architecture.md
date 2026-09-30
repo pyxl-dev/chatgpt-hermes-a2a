@@ -1,107 +1,199 @@
 # Architecture
 
-Target path:
+The repository name is historical. The current runtime is **native-only** and does not use Hermes A2A.
 
-~~~text
+## Runtime path
+
+```text
 ChatGPT Web
   |
   | OpenAI Secure MCP Tunnel
   v
-openai/tunnel-client (local macOS process)
+openai/tunnel-client
   |
   | MCP stdio
   v
 src/hermes-mcp.mjs
   |\
-  | \ native Hermes CLI session API
-  |  \--> sessions list / sessions export --session-id / chat --resume
-  |  \--> authenticated Runs API :8642 (start/status/steer/stop)
+  | \ Hermes native session CLI
+  |  \-> sessions list
+  |  \-> sessions export --session-id
   |
-  | private MCP stdio
-  v
-@cognicellai/a2a-mcp (backend)
-  |
-  | A2A JSON-RPC / HTTP+JSON on loopback
-  v
-Hermes Agent A2A adapter :9900
-  |
-  v
-Hermes gateway / agent loop / tools / memory
-  |
-  v
-macOS
-~~~
+  \---- authenticated Hermes Runs API on loopback
+       \-> POST /v1/runs
+       \-> GET  /v1/runs/:id
+       \-> POST /v1/runs/:id/steer
+       \-> POST /v1/runs/:id/stop
+             |
+             v
+        Hermes Agent
+             |
+             v
+            macOS
+```
 
-## Why this split
+There is no private A2A MCP backend, no A2A task envelope, no A2A context routing and no dependency on port 9900.
 
-- ChatGPT sees exactly thirteen task-oriented bridge tools rather than the generic A2A backend surface.
-- `src/hermes-mcp.mjs` translates A2A task calls into the generic backend's real MCP request shapes and routes durable-session calls through Hermes' documented CLI session surface.
-- The generic backend remains a private child MCP server; its agent-list, stream, and push-notification tools are not forwarded.
-- Hermes stays an agent rather than becoming a bag of low-level shell/file tools.
-- Hermes owns its internal loop, sessions, memory, tools, and local permissions.
-- The A2A listener stays on loopback; only the OpenAI tunnel client talks outward.
+## Public MCP surface
 
-The public thirteen-tool surface consists of:
+The wrapper exposes 10 tools:
 
-- four explicit A2A task/context operations: `continue_with_hermes`, `get_hermes_task`, `cancel_hermes_task`, `hermes_status`;
-- one local observability tool: `hermes_activity`;
-- three durable Hermes-session operations: `list_hermes_sessions`, `get_hermes_session`, `continue_hermes_session`;
-- five native-run operations including the ordinary ChatGPT entrypoint: `delegate_to_hermes`, `start_hermes_run`, `get_hermes_run`, `steer_hermes_run`, `stop_hermes_run`.
+- `delegate_to_hermes`
+- `list_hermes_sessions`
+- `get_hermes_session`
+- `continue_hermes_session`
+- `start_hermes_run`
+- `get_hermes_run`
+- `steer_hermes_run`
+- `stop_hermes_run`
+- `hermes_status`
+- `hermes_activity`
+
+Ordinary ChatGPT work should use `delegate_to_hermes`. Long work that may need intervention should use `start_hermes_run` followed by get/steer/stop.
 
 ## Trust boundaries
 
-There are three deliberately separate control surfaces:
+There are two runtime control boundaries:
 
-1. **OpenAI ↔ local MCP wrapper** — OpenAI Secure MCP Tunnel terminates into a local stdio child. The MCP wrapper is not exposed on a public HTTP port.
-2. **MCP wrapper ↔ Hermes A2A** — generic A2A traffic stays on `127.0.0.1:9900` through the private `@cognicellai/a2a-mcp` child process.
-3. **MCP wrapper ↔ Hermes native control/session APIs** — durable session operations use Hermes' CLI and controllable runs use the authenticated loopback Runs API.
+1. **OpenAI ↔ local MCP wrapper** — Secure MCP Tunnel starts the wrapper as a local stdio child. The wrapper itself is not exposed on a public HTTP port.
+2. **MCP wrapper ↔ Hermes** — mutating work uses Hermes' bearer-authenticated Runs API on loopback; persisted session discovery/export uses Hermes' local CLI.
 
-This means the tunnel gives ChatGPT access to the wrapper, not arbitrary direct network access to the Hermes gateway or the Mac.
+The tunnel gives ChatGPT access to the wrapper, not arbitrary direct network or shell access to the Mac.
 
-## Bridge observability, session coordination and idempotence
+## Native session coordinator
 
-`src/hermes-mcp.mjs` creates a trace for every public tool call and appends it to `.runtime/hermes-activity.jsonl`. The trace records timing, tool/purpose, a safe instruction fingerprint/preview, input/output task and context IDs, state, error status, background mode, deduplication metadata, and the SHA-256 hash of the ChatGPT conversation scope when `_meta["openai/session"]` is present. The raw OpenAI session value is never written to the activity log.
+`src/hermes-session-coordinator.mjs` is the concurrency/idempotency boundary for ChatGPT-scoped mutating calls.
 
-`hermes_activity` is implemented entirely in the wrapper. It reads the local JSONL file and never initializes or calls the private A2A backend.
+The raw `_meta["openai/session"]` value is SHA-256 hashed immediately. Only the hash is persisted.
 
-`src/hermes-session-coordinator.mjs` is the server-side concurrency boundary for ChatGPT calls. It persists only hashed ChatGPT session keys plus canonical Hermes identifiers under `.runtime/chatgpt-session-coordinator.json`.
+Each record contains:
 
-For each ChatGPT conversation it enforces these invariants:
+```text
+canonicalSessionId
+active:
+  operationId
+  tool
+  kind: native-pending | native-submission-unknown | run
+  traceId
+  sessionId
+  runId
+  fingerprint
+  ownerInstanceId
+  idempotencyKey
+recentResult:
+  fingerprint
+  settledAtMs
+  traceId
+  payload
+```
 
-1. one canonical execution route: native Hermes sessions/runs by default, or A2A only when explicitly bound;
-2. one mutating Hermes operation active at a time;
-3. one canonical durable Hermes `sessionId` on the default route, or one canonical A2A `contextId` on the legacy route;
-4. a first scoped `delegate_to_hermes` call starts a native Run without inventing a session ID, then persists the durable `sessionId` returned by Hermes when the Run settles;
-5. later `delegate_to_hermes` calls submit new Runs into that same native session; existing explicitly A2A-bound chats stay on their original context instead of silently forking;
-6. a different explicit `contextId`, `sessionId`, execution route, or concurrent operation is rejected before a model call reaches Hermes.
+There is deliberately no route discriminator, `contextId`, `taskId`, A2A state or restore-on-A2A-resumption logic.
 
-Every native Run, including the synchronous Runs underneath `delegate_to_hermes` and ChatGPT-scoped `continue_hermes_session`, is persisted as active with its `runId` before polling continues. It remains active until a terminal Runs API state is observed. Each native submission also has a persisted operation-scoped idempotency key. If POST delivery is ambiguous (timeout/network failure or a success response without `runId`), the coordinator keeps an unresolved native lock; only an exact retry may resubmit with the same idempotency key, including after a wrapper restart. Different work remains blocked. A2A sends follow the same conservative rule: transport ambiguity retains an unresolved lock and exact retries reuse the persisted A2A message ID, while definitive MCP rejections release the lease. This prevents accepted-but-unacknowledged work from creating parallel Hermes actions. Nonterminal A2A task envelopes are similarly retained when they occur. Before rejecting a new operation, the coordinator can reconcile a persisted run/task with Hermes so a bridge restart does not leave a completed operation permanently locked.
+## State transitions
 
-For scoped ChatGPT traffic, background A2A delegation is disabled in favor of `start_hermes_run`, because A2A cancellation only cancels the task envelope and cannot guarantee interruption of the underlying agent loop.
+### First synchronous delegation
 
-Exact-instruction deduplication remains a separate 60-second defense. Coordinator replay entries are scoped by the hashed ChatGPT conversation plus operation fingerprint and are persisted for the bounded replay window, so completed results remain replayable across bridge restarts. Failed, rejected, cancelled, or interrupted terminal outcomes invalidate matching provisional replay state so a real retry can run.
+1. `begin()` creates a persisted `native-pending` lease.
+2. `control.startRun()` submits the instruction with an operation-scoped idempotency key.
+3. Once Hermes returns a `runId`, `complete(... keepActive=true)` persists an active `run`.
+4. The wrapper polls the Runs API.
+5. On successful terminal completion, the durable `sessionId` is bound and the final result is cached for bounded exact replay.
+6. On terminal failure, the active Run is released and no successful replay is cached.
 
-Calls from clients that do not provide `openai/session` keep the prior unscoped behavior for compatibility.
+### Later delegation
+
+Later calls automatically use the bound canonical `sessionId`. A different explicit durable session is rejected.
+
+### Ambiguous submission
+
+If POST delivery times out, fails at the network layer, receives a 5xx response, or succeeds without a usable `runId`, the coordinator stores `native-submission-unknown`.
+
+Only an exact retry may recover this state. It reuses the persisted operation idempotency key. Different work remains blocked because Hermes may already have accepted the original Run.
+
+### Known active Run
+
+Once a `runId` is known, it is never replaced by a plain pending state. New mutating work is rejected until the Run becomes terminal.
+
+After a bridge restart, `begin()` reconciles the persisted active Run through `GET /v1/runs/:id` before deciding whether new work is allowed.
+
+### Exact replay
+
+Successful terminal results are persisted for a bounded deduplication window. The fingerprint uses normalized NFKC/trim/collapsed-whitespace instruction text plus operation mode and explicit session binding.
+
+Exact retries inside the window return the prior result rather than resubmitting work, including after a bridge restart.
+
+Failed/rejected/cancelled/interrupted results are not reusable replay payloads.
+
+Expired replay payloads are pruned globally on state load and before persistence.
+
+## Native API idempotency
+
+`src/hermes-control.mjs` computes the Runs API `Idempotency-Key` from:
+
+- the persisted operation scope;
+- the target durable session or `new`;
+- the same normalized instruction semantics used by the coordinator.
+
+This ensures a retry the coordinator considers exact also reaches Hermes with the same native idempotency key.
+
+## Run control
+
+`start_hermes_run` exposes the same submission path asynchronously. The returned `runId` remains the active mutating operation.
+
+- `get_hermes_run` observes terminal state and can preserve replay for a successful original operation.
+- `steer_hermes_run` requires the active `runId` for tracked ChatGPT sessions.
+- `stop_hermes_run` requires the active `runId`; if the stop races with natural successful completion, the coordinator preserves the successful replay instead of losing it.
+
+## Persisted-state migration
+
+Coordinator state version 2 is native-only.
+
+When loading version-1 mixed-route state:
+
+- native canonical `sessionId` and native Run state are retained;
+- legacy A2A contexts/tasks are discarded;
+- only native-looking replay payloads are retained.
+
+This migration exists so existing installations can move to the native-only bridge without keeping the old A2A state machine alive.
+
+## Session discovery
+
+`src/hermes-sessions.mjs` uses Hermes' local CLI for read-only persisted-session access:
+
+- `hermes sessions list`
+- `hermes sessions export ... --redact`
+
+User text is not shell-interpreted: Node `execFile` passes command arguments directly.
+
+Mutating continuation uses the Runs API rather than the CLI path.
+
+## Observability
+
+`src/hermes-observability.mjs` appends redacted local traces to:
+
+```text
+.runtime/hermes-activity.jsonl
+```
+
+The trace includes timing, tool name, hashed ChatGPT session scope, instruction hash/preview, Run/session IDs, success/error state and deduplication metadata.
+
+`hermes_activity` reads this file only; it does not contact Hermes.
 
 ## Dependencies
 
-- Hermes Agent with its `hermes` CLI on PATH; inbound A2A enabled on `127.0.0.1:9900` for the A2A tools.
-- Node.js `>=20`.
-- `src/hermes-mcp.mjs` and the installed MCP SDK `1.30.0`.
-- `@cognicellai/a2a-mcp` `0.1.1`.
-- `@modelcontextprotocol/sdk` `1.30.0`.
+- Hermes Agent with native session CLI and authenticated API server;
+- Node.js >=20;
+- `@modelcontextprotocol/sdk` 1.30.0;
 - OpenAI `tunnel-client`.
 
-The wrapper uses the installed MCP SDK `Client`/`StdioClientTransport` APIs to connect to the existing `a2a-mcp` child process for explicit A2A operations: `continue_with_hermes`, task reads/cancellation, and agent-card status.
+The bridge no longer depends on `@cognicellai/a2a-mcp`.
 
-For normal ChatGPT-scoped work, `src/hermes-control.mjs` calls the Hermes gateway's loopback Runs API. `delegate_to_hermes` starts a Run, persists its `runId`, polls it synchronously, captures the durable `sessionId`, and reuses that session on later turns. `start_hermes_run` exposes the same native execution path asynchronously for work that needs polling, steering, or stopping. `get_hermes_run`, `steer_hermes_run`, and `stop_hermes_run` operate on that active Run. The API remains bound to loopback and bearer-authenticated.
+## Validation criterion
 
-This default changed after runtime validation showed Hermes' A2A adapter enforces a five-turn anti-loop limit, while successive Runs attached to one native Hermes session preserve context beyond that boundary.
+A valid local pipeline must prove:
 
-Separately, `list_hermes_sessions` invokes Hermes' native `sessions list` command and parses its compact table into structured discovery metadata. `get_hermes_session` shells no user text: it invokes `hermes sessions export` via Node `execFile`, parses the redacted JSONL export, and removes it. For ChatGPT-scoped calls, `continue_hermes_session` resumes through the authenticated Runs API so submission, polling, replay, and restart recovery use the same coordinator semantics as normal native delegation. Unscoped legacy clients retain the `hermes chat -q ... -Q --resume <sessionId>` `execFile` path.
-
-## POC success criterion
-
-The local POC is considered valid only if the thirteen-tool UX MCP surface reaches Hermes through the private backend and A2A, and Hermes uses one of its own local tools to create the expected temporary proof file. A text-only response is not sufficient.
-
-For the full operator path from a fresh Mac through OpenAI Platform and ChatGPT configuration, see [`getting-started.md`](getting-started.md).
+1. the MCP wrapper exposes exactly the native-only 10-tool surface;
+2. Hermes native control capabilities are reachable;
+3. a real delegated Run reaches Hermes and uses a local tool;
+4. start/poll/steer/stop works;
+5. coordinator tests cover serialization, idempotent retry, restart recovery, drift, terminal replay and persisted-state migration.
