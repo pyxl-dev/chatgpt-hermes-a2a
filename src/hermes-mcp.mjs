@@ -960,7 +960,9 @@ function nativeDelegateResult(started, completed, reusedSession) {
   const output = completed?.output ?? null;
   return {
     ...completed,
-    ok: completed?.ok !== false,
+    ok:
+      String(completed?.status || "").toLowerCase() === "completed" &&
+      !completed?.error,
     operation: "delegate_to_hermes",
     agent: AGENT,
     runId: completed?.runId || started?.runId || null,
@@ -976,6 +978,55 @@ function nativeDelegateResult(started, completed, reusedSession) {
       reusedSession !== true &&
       Boolean(completed?.sessionId || started?.sessionId),
   };
+}
+
+function requireNativeRunId(result, sessionScope) {
+  if (typeof result?.runId === "string" && result.runId.trim()) {
+    return result.runId;
+  }
+  const error = codedError(
+    "HERMES_NATIVE_RUN_ID_MISSING",
+    "Hermes accepted native run submission without returning a runId. The submission may have been delivered, so this ChatGPT conversation remains locked until the same instruction can reconcile through the idempotent submission.",
+    { sessionHash: sessionScope?.sessionHash || null },
+  );
+  error.deliveryAmbiguous = true;
+  throw error;
+}
+
+function nativeRunSucceeded(result) {
+  return (
+    String(result?.status || "").toLowerCase() === "completed" &&
+    !result?.error
+  );
+}
+
+function nativeRunFailureError(result, runId, sessionScope) {
+  return codedError(
+    "HERMES_NATIVE_RUN_FAILED",
+    "Hermes native run reached an unsuccessful terminal state.",
+    {
+      sessionHash: sessionScope?.sessionHash || null,
+      runId,
+      sessionId: result?.sessionId || null,
+      status: result?.status || null,
+      error: result?.error || null,
+    },
+  );
+}
+
+async function releaseOrPreserveSubmissionFailure(
+  sessionScope,
+  operationId,
+  error,
+) {
+  if (error?.deliveryAmbiguous === true) {
+    await sessionCoordinator.markSubmissionUnknown(
+      sessionScope,
+      operationId,
+    );
+  } else {
+    await sessionCoordinator.fail(sessionScope, operationId);
+  }
 }
 
 function rejectScopedBackground(sessionScope, background) {
@@ -1061,16 +1112,9 @@ async function executePublicTool(
           const started = await control.startRun(
             instruction,
             lease.sessionIdToUse,
+            sessionScope?.sessionHash || "unscoped",
           );
-          if (!started?.runId) {
-            throw codedError(
-              "HERMES_NATIVE_RUN_ID_MISSING",
-              "Hermes accepted native delegation without returning a runId.",
-              { sessionHash: sessionScope?.sessionHash || null },
-            );
-          }
-
-          nativeRunId = started.runId;
+          nativeRunId = requireNativeRunId(started, sessionScope);
           await sessionCoordinator.complete(
             sessionScope,
             lease.operationId,
@@ -1087,6 +1131,24 @@ async function executePublicTool(
           nativeRunStarted = true;
 
           const completed = await waitForNativeRun(started.runId);
+          if (!nativeRunSucceeded(completed)) {
+            await sessionCoordinator.observe(sessionScope, {
+              kind: "run",
+              id: started.runId,
+              terminal: true,
+              sessionId:
+                completed.sessionId ||
+                started.sessionId ||
+                lease.sessionIdToUse ||
+                null,
+            });
+            throw nativeRunFailureError(
+              completed,
+              started.runId,
+              sessionScope,
+            );
+          }
+
           result = nativeDelegateResult(
             started,
             completed,
@@ -1135,7 +1197,11 @@ async function executePublicTool(
         );
       } catch (error) {
         if (!nativeRunStarted) {
-          await sessionCoordinator.fail(sessionScope, lease.operationId);
+          await releaseOrPreserveSubmissionFailure(
+            sessionScope,
+            lease.operationId,
+            error,
+          );
         } else if (!error?.details?.runId) {
           error.details = {
             ...(error?.details || {}),
@@ -1258,7 +1324,9 @@ async function executePublicTool(
         const result = await control.startRun(
           instruction,
           lease.sessionIdToUse,
+          sessionScope?.sessionHash || "unscoped",
         );
+        const runId = requireNativeRunId(result, sessionScope);
         const keepActive = !runIsTerminal(result);
         await sessionCoordinator.complete(
           sessionScope,
@@ -1267,14 +1335,18 @@ async function executePublicTool(
             payload: result,
             traceId,
             sessionId: result.sessionId || lease.sessionIdToUse || null,
-            runId: result.runId || null,
+            runId,
             keepActive,
             activeKind: keepActive ? "run" : null,
           },
         );
         return result;
       } catch (error) {
-        await sessionCoordinator.fail(sessionScope, lease.operationId);
+        await releaseOrPreserveSubmissionFailure(
+          sessionScope,
+          lease.operationId,
+          error,
+        );
         throw error;
       }
     }
