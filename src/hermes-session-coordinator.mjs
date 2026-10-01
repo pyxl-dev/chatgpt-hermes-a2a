@@ -341,7 +341,11 @@ export function createHermesSessionCoordinator({
       bucket = {};
       state.recentResults[sessionHash] = bucket;
     }
-    bucket[fingerprint] = value;
+    const existing = getRecentResult(sessionHash, fingerprint);
+    bucket[fingerprint] = {
+      ...value,
+      settledAtMs: existing?.settledAtMs ?? value.settledAtMs,
+    };
 
   }
 
@@ -452,7 +456,13 @@ export function createHermesSessionCoordinator({
               reconciled.replayPayload &&
               payloadIsReusable(reconciled.replayPayload);
 
-            if (reusable) {
+            if (
+              reusable &&
+              (
+                currentActive.kind !== "native-session-unresolved" ||
+                getRecentResult(scope.sessionHash, fingerprint)
+              )
+            ) {
               setRecentResult(scope.sessionHash, fingerprint, {
                 settledAtMs: Date.now(),
                 traceId: currentActive.traceId || null,
@@ -814,7 +824,13 @@ export function createHermesSessionCoordinator({
           replayPayload &&
           payloadIsReusable(replayPayload);
 
-        if (reusable) {
+        if (
+          reusable &&
+          (
+            active.kind !== "native-session-unresolved" ||
+            getRecentResult(scope.sessionHash, active.fingerprint)
+          )
+        ) {
           setRecentResult(scope.sessionHash, active.fingerprint, {
             settledAtMs: Date.now(),
             traceId: active.traceId || null,

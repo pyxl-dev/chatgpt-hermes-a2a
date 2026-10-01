@@ -78,7 +78,7 @@ API_URL="${HERMES_API_SERVER_URL:-}"
 if [[ -z "$API_URL" ]]; then
   API_URL="http://127.0.0.1:$API_PORT"
 fi
-API_URL="${API_URL%/}"
+API_URL="$(node -e 'process.stdout.write(String(process.argv[1] || "").trim().replace(/\/+$/u, ""))' "$API_URL")"
 
 NATIVE_READY=0
 CAPABILITIES_JSON=""

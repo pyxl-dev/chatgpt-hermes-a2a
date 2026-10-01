@@ -17,6 +17,33 @@ async function makeCoordinator(options = {}) {
   return { root, coordinator };
 }
 
+async function completeSessionlessSuccess(coordinator, scope, instruction, runId) {
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction,
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId,
+      status: "completed",
+    },
+    runId,
+    sessionId: null,
+  });
+}
+
+async function readCoordinatorState(root) {
+  return JSON.parse(
+    await fs.readFile(
+      path.join(root, ".runtime", "chatgpt-session-coordinator.json"),
+      "utf8",
+    ),
+  );
+}
+
 const metaA = { "openai/session": "chat-a" };
 const metaB = { "openai/session": "chat-b" };
 
@@ -420,6 +447,134 @@ test("observing a resolved sessionless run preserves exact replay", async () => 
   assert.equal(replay.replay, true);
   assert.equal(replay.replayPayload.runId, "run-get-resolve");
   assert.equal(replay.replayPayload.sessionId, "session-get-resolved");
+});
+
+test("repeated reconciliation cannot extend or revive an expired replay", async () => {
+  const { root, coordinator } = await makeCoordinator({ dedupWindowMs: 1_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+  const originalNow = Date.now;
+  let now = 10_000;
+  Date.now = () => now;
+  try {
+    await completeSessionlessSuccess(
+      coordinator,
+      scope,
+      "reconcile immutable replay",
+      "run-reconcile-immutable",
+    );
+    const initialState = await readCoordinatorState(root);
+    const originalTimestamp =
+      initialState.recentResults[scope.sessionHash][
+        Object.keys(initialState.recentResults[scope.sessionHash])[0]
+      ].settledAtMs;
+
+    const reconcile = () =>
+      coordinator.begin(scope, {
+        mode: "delegate",
+        tool: "delegate_to_hermes",
+        instruction: "different reconciliation work",
+        reconcileActive: async () => ({
+          terminal: true,
+          sessionId: null,
+          replayPayload: {
+            ok: true,
+            operation: "delegate_to_hermes",
+            runId: "run-reconcile-immutable",
+            status: "completed",
+          },
+        }),
+      });
+
+    now = 10_500;
+    await assert.rejects(
+      reconcile(),
+      (error) => error?.code === "HERMES_NATIVE_SESSION_UNRESOLVED",
+    );
+    const refreshedState = await readCoordinatorState(root);
+    const refreshedBucket = refreshedState.recentResults[scope.sessionHash];
+    assert.equal(
+      refreshedBucket[Object.keys(refreshedBucket)[0]].settledAtMs,
+      originalTimestamp,
+    );
+
+    now = 11_001;
+    await assert.rejects(
+      reconcile(),
+      (error) => error?.code === "HERMES_NATIVE_SESSION_UNRESOLVED",
+    );
+    assert.equal(
+      (await readCoordinatorState(root)).recentResults[scope.sessionHash],
+      undefined,
+    );
+
+    now = 12_500;
+    await assert.rejects(
+      reconcile(),
+      (error) => error?.code === "HERMES_NATIVE_SESSION_UNRESOLVED",
+    );
+    assert.equal(
+      (await readCoordinatorState(root)).recentResults[scope.sessionHash],
+      undefined,
+    );
+  } finally {
+    Date.now = originalNow;
+  }
+});
+
+test("repeated observation cannot extend or revive an expired replay", async () => {
+  const { root, coordinator } = await makeCoordinator({ dedupWindowMs: 1_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+  const originalNow = Date.now;
+  let now = 20_000;
+  Date.now = () => now;
+  try {
+    await completeSessionlessSuccess(
+      coordinator,
+      scope,
+      "observe immutable replay",
+      "run-observe-immutable",
+    );
+    const initialState = await readCoordinatorState(root);
+    const initialBucket = initialState.recentResults[scope.sessionHash];
+    const fingerprint = Object.keys(initialBucket)[0];
+    const originalTimestamp = initialBucket[fingerprint].settledAtMs;
+    const observe = () =>
+      coordinator.observe(scope, {
+        kind: "run",
+        id: "run-observe-immutable",
+        terminal: true,
+        replayPayload: {
+          ok: true,
+          operation: "delegate_to_hermes",
+          runId: "run-observe-immutable",
+          status: "completed",
+        },
+      });
+
+    now = 20_500;
+    await observe();
+    const refreshedState = await readCoordinatorState(root);
+    assert.equal(
+      refreshedState.recentResults[scope.sessionHash][fingerprint].settledAtMs,
+      originalTimestamp,
+    );
+
+    now = 21_001;
+    await observe();
+    assert.equal(
+      (await readCoordinatorState(root)).recentResults[scope.sessionHash],
+      undefined,
+    );
+
+    now = 22_500;
+    await observe();
+    assert.equal(
+      (await readCoordinatorState(root)).recentResults[scope.sessionHash],
+      undefined,
+    );
+  } finally {
+    Date.now = originalNow;
+  }
 });
 
 test("successful polled run caches recovered delegate replay", async () => {
