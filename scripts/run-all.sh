@@ -15,9 +15,11 @@ for cmd in git curl node npm hermes; do
   fi
 done
 
-NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])')"
-if (( NODE_MAJOR < 20 )); then
-  echo "Node.js >=20 is required; got $(node -v)" >&2
+if ! node -e '
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  process.exit(major > 22 || (major === 22 && minor >= 13) ? 0 : 1);
+'; then
+  echo "Node.js >=22.13.0 is required; got $(node -v)" >&2
   exit 2
 fi
 
