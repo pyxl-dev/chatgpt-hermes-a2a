@@ -104,7 +104,9 @@ try {
     status?.reachable !== true ||
     status?.nativeOnly !== true ||
     status?.control?.runSubmission !== true ||
-    status?.control?.runStatus !== true
+    status?.control?.runStatus !== true ||
+    status?.control?.runSteer !== true ||
+    status?.control?.runStop !== true
   ) {
     throw new Error("Native Hermes control API is not ready: " + JSON.stringify(status));
   }
@@ -113,6 +115,8 @@ try {
     nativeOnly: status.nativeOnly,
     runSubmission: status.control.runSubmission,
     runStatus: status.control.runStatus,
+    runSteer: status.control.runSteer,
+    runStop: status.control.runStop,
   };
 
   const sessions = assertOk(
