@@ -80,6 +80,7 @@ active:
   fingerprint
   ownerInstanceId
   idempotencyKey
+  reusedSession
 recentResults[fingerprint]:
   settledAtMs
   traceId
@@ -137,6 +138,8 @@ Expired replay payloads are pruned globally on state load and before persistence
 - the same normalized instruction semantics used by the coordinator.
 
 This ensures a retry the coordinator considers exact also reaches Hermes with the same native idempotency key.
+
+The active record also persists whether the operation already had a durable session before submission. That provenance is not inferred later from a returned `sessionId`, so recovered/retried first-turn Runs still report that they created the canonical session rather than falsely appearing as continuations.
 
 ## Run control
 
