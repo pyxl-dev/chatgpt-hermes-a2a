@@ -554,6 +554,30 @@ export function createHermesSessionCoordinator({
         };
       }
 
+      const exactActiveRun =
+        active?.kind === "run" &&
+        Boolean(active.runId) &&
+        fingerprint &&
+        active.fingerprint === fingerprint;
+
+      if (exactActiveRun) {
+        return {
+          tracked: true,
+          replay: false,
+          activeRun: true,
+          operationId: active.operationId || null,
+          canonicalSessionId: record.canonicalSessionId || null,
+          sessionIdToUse:
+            active.sessionId ||
+            requested ||
+            record.canonicalSessionId ||
+            null,
+          runId: active.runId,
+          activeTraceId: active.traceId || null,
+          idempotencyKey: active.idempotencyKey || null,
+        };
+      }
+
       if (active?.kind === "native-session-unresolved") {
         throw coordinatorError(
           "HERMES_NATIVE_SESSION_UNRESOLVED",
