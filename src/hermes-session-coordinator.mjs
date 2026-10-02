@@ -54,6 +54,10 @@ function activeSummary(active) {
     startedAt: active.startedAt || null,
     sessionId: active.sessionId || null,
     runId: active.runId || null,
+    reusedSession:
+      typeof active.reusedSession === "boolean"
+        ? active.reusedSession
+        : null,
   };
 }
 
@@ -574,6 +578,10 @@ export function createHermesSessionCoordinator({
             null,
           runId: active.runId,
           activeTraceId: active.traceId || null,
+          reusedSession:
+            typeof active.reusedSession === "boolean"
+              ? active.reusedSession
+              : Boolean(record.canonicalSessionId),
           idempotencyKey: active.idempotencyKey || null,
         };
       }
@@ -622,6 +630,11 @@ export function createHermesSessionCoordinator({
           ? active.idempotencyKey
           : sha256(scope.sessionHash + "\n" + operationId);
 
+      const reusedSession =
+        recoverablePending && typeof active?.reusedSession === "boolean"
+          ? active.reusedSession
+          : Boolean(requested || record.canonicalSessionId);
+
       record.active = {
         operationId,
         tool,
@@ -633,6 +646,7 @@ export function createHermesSessionCoordinator({
         fingerprint,
         ownerInstanceId: instanceId,
         idempotencyKey,
+        reusedSession,
       };
       record.updatedAt = new Date().toISOString();
       await persist();
@@ -643,6 +657,7 @@ export function createHermesSessionCoordinator({
         operationId,
         canonicalSessionId: record.canonicalSessionId || null,
         sessionIdToUse: requested || record.canonicalSessionId || null,
+        reusedSession,
         idempotencyKey,
       };
     });
