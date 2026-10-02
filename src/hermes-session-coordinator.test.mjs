@@ -254,6 +254,7 @@ test("normalized exact retry reuses the active native run", async () => {
     instruction: "long task",
     reconcileActive: async (active) => {
       assert.equal(active.runId, "run-active");
+      assert.equal(active.reusedSession, false);
       return {
         terminal: false,
         sessionId: "session-active",
@@ -262,6 +263,8 @@ test("normalized exact retry reuses the active native run", async () => {
     },
   });
 
+  assert.equal(lease.reusedSession, false);
+  assert.equal(retry.reusedSession, false);
   assert.equal(retry.replay, false);
   assert.equal(retry.activeRun, true);
   assert.equal(retry.runId, "run-active");
@@ -277,6 +280,36 @@ test("normalized exact retry reuses the active native run", async () => {
     }),
     (error) => error?.code === "HERMES_SESSION_BUSY",
   );
+});
+
+test("existing durable session provenance stays marked as reused", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const first = await coordinator.begin(scope, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "bind session",
+  });
+  await coordinator.complete(scope, first.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-bind",
+      sessionId: "session-bound",
+      status: "completed",
+    },
+    runId: "run-bind",
+    sessionId: "session-bound",
+  });
+
+  const next = await coordinator.begin(scope, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "reuse session",
+  });
+  assert.equal(next.sessionIdToUse, "session-bound");
+  assert.equal(next.reusedSession, true);
 });
 
 test("session drift preserves a known run lock", async () => {
