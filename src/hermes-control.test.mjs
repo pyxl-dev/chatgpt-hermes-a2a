@@ -147,6 +147,63 @@ test("explicit Hermes API URL takes precedence over port", () => {
   );
 });
 
+test("status script rejects unsupported API URLs before curl", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-invalid-url-"));
+  const curlPath = path.join(tempDir, "curl");
+  const launchctlPath = path.join(tempDir, "launchctl");
+  const capturedUrlsPath = path.join(tempDir, "curl-urls.txt");
+  try {
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "printf '%s\\n' \"$url\" >> \"$STATUS_CURL_CAPTURE\"\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+    await writeFile(launchctlPath, "#!/bin/bash\nexit 1\n", "utf8");
+    await chmod(launchctlPath, 0o755);
+
+    for (const apiUrl of [
+      "ftp://hermes.example",
+      "http://user:pass@hermes.example",
+    ]) {
+      await writeFile(capturedUrlsPath, "", "utf8");
+      const result = spawnSync(
+        "bash",
+        [path.join(projectRoot, "scripts", "status.sh")],
+        {
+          cwd: projectRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            HOME: tempDir,
+            PATH: tempDir + path.delimiter + process.env.PATH,
+            API_SERVER_PORT: "8642",
+            HERMES_API_SERVER_KEY: "test-key",
+            HERMES_API_SERVER_URL: apiUrl,
+            STATUS_CURL_CAPTURE: capturedUrlsPath,
+          },
+        },
+      );
+
+      assert.match(result.stdout, /Hermes native Runs API: NOT READY/u);
+      const capturedUrls = (await readFile(capturedUrlsPath, "utf8"))
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+      assert.equal(
+        capturedUrls.some((url) => url.startsWith(apiUrl)),
+        false,
+        "unsupported Hermes API URL must not be passed to curl",
+      );
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("status script trims API URL whitespace and all trailing slashes", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-url-"));
   const curlPath = path.join(tempDir, "curl");
@@ -192,6 +249,47 @@ test("status script trims API URL whitespace and all trailing slashes", async ()
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }
+});
+
+test("synchronous native path handles terminal submission before polling", async () => {
+  const source = await readFile(
+    path.join(projectRoot, "src", "hermes-mcp.mjs"),
+    "utf8",
+  );
+  const start = source.indexOf("async function executeSynchronousNative");
+  const end = source.indexOf("async function executePublicTool", start);
+  const body = source.slice(start, end);
+  const terminalCheck = body.indexOf("if (runIsTerminal(started))");
+  const polling = body.indexOf("const waited = await waitForNativeRun(runId)");
+
+  assert.ok(terminalCheck >= 0, "terminal submission branch should exist");
+  assert.ok(
+    terminalCheck < polling,
+    "terminal submission must be handled before polling",
+  );
+  assert.match(
+    body,
+    /throw nativeRunFailureError\(started, runId, sessionScope\);/u,
+  );
+  assert.match(
+    body,
+    /nativeDelegateResult\(\s*started,\s*started,/u,
+  );
+});
+
+test("control smoke accepts both cancellation spellings", async () => {
+  const source = await readFile(
+    path.join(projectRoot, "src", "mcp-control-smoke.mjs"),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /terminalStatuses = new Set\(\[[^\]]*"cancelled"[^\]]*"canceled"/su,
+  );
+  assert.match(
+    source,
+    /if \(!terminalStatuses\.has\(terminal\.status\)\)/u,
+  );
 });
 
 test("native run status supports a shorter per-poll timeout", async () => {

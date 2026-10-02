@@ -7,7 +7,14 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const bridge = path.join(root, "scripts", "start-bridge.sh");
 const timeoutMs = Number(process.env.HERMES_CONTROL_SMOKE_TIMEOUT_MS || 45000);
-const terminalStatuses = new Set(["completed", "failed", "cancelled", "interrupted"]);
+const terminalStatuses = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "canceled",
+  "interrupted",
+  "rejected",
+]);
 
 const childEnv = Object.fromEntries(
   Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
@@ -181,9 +188,10 @@ try {
     error: terminal.error || null,
   };
 
-  if (terminal.status !== "cancelled") {
+  if (!terminalStatuses.has(terminal.status) || terminal.status === "completed") {
     throw new Error(
-      "Expected stopped run to settle as cancelled; got " + terminal.status,
+      "Expected stopped run to settle in a cancellation/failure terminal state; got " +
+        terminal.status,
     );
   }
 

@@ -702,6 +702,47 @@ async function executeSynchronousNative(
     runId = requireNativeRunId(started, sessionScope);
     runSubmitted = true;
 
+    if (runIsTerminal(started)) {
+      if (!nativeRunSucceeded(started)) {
+        await sessionCoordinator.complete(
+          sessionScope,
+          lease.operationId,
+          {
+            payload: started,
+            traceId,
+            sessionId: started.sessionId || lease.sessionIdToUse || null,
+            runId,
+          },
+        );
+        throw nativeRunFailureError(started, runId, sessionScope);
+      }
+
+      const result =
+        operation === "continue_hermes_session"
+          ? nativeSessionContinuationResult(
+              started,
+              started,
+              lease.sessionIdToUse || requestedSessionId,
+            )
+          : nativeDelegateResult(
+              started,
+              started,
+              lease.reusedSession === true,
+            );
+
+      await sessionCoordinator.complete(
+        sessionScope,
+        lease.operationId,
+        {
+          payload: result,
+          traceId,
+          sessionId: result.sessionId || lease.sessionIdToUse || null,
+          runId,
+        },
+      );
+      return result;
+    }
+
     await sessionCoordinator.complete(
       sessionScope,
       lease.operationId,

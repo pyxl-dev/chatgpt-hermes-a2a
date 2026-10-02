@@ -79,9 +79,26 @@ if [[ -z "$API_URL" ]]; then
   API_URL="http://127.0.0.1:$API_PORT"
 fi
 
+API_URL_VALID=1
+if ! node -e '
+try {
+  const url = new URL(process.argv[1]);
+  const supported =
+    ["http:", "https:"].includes(url.protocol) &&
+    url.username === "" &&
+    url.password === "";
+  process.exit(supported ? 0 : 1);
+} catch {
+  process.exit(1);
+}
+' "$API_URL"; then
+  echo "Hermes API server URL is invalid or unsupported; expected HTTP(S) without credentials." >&2
+  API_URL_VALID=0
+fi
+
 NATIVE_READY=0
 CAPABILITIES_JSON=""
-if [[ -n "$API_KEY" ]]; then
+if [[ -n "$API_KEY" && "$API_URL_VALID" -eq 1 ]]; then
   CAPABILITIES_JSON="$(
     curl -fsS --max-time 3       -H "Authorization: Bearer $API_KEY"       "$API_URL/v1/capabilities" 2>/dev/null || true
   )"

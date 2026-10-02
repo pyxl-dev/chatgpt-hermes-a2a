@@ -368,6 +368,61 @@ test("terminal success is replayed for normalized exact retry", async () => {
   assert.equal(retry.replayPayload.text, "done");
 });
 
+test("successful replay remains available while unrelated work is active", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+
+  const leaseA = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "operation A",
+  });
+  const payloadA = {
+    ok: true,
+    operation: "delegate_to_hermes",
+    runId: "run-A",
+    sessionId: "session-A",
+    status: "completed",
+    text: "result A",
+  };
+  await coordinator.complete(scope, leaseA.operationId, {
+    payload: payloadA,
+    runId: "run-A",
+    sessionId: "session-A",
+  });
+
+  const leaseB = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "operation B",
+  });
+  assert.ok(leaseB.operationId);
+
+  const replayA = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "operation A",
+  });
+  assert.equal(replayA.replay, true);
+  assert.equal(replayA.operationId, null);
+  assert.equal(replayA.replayPayload.runId, "run-A");
+  assert.equal(replayA.replayPayload.text, "result A");
+  assert.equal(
+    (await coordinator.inspect(scope)).active?.operationId,
+    leaseB.operationId,
+    "read-only replay must not disturb unrelated active work",
+  );
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "operation C",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+});
+
 test("terminal failure is never replayed and genuine retry is possible", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
@@ -873,6 +928,35 @@ test("expired replays are pruned globally on restart", async () => {
   await restarted.inspect(restarted.scopeFromMeta(metaB));
   const pruned = JSON.parse(await fs.readFile(statePath, "utf8"));
   assert.equal(pruned.recentResults[scopeA.sessionHash], undefined);
+});
+
+test("subsecond deduplication window falls back to 60 seconds", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 500 });
+  const scope = coordinator.scopeFromMeta(metaA);
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "subsecond-window",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-window",
+      sessionId: "session-window",
+      status: "completed",
+    },
+    runId: "run-window",
+    sessionId: "session-window",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "subsecond-window",
+  });
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.dedupWindowMs, 60_000);
 });
 
 test("invalid deduplication windows fall back to the default expiry", async () => {

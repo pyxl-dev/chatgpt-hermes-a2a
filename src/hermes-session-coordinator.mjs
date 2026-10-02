@@ -22,7 +22,7 @@ function normalizeInstruction(value) {
 
 function normalizedDedupWindowMs(value) {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0
+  return Number.isFinite(parsed) && parsed >= 1000
     ? parsed
     : DEFAULT_DEDUP_WINDOW_MS;
 }
@@ -532,15 +532,7 @@ export function createHermesSessionCoordinator({
       if (
         fingerprint &&
         recent &&
-        now - Number(recent.settledAtMs) <= replayWindowMs &&
-        (
-          !active ||
-          recoverablePending ||
-          (
-            active.kind === "native-session-unresolved" &&
-            active.fingerprint === fingerprint
-          )
-        )
+        now - Number(recent.settledAtMs) <= replayWindowMs
       ) {
         return {
           tracked: true,
