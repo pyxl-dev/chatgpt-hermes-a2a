@@ -283,3 +283,87 @@ test("status script falls back when API URL is whitespace only", async () => {
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test("definitive terminal submission without run id is not treated as ambiguous", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          status: "rejected",
+          error: { message: "policy rejected" },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    await assert.rejects(
+      control.startRun("rejected work", null, "scope"),
+      (error) =>
+        error?.code === "HERMES_NATIVE_RUN_FAILED" &&
+        error?.deliveryAmbiguous === false &&
+        error?.details?.status === "rejected",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
+
+test("malformed control URL fails definitively before submission", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "not a valid url";
+    let fetchCalled = false;
+    globalThis.fetch = async () => {
+      fetchCalled = true;
+      throw new Error("fetch should not be called");
+    };
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    await assert.rejects(
+      control.startRun("work", null, "scope"),
+      (error) => error?.deliveryAmbiguous === false,
+    );
+    assert.equal(fetchCalled, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
