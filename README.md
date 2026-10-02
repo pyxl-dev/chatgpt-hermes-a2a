@@ -83,12 +83,19 @@ The persisted coordinator state is stored under:
 .runtime/chatgpt-session-coordinator.json
 ```
 
+Cross-process state transactions are serialized by a local SQLite mutex at
+`.runtime/chatgpt-session-coordinator.json.mutex.sqlite`. The SQLite file
+contains no coordinator payload; it exists only to provide an OS-backed
+transaction lock that is released automatically if a bridge process exits.
+Hermes network reconciliation is performed outside that transaction and is
+applied only after the active lease is revalidated.
+
 Legacy version-1 mixed-route state and version-2 native single-replay state are migrated on load. Native session/run state is preserved; old A2A context/task state is discarded. Version 3 stores every live replay result by operation fingerprint until the time-based deduplication window expires.
 
 ## Requirements
 
 - macOS for the provided background LaunchAgent workflow;
-- Node.js 20 or newer;
+- Node.js 22.13 or newer (the coordinator uses the built-in `node:sqlite` mutex);
 - Hermes Agent installed and working locally;
 - Hermes authenticated API server enabled on loopback;
 - OpenAI `tunnel-client`;
