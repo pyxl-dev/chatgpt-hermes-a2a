@@ -21,11 +21,12 @@ const AGENT = "hermes";
 const configuredNativeDelegateTimeout = Number(
   process.env.HERMES_NATIVE_DELEGATE_TIMEOUT_MS,
 );
+const MAX_NATIVE_DELEGATE_WAIT_MS = 90000;
 const NATIVE_DELEGATE_TIMEOUT_MS =
   Number.isFinite(configuredNativeDelegateTimeout) &&
   configuredNativeDelegateTimeout >= 1000
-    ? configuredNativeDelegateTimeout
-    : 330000;
+    ? Math.min(configuredNativeDelegateTimeout, MAX_NATIVE_DELEGATE_WAIT_MS)
+    : MAX_NATIVE_DELEGATE_WAIT_MS;
 const configuredNativePollMs = Number(
   process.env.HERMES_NATIVE_DELEGATE_POLL_MS,
 );
@@ -141,7 +142,7 @@ const TOOLS = [
   {
     name: "delegate_to_hermes",
     description:
-      "Run ordinary Hermes work in the single durable native Hermes session bound to this ChatGPT conversation. Uses Hermes' authenticated Runs API, serializes mutating work, and automatically reuses the returned durable sessionId on later turns.",
+      "Run ordinary Hermes work in the single durable native Hermes session bound to this ChatGPT conversation. Uses Hermes' authenticated Runs API, serializes mutating work, and automatically reuses the returned durable sessionId on later turns. Waits up to 90 seconds; if Hermes is still running, returns the existing runId/status so get_hermes_run can continue polling. An exact retry reuses the same active Run instead of starting duplicate work.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -188,7 +189,7 @@ const TOOLS = [
   {
     name: "continue_hermes_session",
     description:
-      "Continue an explicitly chosen durable Hermes session through the authenticated Runs API. The wrapper rejects a different session once this ChatGPT conversation has a canonical Hermes session.",
+      "Continue an explicitly chosen durable Hermes session through the authenticated Runs API. The wrapper rejects a different session once this ChatGPT conversation has a canonical Hermes session. Long work hands back the active runId after at most 90 seconds for polling, and exact retries reuse that Run.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -202,7 +203,7 @@ const TOOLS = [
   {
     name: "start_hermes_run",
     description:
-      "Start the single controllable Hermes Run allowed for this ChatGPT conversation and return its runId. Reuses the canonical durable session when known.",
+      "Start the single controllable Hermes Run allowed for this ChatGPT conversation and return its runId. Reuses the canonical durable session when known; an exact retry while that Run is still active returns the same runId instead of failing busy or submitting duplicate work.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -420,6 +421,47 @@ function nativeSessionContinuationResult(
   };
 }
 
+function nativePendingRunResult({
+  operation,
+  started = null,
+  current = null,
+  sessionId = null,
+  requestedSessionId = null,
+  deduplicated = false,
+  duplicateOfTraceId = null,
+  lastPollError = null,
+}) {
+  const source = current || started || {};
+  return {
+    ...source,
+    ok: true,
+    operation,
+    agent: AGENT,
+    runId: source?.runId || started?.runId || null,
+    sessionId:
+      source?.sessionId ||
+      started?.sessionId ||
+      sessionId ||
+      requestedSessionId ||
+      null,
+    status: source?.status || started?.status || "running",
+    nativeSession: true,
+    pending: true,
+    completed: false,
+    pollWith: "get_hermes_run",
+    ...(requestedSessionId ? { requestedSessionId } : {}),
+    ...(deduplicated
+      ? {
+          deduplicated: true,
+          duplicateOfTraceId: duplicateOfTraceId || null,
+        }
+      : {}),
+    ...(lastPollError
+      ? { lastPollError: errorMessage(lastPollError) }
+      : {}),
+  };
+}
+
 function recoveredNativeRunPayload(active, result) {
   if (!nativeRunSucceeded(result)) return null;
   if (active?.tool === "delegate_to_hermes") {
@@ -468,23 +510,24 @@ async function waitForNativeRun(runId) {
     try {
       lastResult = await control.getRun(runId);
       lastError = null;
-      if (runIsTerminal(lastResult)) return lastResult;
+      if (runIsTerminal(lastResult)) {
+        return {
+          terminal: true,
+          result: lastResult,
+          lastError: null,
+        };
+      }
     } catch (error) {
       lastError = error;
     }
     await sleep(NATIVE_DELEGATE_POLL_MS);
   }
 
-  throw codedError(
-    "HERMES_NATIVE_RUN_TIMEOUT",
-    "Hermes native Run did not reach a terminal state before the synchronous delegation timeout.",
-    {
-      runId,
-      timeoutMs: NATIVE_DELEGATE_TIMEOUT_MS,
-      lastStatus: lastResult?.status || null,
-      lastError: lastError ? errorMessage(lastError) : null,
-    },
-  );
+  return {
+    terminal: false,
+    result: lastResult,
+    lastError,
+  };
 }
 
 async function reconcileCoordinatorActive(active) {
@@ -502,6 +545,89 @@ async function reconcileCoordinatorActive(active) {
     };
   }
   return { terminal: false };
+}
+
+async function reuseActiveNativeRun(
+  operation,
+  lease,
+  requestedSessionId,
+  sessionScope,
+) {
+  let current = null;
+  let pollError = null;
+  try {
+    current = await control.getRun(lease.runId);
+  } catch (error) {
+    pollError = error;
+  }
+
+  if (!current || !runIsTerminal(current)) {
+    return nativePendingRunResult({
+      operation,
+      started: {
+        runId: lease.runId,
+        sessionId: lease.sessionIdToUse || null,
+        status: "running",
+      },
+      current,
+      sessionId: lease.sessionIdToUse || null,
+      requestedSessionId,
+      deduplicated: true,
+      duplicateOfTraceId: lease.activeTraceId || null,
+      lastPollError: pollError,
+    });
+  }
+
+  if (!nativeRunSucceeded(current)) {
+    await sessionCoordinator.observe(sessionScope, {
+      kind: "run",
+      id: lease.runId,
+      terminal: true,
+      sessionId: current.sessionId || lease.sessionIdToUse || null,
+      replayPayload: null,
+    });
+    throw nativeRunFailureError(current, lease.runId, sessionScope);
+  }
+
+  const started = {
+    runId: lease.runId,
+    sessionId: lease.sessionIdToUse || null,
+  };
+  const result =
+    operation === "continue_hermes_session"
+      ? nativeSessionContinuationResult(
+          started,
+          current,
+          lease.sessionIdToUse || requestedSessionId,
+        )
+      : operation === "delegate_to_hermes"
+        ? nativeDelegateResult(
+            started,
+            current,
+            Boolean(lease.sessionIdToUse),
+          )
+        : {
+            ...current,
+            ok: true,
+            operation: "start_hermes_run",
+            agent: AGENT,
+            recovered: true,
+          };
+
+  await sessionCoordinator.observe(sessionScope, {
+    kind: "run",
+    id: lease.runId,
+    terminal: true,
+    sessionId: result.sessionId || lease.sessionIdToUse || null,
+    replayPayload: result,
+  });
+
+  return {
+    ...result,
+    deduplicated: true,
+    duplicateOfTraceId: lease.activeTraceId || null,
+    reusedActiveRun: true,
+  };
 }
 
 async function releaseOrPreserveSubmissionFailure(
@@ -545,6 +671,14 @@ async function executeSynchronousNative(
     reconcileActive: reconcileCoordinatorActive,
   });
   if (lease.replay) return lease.replayPayload;
+  if (lease.activeRun) {
+    return reuseActiveNativeRun(
+      operation,
+      lease,
+      requestedSessionId,
+      sessionScope,
+    );
+  }
 
   let runSubmitted = false;
   let runId = null;
@@ -570,7 +704,19 @@ async function executeSynchronousNative(
       },
     );
 
-    const completed = await waitForNativeRun(runId);
+    const waited = await waitForNativeRun(runId);
+    if (!waited.terminal) {
+      return nativePendingRunResult({
+        operation,
+        started,
+        current: waited.result,
+        sessionId: lease.sessionIdToUse || null,
+        requestedSessionId,
+        lastPollError: waited.lastError,
+      });
+    }
+
+    const completed = waited.result;
     if (!nativeRunSucceeded(completed)) {
       await sessionCoordinator.observe(sessionScope, {
         kind: "run",
@@ -681,6 +827,14 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         reconcileActive: reconcileCoordinatorActive,
       });
       if (lease.replay) return lease.replayPayload;
+      if (lease.activeRun) {
+        return reuseActiveNativeRun(
+          name,
+          lease,
+          requestedSessionId,
+          sessionScope,
+        );
+      }
 
       let submitted = false;
       let runId = null;
