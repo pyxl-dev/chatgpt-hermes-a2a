@@ -8,6 +8,7 @@ import test from "node:test";
 
 import {
   controlIdempotencyKey,
+  createHermesControl,
   resolveHermesApiUrl,
 } from "./hermes-control.mjs";
 
@@ -187,6 +188,96 @@ test("status script trims API URL whitespace and all trailing slashes", async ()
     assert.ok(
       capturedUrls.includes("https://hermes.example/api/v1/capabilities"),
       "status should request capabilities from the trimmed base URL",
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("native run status supports a shorter per-poll timeout", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    globalThis.fetch = (_url, options = {}) =>
+      new Promise((_resolve, reject) => {
+        const onAbort = () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        if (options.signal?.aborted) {
+          onAbort();
+        } else {
+          options.signal?.addEventListener("abort", onAbort, { once: true });
+        }
+      });
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    const startedAt = Date.now();
+    await assert.rejects(
+      control.getRun("run-timeout", { timeoutMs: 20 }),
+      /timed out after 20ms/,
+    );
+    assert.ok(
+      Date.now() - startedAt < 250,
+      "per-poll timeout should bound a status request well below the default 30s",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+  }
+});
+
+test("status script falls back when API URL is whitespace only", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-blank-url-"));
+  const curlPath = path.join(tempDir, "curl");
+  const launchctlPath = path.join(tempDir, "launchctl");
+  const capturedUrlsPath = path.join(tempDir, "curl-urls.txt");
+  try {
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "printf '%s\\n' \"$url\" >> \"$STATUS_CURL_CAPTURE\"\n" +
+        "if [[ \"$url\" == */v1/capabilities ]]; then\n" +
+        "  printf '%s\\n' '{\"features\":{\"run_submission\":true,\"run_status\":true}}'\n" +
+        "fi\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+    await writeFile(launchctlPath, "#!/bin/bash\nexit 1\n", "utf8");
+    await chmod(launchctlPath, 0o755);
+
+    spawnSync("bash", [path.join(projectRoot, "scripts", "status.sh")], {
+      cwd: projectRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        PATH: tempDir + path.delimiter + process.env.PATH,
+        API_SERVER_PORT: "9001",
+        HERMES_API_SERVER_KEY: "test-key",
+        HERMES_API_SERVER_URL: "   \t \n",
+        STATUS_CURL_CAPTURE: capturedUrlsPath,
+      },
+    });
+
+    const capturedUrls = (await readFile(capturedUrlsPath, "utf8"))
+      .trim()
+      .split("\n");
+    assert.ok(
+      capturedUrls.includes("http://127.0.0.1:9001/v1/capabilities"),
+      "blank normalized URL should fall back to the resolved loopback port",
     );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
