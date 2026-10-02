@@ -114,7 +114,7 @@ try {
     "CONTROL SMOKE " +
     nonce +
     ": use your local terminal tool to run exactly " +
-    '`python3 -c "import time; time.sleep(60)"`' +
+    '`node -e "setTimeout(() => {}, 60000)"`' +
     ". Do not create, edit, or delete any files. After the command finishes, reply exactly CONTROL_SMOKE_NATURAL_COMPLETION.";
 
   const startResult = await client.callTool({
