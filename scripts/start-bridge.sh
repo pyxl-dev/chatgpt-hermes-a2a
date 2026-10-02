@@ -95,6 +95,13 @@ if [[ -z "$NODE_BIN" ]]; then
   echo "node is not installed or is not on PATH." >&2
   exit 1
 fi
+if ! "$NODE_BIN" -e '
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  process.exit(major > 22 || (major === 22 && minor >= 13) ? 0 : 1);
+'; then
+  echo "Node.js >=22.13.0 is required; got $("$NODE_BIN" -v)" >&2
+  exit 1
+fi
 
 unset HERMES_ENV_FILE
 exec "$NODE_BIN" "$ROOT/src/hermes-mcp.mjs"
