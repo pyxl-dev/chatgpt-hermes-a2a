@@ -335,6 +335,36 @@ export function createHermesSessionCoordinator({
     if (persistRepairs && (migrated || pruned)) await persist();
   }
 
+  async function acquireStateMutexTransaction() {
+    const deadline = Date.now() + stateMutexWaitMs;
+
+    while (true) {
+      const database = new DatabaseSync(stateMutexPath);
+      try {
+        database.exec("PRAGMA busy_timeout = 0");
+        database.exec("BEGIN IMMEDIATE");
+        return database;
+      } catch (error) {
+        database.close();
+        if (!/database is (locked|busy)/iu.test(String(error?.message || ""))) {
+          throw error;
+        }
+
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) {
+          throw coordinatorError(
+            "HERMES_COORDINATOR_LOCK_TIMEOUT",
+            "Timed out waiting for the Hermes coordinator SQLite transaction mutex.",
+            { lockPath: stateMutexPath },
+          );
+        }
+        await new Promise((resolve) =>
+          setTimeout(resolve, Math.min(25, remaining)),
+        );
+      }
+    }
+  }
+
   async function withStateTransaction(fn) {
     return withProcessStateTransactionQueue(stateMutexPath, async () => {
       await fs.mkdir(path.dirname(filePath), {
@@ -342,24 +372,9 @@ export function createHermesSessionCoordinator({
         mode: 0o700,
       });
 
-      const database = new DatabaseSync(stateMutexPath);
-      let transactionOpen = false;
+      const database = await acquireStateMutexTransaction();
+      let transactionOpen = true;
       try {
-        database.exec("PRAGMA busy_timeout = " + stateMutexWaitMs);
-        try {
-          database.exec("BEGIN IMMEDIATE");
-          transactionOpen = true;
-        } catch (error) {
-          if (/database is (locked|busy)/iu.test(String(error?.message || ""))) {
-            throw coordinatorError(
-              "HERMES_COORDINATOR_LOCK_TIMEOUT",
-              "Timed out waiting for the Hermes coordinator SQLite transaction mutex.",
-              { lockPath: stateMutexPath },
-            );
-          }
-          throw error;
-        }
-
         await fs.chmod(stateMutexPath, 0o600).catch(() => {});
         await loadStateFromDisk({ persistRepairs: true });
         const result = await fn();
