@@ -2,6 +2,13 @@ import { createHash } from "node:crypto";
 
 const DEFAULT_API_URL = "http://127.0.0.1:8642";
 const DEFAULT_TIMEOUT_MS = 30000;
+const UNSUCCESSFUL_TERMINAL_RUN_STATUSES = new Set([
+  "failed",
+  "rejected",
+  "cancelled",
+  "canceled",
+  "interrupted",
+]);
 
 function requiredString(value, label) {
   if (typeof value !== "string" || value.trim() === "") {
@@ -90,18 +97,28 @@ export function createHermesControl({ redactText, redactValue }) {
       Number.isFinite(configuredOverride) && configuredOverride > 0
         ? Math.min(timeoutMs, Math.max(1, Math.floor(configuredOverride)))
         : timeoutMs;
+    let requestUrl;
+    let requestHeaders;
+    try {
+      requestUrl = new URL(apiUrl + path);
+      requestHeaders = new Headers({
+        Authorization: "Bearer " + apiKey,
+        Accept: "application/json",
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...headers,
+      });
+    } catch (error) {
+      error.deliveryAmbiguous = false;
+      throw error;
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
     try {
-      const response = await fetch(apiUrl + path, {
+      const response = await fetch(requestUrl, {
         method,
         signal: controller.signal,
-        headers: {
-          Authorization: "Bearer " + apiKey,
-          Accept: "application/json",
-          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-          ...headers,
-        },
+        headers: requestHeaders,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       const raw = await response.text();
@@ -200,13 +217,39 @@ export function createHermesControl({ redactText, redactValue }) {
         ...(durableSessionId ? { session_id: durableSessionId } : {}),
       },
     });
+    const runId = payload?.run_id || payload?.id || null;
+    const status = payload?.status || "started";
+    if (
+      !runId &&
+      UNSUCCESSFUL_TERMINAL_RUN_STATUSES.has(
+        String(status).toLowerCase(),
+      )
+    ) {
+      const error = new Error(
+        redactText(
+          "Hermes rejected native Run submission before returning a runId" +
+            (status ? " (status: " + status + ")" : "") +
+            ".",
+        ),
+      );
+      error.code = "HERMES_NATIVE_RUN_FAILED";
+      error.deliveryAmbiguous = false;
+      error.details = {
+        runId: null,
+        sessionId: payload?.session_id || durableSessionId || null,
+        status,
+        error: payload?.error || null,
+      };
+      throw error;
+    }
+
     return {
       ok: true,
       operation: "start_hermes_run",
       agent: "hermes",
-      runId: payload?.run_id || payload?.id || null,
+      runId,
       sessionId: payload?.session_id || durableSessionId || null,
-      status: payload?.status || "started",
+      status,
       replayed: payload?.replayed === true,
     };
   }
