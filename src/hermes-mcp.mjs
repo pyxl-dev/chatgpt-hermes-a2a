@@ -360,6 +360,14 @@ function requireNativeRunId(result, sessionScope) {
   throw error;
 }
 
+function nativeRunNotFoundError(error) {
+  return (
+    error?.code === "run_not_found" ||
+    (error?.status === 404 &&
+      /run\s+not\s+found/iu.test(String(error?.message || "")))
+  );
+}
+
 function nativeRunFailureError(result, runId, sessionScope) {
   return codedError(
     "HERMES_NATIVE_RUN_FAILED",
@@ -448,7 +456,10 @@ function nativePendingRunResult({
     nativeSession: true,
     pending: true,
     completed: false,
+    handoffReason: "synchronous_wait_exhausted",
     pollWith: "get_hermes_run",
+    nextAction:
+      "Poll this runId with get_hermes_run. Do not resubmit or stop it merely because the synchronous wait ended.",
     ...(requestedSessionId ? { requestedSessionId } : {}),
     ...(deduplicated
       ? {
@@ -547,14 +558,26 @@ async function reconcileCoordinatorActive(active) {
     ["run", "native-session-unresolved"].includes(active?.kind) &&
     active.runId
   ) {
-    const result = await control.getRun(active.runId);
-    const terminal = runIsTerminal(result);
-    return {
-      terminal,
-      sessionId: result.sessionId || active.sessionId || null,
-      replayPayload:
-        terminal ? recoveredNativeRunPayload(active, result) : null,
-    };
+    try {
+      const result = await control.getRun(active.runId);
+      const terminal = runIsTerminal(result);
+      return {
+        terminal,
+        sessionId: result.sessionId || active.sessionId || null,
+        replayPayload:
+          terminal ? recoveredNativeRunPayload(active, result) : null,
+      };
+    } catch (error) {
+      if (nativeRunNotFoundError(error)) {
+        return {
+          terminal: true,
+          sessionId: active.sessionId || null,
+          replayPayload: null,
+          runMissing: true,
+        };
+      }
+      throw error;
+    }
   }
   return { terminal: false };
 }
@@ -571,6 +594,23 @@ async function reuseActiveNativeRun(
     current = await control.getRun(lease.runId);
   } catch (error) {
     if (error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH") throw error;
+    if (nativeRunNotFoundError(error)) {
+      await sessionCoordinator.observe(sessionScope, {
+        kind: "run",
+        id: lease.runId,
+        terminal: true,
+        sessionId: lease.sessionIdToUse || null,
+        replayPayload: null,
+      });
+      throw codedError(
+        "HERMES_NATIVE_RUN_NOT_FOUND_RECOVERED",
+        "The previously active Hermes Run no longer exists. Its stale coordinator lease was cleared; retry the operation to start a fresh Run.",
+        {
+          sessionHash: sessionScope?.sessionHash || null,
+          runId: lease.runId,
+        },
+      );
+    }
     pollError = error;
   }
 
@@ -940,7 +980,25 @@ async function executePublicTool(name, args, traceId, sessionScope) {
     case "get_hermes_run": {
       const runId = requireString(args, "runId");
       const before = await sessionCoordinator.inspect(sessionScope);
-      const result = await control.getRun(runId);
+      let result;
+      try {
+        result = await control.getRun(runId);
+      } catch (error) {
+        if (
+          nativeRunNotFoundError(error) &&
+          ["run", "native-session-unresolved"].includes(before?.active?.kind) &&
+          before.active.runId === runId
+        ) {
+          await sessionCoordinator.observe(sessionScope, {
+            kind: "run",
+            id: runId,
+            terminal: true,
+            sessionId: before.active.sessionId || null,
+            replayPayload: null,
+          });
+        }
+        throw error;
+      }
       const terminal = runIsTerminal(result);
       const replayPayload =
         terminal &&
