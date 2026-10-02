@@ -297,7 +297,7 @@ test("status script requires stop and steer capabilities before READY", async ()
   }
 });
 
-test("control rejects mismatched run ids from get and stop responses", async () => {
+test("control rejects mismatched run ids from get, steer, and stop responses", async () => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.HERMES_API_SERVER_KEY;
   const originalUrl = process.env.HERMES_API_SERVER_URL;
@@ -324,6 +324,7 @@ test("control rejects mismatched run ids from get and stop responses", async () 
 
     for (const operation of [
       () => nativeControl.getRun("run-requested"),
+      () => nativeControl.steerRun("run-requested", "steer"),
       () => nativeControl.stopRun("run-requested"),
     ]) {
       await assert.rejects(
