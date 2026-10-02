@@ -26,6 +26,8 @@ The repository name and LaunchAgent identifiers still contain `a2a` for backward
 18. Replay payloads are globally pruned after the deduplication window.
 19. Returned `sessionId` values are checked against the requested/canonical session before terminal state is accepted.
 20. `steer_hermes_run` and `stop_hermes_run` require the exact active `runId` for a tracked ChatGPT conversation.
+21. A normalized exact retry of an already active Run reuses that persisted `runId`; different work still fails closed with `HERMES_SESSION_BUSY`.
+22. Synchronous delegation is capped at 90 seconds of local polling so the MCP call can hand back the live `runId` before upstream transport retries are likely to duplicate the invocation.
 
 ## Native control API
 
