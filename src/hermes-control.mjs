@@ -74,11 +74,24 @@ export function createHermesControl({ redactText, redactValue }) {
     }
   }
 
-  async function request(path, { method = "GET", body, headers = {} } = {}) {
+  async function request(
+    path,
+    {
+      method = "GET",
+      body,
+      headers = {},
+      timeoutOverrideMs = null,
+    } = {},
+  ) {
     ensureConfigured();
     const methodName = String(method || "GET").toUpperCase();
+    const configuredOverride = Number(timeoutOverrideMs);
+    const requestTimeoutMs =
+      Number.isFinite(configuredOverride) && configuredOverride > 0
+        ? Math.min(timeoutMs, Math.max(1, Math.floor(configuredOverride)))
+        : timeoutMs;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
     try {
       const response = await fetch(apiUrl + path, {
         method,
@@ -129,7 +142,7 @@ export function createHermesControl({ redactText, redactValue }) {
     } catch (error) {
       if (error?.name === "AbortError") {
         const timeoutError = new Error(
-          "Hermes control API request timed out after " + timeoutMs + "ms",
+          "Hermes control API request timed out after " + requestTimeoutMs + "ms",
         );
         timeoutError.deliveryAmbiguous = methodName !== "GET";
         throw timeoutError;
@@ -198,9 +211,11 @@ export function createHermesControl({ redactText, redactValue }) {
     };
   }
 
-  async function getRun(runId) {
+  async function getRun(runId, { timeoutMs: timeoutOverrideMs = null } = {}) {
     const id = requiredString(runId, "runId");
-    const payload = await request("/v1/runs/" + encodeURIComponent(id));
+    const payload = await request("/v1/runs/" + encodeURIComponent(id), {
+      timeoutOverrideMs,
+    });
     return {
       ok: true,
       operation: "get_hermes_run",
