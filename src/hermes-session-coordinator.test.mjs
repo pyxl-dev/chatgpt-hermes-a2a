@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { spawn } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1054,6 +1055,109 @@ test("all live replay results remain available inside the dedup window", async (
   assert.equal(lastReplay.replayPayload.runId, "run-69");
 });
 
+test("coordinator serializes leases across independent bridge processes", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-ipc-process-"));
+  const startPath = path.join(root, "start");
+  const moduleUrl = new URL("./hermes-session-coordinator.mjs", import.meta.url).href;
+  const childScript = `
+    import fs from "node:fs/promises";
+    import path from "node:path";
+    import { createHermesSessionCoordinator } from ${JSON.stringify(moduleUrl)};
+
+    const [root, label, startPath] = process.argv.slice(1);
+    let counter = 0;
+    const coordinator = createHermesSessionCoordinator({
+      root,
+      randomUUID: () => label + "-" + ++counter,
+    });
+    const scope = coordinator.scopeFromMeta({ "openai/session": "chat-a" });
+    await fs.writeFile(path.join(root, "ready-" + label), "ready");
+    while (true) {
+      try {
+        await fs.access(startPath);
+        break;
+      } catch {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+    }
+
+    try {
+      const lease = await coordinator.begin(scope, {
+        mode: "delegate",
+        tool: "delegate_to_hermes",
+        instruction: "bridge " + label + " work",
+      });
+      process.stdout.write(JSON.stringify({ ok: true, operationId: lease.operationId }));
+    } catch (error) {
+      process.stdout.write(JSON.stringify({ ok: false, code: error?.code || null }));
+    }
+  `;
+
+  function runChild(label) {
+    const child = spawn(
+      process.execPath,
+      ["--input-type=module", "-e", childScript, root, label, startPath],
+      { stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk;
+    });
+    return {
+      child,
+      result: new Promise((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code) => {
+          if (code !== 0) {
+            reject(new Error("child " + label + " failed: " + stderr));
+            return;
+          }
+          resolve(JSON.parse(stdout));
+        });
+      }),
+    };
+  }
+
+  const a = runChild("a");
+  const b = runChild("b");
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    const ready = await Promise.all(
+      ["a", "b"].map(async (label) => {
+        try {
+          await fs.access(path.join(root, "ready-" + label));
+          return true;
+        } catch {
+          return false;
+        }
+      }),
+    );
+    if (ready.every(Boolean)) break;
+    if (Date.now() >= deadline) {
+      a.child.kill("SIGKILL");
+      b.child.kill("SIGKILL");
+      throw new Error("child coordinators did not reach the start barrier");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  await fs.writeFile(startPath, "go");
+  const results = await Promise.all([a.result, b.result]);
+  assert.equal(results.filter((result) => result.ok === true).length, 1);
+  assert.equal(
+    results.filter((result) => result.code === "HERMES_SESSION_BUSY").length,
+    1,
+  );
+
+  const state = await readCoordinatorState(root);
+  assert.equal(Object.keys(state.sessions).length, 1);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 test("coordinator serializes leases across independent bridge instances", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-ipc-"));
   let aCounter = 0;
@@ -1122,6 +1226,230 @@ test("coordinator transactions preserve concurrent independent conversations", a
   assert.ok(leaseB.operationId);
   const disk = await readCoordinatorState(root);
   assert.equal(Object.keys(disk.sessions).length, 2);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("coordinator mutex is released automatically when a process exits", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-ipc-crash-"));
+  const runtimeDir = path.join(root, ".runtime");
+  const statePath = path.join(runtimeDir, "chatgpt-session-coordinator.json");
+  const mutexPath = statePath + ".mutex.sqlite";
+  await fs.mkdir(runtimeDir, { recursive: true });
+
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+        import { DatabaseSync } from "node:sqlite";
+        const database = new DatabaseSync(process.argv[1]);
+        database.exec("BEGIN IMMEDIATE");
+        process.exit(0);
+      `,
+      mutexPath,
+    ],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error("mutex holder failed: " + stderr));
+    });
+  });
+
+  let counter = 0;
+  const coordinator = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "after-crash-" + ++counter,
+  });
+  const lease = await coordinator.begin(coordinator.scopeFromMeta(metaA), {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "after crashed mutex holder",
+  });
+  assert.ok(lease.operationId);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("remote reconciliation does not hold the global state transaction", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-reconcile-lock-"));
+  let aCounter = 0;
+  let bCounter = 0;
+  const coordinatorA = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "a-" + ++aCounter,
+  });
+  const coordinatorB = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "b-" + ++bCounter,
+  });
+
+  const scopeA = coordinatorA.scopeFromMeta(metaA);
+  const first = await coordinatorA.begin(scopeA, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "first A",
+  });
+  await coordinatorA.complete(scopeA, first.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-A",
+      sessionId: "session-A",
+      status: "running",
+    },
+    runId: "run-A",
+    sessionId: "session-A",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  let releasePoll;
+  let markPollStarted;
+  const pollStarted = new Promise((resolve) => {
+    markPollStarted = resolve;
+  });
+  const pollGate = new Promise((resolve) => {
+    releasePoll = resolve;
+  });
+
+  const pendingA = coordinatorA.begin(scopeA, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "different A work",
+    reconcileActive: async () => {
+      markPollStarted();
+      await pollGate;
+      return { terminal: false };
+    },
+  });
+
+  await pollStarted;
+  try {
+    const independent = await Promise.race([
+      coordinatorB.begin(coordinatorB.scopeFromMeta(metaB), {
+        mode: "delegate",
+        tool: "delegate_to_hermes",
+        instruction: "independent B work",
+      }),
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("independent transaction blocked by remote reconciliation")),
+          750,
+        ),
+      ),
+    ]);
+    assert.ok(independent.operationId);
+  } finally {
+    releasePoll();
+  }
+
+  await assert.rejects(
+    pendingA,
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("reconciliation result is ignored if the active lease changes during the poll", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-reconcile-cas-"));
+  let aCounter = 0;
+  let bCounter = 0;
+  const coordinatorA = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "a-" + ++aCounter,
+  });
+  const coordinatorB = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "b-" + ++bCounter,
+  });
+  const scopeA = coordinatorA.scopeFromMeta(metaA);
+  const scopeB = coordinatorB.scopeFromMeta(metaA);
+
+  const first = await coordinatorA.begin(scopeA, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "first A",
+  });
+  await coordinatorA.complete(scopeA, first.operationId, {
+    payload: {
+      ok: true,
+      operation: "delegate_to_hermes",
+      runId: "run-old",
+      sessionId: "session-A",
+      status: "running",
+    },
+    runId: "run-old",
+    sessionId: "session-A",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  let releasePoll;
+  let markPollStarted;
+  const pollStarted = new Promise((resolve) => {
+    markPollStarted = resolve;
+  });
+  const pollGate = new Promise((resolve) => {
+    releasePoll = resolve;
+  });
+
+  const pending = coordinatorA.begin(scopeA, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "new A work",
+    reconcileActive: async () => {
+      markPollStarted();
+      await pollGate;
+      return {
+        terminal: true,
+        sessionId: "session-A",
+        replayPayload: {
+          ok: true,
+          operation: "delegate_to_hermes",
+          runId: "run-old",
+          sessionId: "session-A",
+          status: "completed",
+          text: "stale completion",
+        },
+      };
+    },
+  });
+
+  await pollStarted;
+  await coordinatorB.observe(scopeB, {
+    kind: "run",
+    id: "run-old",
+    terminal: true,
+    sessionId: "session-A",
+    replayPayload: null,
+  });
+  const replacement = await coordinatorB.begin(scopeB, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "replacement work",
+  });
+  assert.ok(replacement.operationId);
+
+  releasePoll();
+  await assert.rejects(
+    pending,
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+
+  const snapshot = await coordinatorA.inspect(scopeA);
+  assert.equal(snapshot.active?.operationId, replacement.operationId);
+  const state = await readCoordinatorState(root);
+  const replayPayloads = Object.values(
+    state.recentResults?.[scopeA.sessionHash] || {},
+  ).map((entry) => entry.payload?.text);
+  assert.equal(replayPayloads.includes("stale completion"), false);
   await fs.rm(root, { recursive: true, force: true });
 });
 
