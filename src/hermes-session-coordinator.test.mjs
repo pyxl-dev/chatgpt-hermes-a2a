@@ -227,6 +227,58 @@ test("known run remains locked until terminal observation", async () => {
   assert.ok(next.operationId);
 });
 
+test("normalized exact retry reuses the active native run", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+  const lease = await coordinator.begin(scope, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "long   task",
+  });
+  await coordinator.complete(scope, lease.operationId, {
+    payload: {
+      ok: true,
+      runId: "run-active",
+      sessionId: "session-active",
+      status: "running",
+    },
+    sessionId: "session-active",
+    runId: "run-active",
+    keepActive: true,
+    activeKind: "run",
+  });
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "long task",
+    reconcileActive: async (active) => {
+      assert.equal(active.runId, "run-active");
+      return {
+        terminal: false,
+        sessionId: "session-active",
+        replayPayload: null,
+      };
+    },
+  });
+
+  assert.equal(retry.replay, false);
+  assert.equal(retry.activeRun, true);
+  assert.equal(retry.runId, "run-active");
+  assert.equal(retry.operationId, lease.operationId);
+  assert.equal(retry.idempotencyKey, lease.idempotencyKey);
+  assert.equal(retry.sessionIdToUse, "session-active");
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate_to_hermes",
+      tool: "delegate_to_hermes",
+      instruction: "different work",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+});
+
 test("session drift preserves a known run lock", async () => {
   const { coordinator } = await makeCoordinator();
   const scope = coordinator.scopeFromMeta(metaA);
