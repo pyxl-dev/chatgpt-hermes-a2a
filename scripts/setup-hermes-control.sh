@@ -38,11 +38,7 @@ if [[ -z "$API_KEY" ]]; then
   if command -v openssl >/dev/null 2>&1; then
     GENERATED_API_KEY="$(openssl rand -hex 32)"
   else
-    GENERATED_API_KEY="$(python3 - <<'PY'
-import secrets
-print(secrets.token_hex(32))
-PY
-)"
+    GENERATED_API_KEY="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
   fi
   "$HERMES_BIN" config set API_SERVER_KEY "$GENERATED_API_KEY" >/dev/null
 
@@ -94,17 +90,20 @@ fi
 
 CAPS="$(curl -fsS --max-time 5   -H "Authorization: Bearer $API_KEY"   "http://127.0.0.1:$PORT/v1/capabilities")"
 
-if ! printf '%s' "$CAPS" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-features = data.get("features") or {}
-endpoints = data.get("endpoints") or {}
-ok = (
-    features.get("run_submission") is True
-    and features.get("run_stop") is True
-    and (features.get("run_steer") is True or bool(endpoints.get("run_steer")))
-)
-raise SystemExit(0 if ok else 1)
+if ! printf '%s' "$CAPS" | node -e '
+const fs = require("node:fs");
+try {
+  const data = JSON.parse(fs.readFileSync(0, "utf8"));
+  const features = data.features || {};
+  const endpoints = data.endpoints || {};
+  const ok =
+    features.run_submission === true &&
+    features.run_stop === true &&
+    (features.run_steer === true || Boolean(endpoints.run_steer));
+  process.exit(ok ? 0 : 1);
+} catch {
+  process.exit(1);
+}
 '; then
   echo "Hermes API server is reachable but required Runs API capabilities are missing." >&2
   exit 3
