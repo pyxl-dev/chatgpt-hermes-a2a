@@ -322,6 +322,7 @@ export function createHermesControl({ redactText, redactValue }) {
         body: { input: text },
       },
     );
+    assertReturnedRunId(id, payload, "steer_hermes_run");
     return {
       ok: true,
       operation: "steer_hermes_run",
