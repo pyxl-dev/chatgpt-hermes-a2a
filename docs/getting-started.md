@@ -35,7 +35,7 @@ Nothing requires exposing Hermes publicly. `tunnel-client` creates the outbound 
 You need:
 
 - macOS for the provided persistent LaunchAgent workflow;
-- Git, curl, Node.js 20+ and npm;
+- Git, curl, Node.js 22.13+ and npm;
 - Hermes Agent installed and able to complete a normal local task;
 - OpenAI `tunnel-client`;
 - an OpenAI Platform/ChatGPT workspace that supports the needed MCP actions.
@@ -232,6 +232,8 @@ Later normal delegations automatically reuse the same durable Hermes session.
 
 The coordinator enforces:
 
+- cross-process state transactions through an OS-backed SQLite mutex;
+- remote Run reconciliation outside the global transaction, followed by active-lease revalidation;
 - one active mutating Run per ChatGPT conversation;
 - one canonical durable Hermes session;
 - exact idempotent recovery after ambiguous submission;
