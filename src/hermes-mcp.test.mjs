@@ -252,7 +252,11 @@ test("synchronous delegate finalizes terminal submission responses without polli
       },
       _meta: metadata,
     });
-    assert.equal(completed.isError, false);
+    assert.notEqual(
+      completed.isError,
+      true,
+      "successful MCP responses may omit isError instead of setting false",
+    );
     assert.equal(completed.structuredContent?.status, "completed");
     assert.notEqual(completed.structuredContent?.pending, true);
     assert.equal(
