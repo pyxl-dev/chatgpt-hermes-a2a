@@ -297,6 +297,51 @@ test("status script requires stop and steer capabilities before READY", async ()
   }
 });
 
+test("status script accepts endpoint-based steer capability", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-steer-endpoint-"));
+  const curlPath = path.join(tempDir, "curl");
+  const launchctlPath = path.join(tempDir, "launchctl");
+  try {
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "if [[ \"$url\" == */v1/capabilities ]]; then\n" +
+        "  printf '%s\\n' \"$STATUS_CAPABILITIES\"\n" +
+        "fi\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+    await writeFile(launchctlPath, "#!/bin/bash\nexit 1\n", "utf8");
+    await chmod(launchctlPath, 0o755);
+
+    const result = spawnSync(
+      "bash",
+      [path.join(projectRoot, "scripts", "status.sh")],
+      {
+        cwd: projectRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: tempDir,
+          PATH: tempDir + path.delimiter + process.env.PATH,
+          HERMES_API_SERVER_KEY: "test-key",
+          HERMES_API_SERVER_URL: "http://127.0.0.1:8642",
+          STATUS_CAPABILITIES:
+            '{"features":{"run_submission":true,"run_status":true,' +
+            '"run_stop":true,"run_steer":false},' +
+            '"endpoints":{"run_steer":"/v1/runs/:id/steer"}}',
+        },
+      },
+    );
+
+    assert.match(result.stdout, /Hermes native Runs API: READY/u);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("control rejects mismatched run ids from get, steer, and stop responses", async () => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.HERMES_API_SERVER_KEY;
