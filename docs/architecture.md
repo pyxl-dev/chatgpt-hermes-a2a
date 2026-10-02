@@ -49,7 +49,7 @@ The wrapper exposes 10 tools:
 - `hermes_status`
 - `hermes_activity`
 
-Ordinary ChatGPT work should use `delegate_to_hermes`. Long work that may need intervention should use `start_hermes_run` followed by get/steer/stop.
+Ordinary ChatGPT work should use `delegate_to_hermes`. It waits synchronously for at most 90 seconds; if the Run is still nonterminal, the wrapper returns the active `runId` and leaves it running so ChatGPT can continue with `get_hermes_run`. Long work that is known in advance to need intervention can still use `start_hermes_run` followed by get/steer/stop.
 
 ## Trust boundaries
 
@@ -73,7 +73,7 @@ canonicalSessionId
 active:
   operationId
   tool
-  kind: native-pending | native-submission-unknown | run
+  kind: native-pending | native-submission-unknown | run | native-session-unresolved
   traceId
   sessionId
   runId
@@ -95,9 +95,10 @@ There is deliberately no route discriminator, `contextId`, `taskId`, A2A state o
 1. `begin()` creates a persisted `native-pending` lease.
 2. `control.startRun()` submits the instruction with an operation-scoped idempotency key.
 3. Once Hermes returns a `runId`, `complete(... keepActive=true)` persists an active `run`.
-4. The wrapper polls the Runs API.
-5. On successful terminal completion, the durable `sessionId` is bound and the final result is cached for bounded exact replay.
-6. On terminal failure, the active Run is released and no successful replay is cached.
+4. The wrapper polls the Runs API for at most 90 seconds.
+5. If the Run is still nonterminal at that point, the tool returns a successful pending handoff containing the same `runId`; the coordinator keeps the Run active for later `get_hermes_run` polling.
+6. On successful terminal completion, the durable `sessionId` is bound and the final result is cached for bounded exact replay.
+7. On terminal failure, the active Run is released and no successful replay is cached.
 
 ### Later delegation
 
@@ -111,7 +112,9 @@ Only an exact retry may recover this state. It reuses the persisted operation id
 
 ### Known active Run
 
-Once a `runId` is known, it is never replaced by a plain pending state. New mutating work is rejected until the Run becomes terminal.
+Once a `runId` is known, it is never replaced by a plain pending state. Different mutating work is rejected until the Run becomes terminal.
+
+A normalized exact retry of the same operation is different: it attaches to the existing active Run and returns that same `runId` instead of producing `HERMES_SESSION_BUSY` or submitting duplicate work. This covers transport/tool retries that arrive while the original synchronous call is still waiting.
 
 After a bridge restart, `begin()` reconciles the persisted active Run through `GET /v1/runs/:id` before deciding whether new work is allowed.
 
@@ -196,4 +199,5 @@ A valid local pipeline must prove:
 2. Hermes native control capabilities are reachable;
 3. a real delegated Run reaches Hermes and uses a local tool;
 4. start/poll/steer/stop works;
-5. coordinator tests cover serialization, idempotent retry, restart recovery, drift, terminal replay and persisted-state migration.
+5. coordinator tests cover serialization, exact active-Run retry reuse, idempotent retry, restart recovery, drift, terminal replay and persisted-state migration;
+6. long synchronous delegation can hand back a nonterminal `runId` without cancelling or duplicating the underlying Hermes Run.
