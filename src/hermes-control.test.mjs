@@ -367,3 +367,41 @@ test("malformed control URL fails definitively before submission", async () => {
     }
   }
 });
+
+test("invalid authorization header fails definitively before submission", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "bad\nkey";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    let fetchCalled = false;
+    globalThis.fetch = async () => {
+      fetchCalled = true;
+      throw new Error("fetch should not be called");
+    };
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    await assert.rejects(
+      control.startRun("work", null, "scope"),
+      (error) => error?.deliveryAmbiguous === false,
+    );
+    assert.equal(fetchCalled, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
