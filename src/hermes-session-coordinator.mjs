@@ -1,8 +1,29 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 const DEFAULT_DEDUP_WINDOW_MS = 60_000;
+const PROCESS_STATE_TRANSACTION_QUEUES = new Map();
+
+async function withProcessStateTransactionQueue(key, fn) {
+  const previous = PROCESS_STATE_TRANSACTION_QUEUES.get(key) || Promise.resolve();
+  let release;
+  const current = new Promise((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.catch(() => {}).then(() => current);
+  PROCESS_STATE_TRANSACTION_QUEUES.set(key, queued);
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (PROCESS_STATE_TRANSACTION_QUEUES.get(key) === queued) {
+      PROCESS_STATE_TRANSACTION_QUEUES.delete(key);
+    }
+  }
+}
 
 const UNSUCCESSFUL_OUTCOMES = new Set([
   "failed",
@@ -95,18 +116,11 @@ export function createHermesSessionCoordinator({
     path.join(runtimeDir, "chatgpt-session-coordinator.json");
 
   const replayWindowMs = normalizedDedupWindowMs(dedupWindowMs);
-  const stateLockPath = filePath + ".lock";
-  const stateLockOwnerPath = path.join(stateLockPath, "owner.json");
-  const stateLockRetryMs = 25;
-  const stateLockWaitMs = 90_000;
-  const ownerlessLockStaleMs = 10_000;
+  const stateMutexPath = filePath + ".mutex.sqlite";
+  const stateMutexWaitMs = 30_000;
 
   const state = { version: 3, sessions: {}, recentResults: {} };
   const instanceId = randomUUID();
-  const locks = new Map();
-  let loaded = false;
-  let loadPromise = null;
-  let writeChain = Promise.resolve();
 
   function scopeFromMeta(meta) {
     const raw =
@@ -234,23 +248,23 @@ export function createHermesSessionCoordinator({
 
   async function persist() {
     pruneExpiredRecentResults();
-    writeChain = writeChain
-      .catch(() => {})
-      .then(async () => {
-        await fs.mkdir(path.dirname(filePath), {
-          recursive: true,
-          mode: 0o700,
-        });
-        const tempPath = filePath + "." + randomUUID() + ".tmp";
-        await fs.writeFile(
-          tempPath,
-          JSON.stringify(state, null, 2) + "\n",
-          { encoding: "utf8", mode: 0o600 },
-        );
-        await fs.rename(tempPath, filePath);
-        await fs.chmod(filePath, 0o600).catch(() => {});
-      });
-    await writeChain;
+    await fs.mkdir(path.dirname(filePath), {
+      recursive: true,
+      mode: 0o700,
+    });
+    const tempPath =
+      filePath + "." + process.pid + "." + randomUUID() + ".tmp";
+    try {
+      await fs.writeFile(
+        tempPath,
+        JSON.stringify(state, null, 2) + "\n",
+        { encoding: "utf8", mode: 0o600 },
+      );
+      await fs.rename(tempPath, filePath);
+      await fs.chmod(filePath, 0o600).catch(() => {});
+    } finally {
+      await fs.rm(tempPath, { force: true }).catch(() => {});
+    }
   }
 
   function resetState() {
@@ -321,124 +335,48 @@ export function createHermesSessionCoordinator({
     if (persistRepairs && (migrated || pruned)) await persist();
   }
 
-  async function lockOwnerIsAlive() {
-    try {
-      const owner = JSON.parse(await fs.readFile(stateLockOwnerPath, "utf8"));
-      const pid = Number(owner?.pid);
-      if (Number.isInteger(pid) && pid > 0) {
-        try {
-          process.kill(pid, 0);
-          return true;
-        } catch (error) {
-          if (error?.code === "ESRCH") return false;
-          return true;
-        }
-      }
-    } catch {
-      // The owner file may not exist yet between mkdir() and writeFile().
-    }
+  async function withStateTransaction(fn) {
+    return withProcessStateTransactionQueue(stateMutexPath, async () => {
+      await fs.mkdir(path.dirname(filePath), {
+        recursive: true,
+        mode: 0o700,
+      });
 
-    try {
-      const stat = await fs.stat(stateLockPath);
-      return Date.now() - stat.mtimeMs <= ownerlessLockStaleMs;
-    } catch (error) {
-      return error?.code !== "ENOENT";
-    }
-  }
-
-  async function acquireStateFileLock() {
-    await fs.mkdir(path.dirname(filePath), {
-      recursive: true,
-      mode: 0o700,
-    });
-
-    const deadline = Date.now() + stateLockWaitMs;
-    while (true) {
+      const database = new DatabaseSync(stateMutexPath);
+      let transactionOpen = false;
       try {
-        await fs.mkdir(stateLockPath, { mode: 0o700 });
+        database.exec("PRAGMA busy_timeout = " + stateMutexWaitMs);
         try {
-          await fs.writeFile(
-            stateLockOwnerPath,
-            JSON.stringify({
-              pid: process.pid,
-              instanceId,
-              acquiredAt: new Date().toISOString(),
-            }) + "\n",
-            { encoding: "utf8", mode: 0o600 },
-          );
+          database.exec("BEGIN IMMEDIATE");
+          transactionOpen = true;
         } catch (error) {
-          await fs.rm(stateLockPath, { recursive: true, force: true });
+          if (/database is (locked|busy)/iu.test(String(error?.message || ""))) {
+            throw coordinatorError(
+              "HERMES_COORDINATOR_LOCK_TIMEOUT",
+              "Timed out waiting for the Hermes coordinator SQLite transaction mutex.",
+              { lockPath: stateMutexPath },
+            );
+          }
           throw error;
         }
 
-        let released = false;
-        return async () => {
-          if (released) return;
-          released = true;
-          await fs.rm(stateLockPath, { recursive: true, force: true });
-        };
-      } catch (error) {
-        if (error?.code !== "EEXIST") throw error;
-
-        if (!(await lockOwnerIsAlive())) {
-          await fs.rm(stateLockPath, { recursive: true, force: true });
-          continue;
-        }
-
-        if (Date.now() >= deadline) {
-          throw coordinatorError(
-            "HERMES_COORDINATOR_LOCK_TIMEOUT",
-            "Timed out waiting for the Hermes coordinator interprocess state lock.",
-            { lockPath: stateLockPath },
-          );
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, stateLockRetryMs));
-      }
-    }
-  }
-
-  async function ensureLoaded() {
-    if (loaded) return;
-    if (loadPromise) return loadPromise;
-
-    loadPromise = (async () => {
-      const releaseStateLock = await acquireStateFileLock();
-      try {
+        await fs.chmod(stateMutexPath, 0o600).catch(() => {});
         await loadStateFromDisk({ persistRepairs: true });
-        loaded = true;
+        const result = await fn();
+        database.exec("COMMIT");
+        transactionOpen = false;
+        return result;
+      } catch (error) {
+        if (transactionOpen) {
+          try {
+            database.exec("ROLLBACK");
+          } catch {}
+        }
+        throw error;
       } finally {
-        await releaseStateLock();
+        database.close();
       }
-    })();
-
-    try {
-      await loadPromise;
-    } finally {
-      loadPromise = null;
-    }
-  }
-
-  async function withLock(sessionHash, fn) {
-    const previous = locks.get(sessionHash) || Promise.resolve();
-    let release;
-    const current = new Promise((resolve) => {
-      release = resolve;
     });
-    const queued = previous.catch(() => {}).then(() => current);
-    locks.set(sessionHash, queued);
-    await previous.catch(() => {});
-
-    let releaseStateLock = null;
-    try {
-      releaseStateLock = await acquireStateFileLock();
-      await loadStateFromDisk({ persistRepairs: true });
-      return await fn();
-    } finally {
-      if (releaseStateLock) await releaseStateLock();
-      release();
-      if (locks.get(sessionHash) === queued) locks.delete(sessionHash);
-    }
   }
 
   function getRecord(sessionHash) {
@@ -488,6 +426,41 @@ export function createHermesSessionCoordinator({
     }
   }
 
+  function activeIdentity(active) {
+    if (!active || typeof active !== "object") return null;
+    return {
+      operationId: active.operationId || null,
+      kind: active.kind || null,
+      runId: active.runId || null,
+      sessionId: active.sessionId || null,
+      fingerprint: active.fingerprint || null,
+      ownerInstanceId: active.ownerInstanceId || null,
+      idempotencyKey: active.idempotencyKey || null,
+      startedAt: active.startedAt || null,
+      reusedSession:
+        typeof active.reusedSession === "boolean"
+          ? active.reusedSession
+          : null,
+    };
+  }
+
+  function sameActiveIdentity(active, expected) {
+    if (!expected) return false;
+    const current = activeIdentity(active);
+    return Boolean(
+      current &&
+      current.operationId === expected.operationId &&
+      current.kind === expected.kind &&
+      current.runId === expected.runId &&
+      current.sessionId === expected.sessionId &&
+      current.fingerprint === expected.fingerprint &&
+      current.ownerInstanceId === expected.ownerInstanceId &&
+      current.idempotencyKey === expected.idempotencyKey &&
+      current.startedAt === expected.startedAt &&
+      current.reusedSession === expected.reusedSession
+    );
+  }
+
   function snapshot(scope, record) {
     return {
       tracked: Boolean(scope?.tracked),
@@ -506,8 +479,7 @@ export function createHermesSessionCoordinator({
         active: null,
       };
     }
-    await ensureLoaded();
-    return withLock(scope.sessionHash, async () =>
+    return withStateTransaction(async () =>
       snapshot(scope, getRecord(scope.sessionHash)),
     );
   }
@@ -539,89 +511,111 @@ export function createHermesSessionCoordinator({
       };
     }
 
-    await ensureLoaded();
-    return withLock(scope.sessionHash, async () => {
+    let reconcileTarget = null;
+    if (typeof reconcileActive === "function") {
+      reconcileTarget = await withStateTransaction(async () => {
+        const record = state.sessions[scope.sessionHash];
+        const active =
+          record &&
+          typeof record === "object" &&
+          !Array.isArray(record)
+            ? record.active
+            : null;
+        return active
+          ? {
+              identity: activeIdentity(active),
+              summary: activeSummary(active),
+            }
+          : null;
+      });
+    }
+
+    let reconciled = null;
+    if (reconcileTarget) {
+      try {
+        reconciled = await reconcileActive(reconcileTarget.summary);
+      } catch (error) {
+        if (error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH") throw error;
+        // A transient status failure is not evidence that the active Run ended.
+      }
+    }
+
+    return withStateTransaction(async () => {
       const record = getRecord(scope.sessionHash);
       let changed = false;
 
-      if (record.active && typeof reconcileActive === "function") {
-        let reconciled = null;
-        try {
-          reconciled = await reconcileActive(activeSummary(record.active));
-        } catch (error) {
-          if (error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH") throw error;
-          // A transient status failure is not evidence that the active Run ended.
+      if (
+        reconciled &&
+        reconcileTarget &&
+        sameActiveIdentity(record.active, reconcileTarget.identity)
+      ) {
+        const expectedSessionId =
+          record.canonicalSessionId || record.active.sessionId || null;
+        if (
+          reconciled.sessionId &&
+          expectedSessionId &&
+          reconciled.sessionId !== expectedSessionId
+        ) {
+          throw coordinatorError(
+            "HERMES_NATIVE_SESSION_DRIFT",
+            "Hermes reported a different sessionId while reconciling the active Run.",
+            {
+              sessionHash: scope.sessionHash,
+              expectedSessionId,
+              returnedSessionId: reconciled.sessionId,
+              active: activeSummary(record.active),
+            },
+          );
         }
 
-        if (reconciled) {
-          const expectedSessionId =
-            record.canonicalSessionId || record.active.sessionId || null;
+        if (reconciled.sessionId && !record.canonicalSessionId) {
+          record.canonicalSessionId = reconciled.sessionId;
+          changed = true;
+        }
+
+        if (reconciled.terminal === true) {
+          const currentActive = record.active;
+          const fingerprint = currentActive.fingerprint || null;
+          const reusable =
+            fingerprint &&
+            reconciled.replayPayload &&
+            payloadIsReusable(reconciled.replayPayload);
+
           if (
-            reconciled.sessionId &&
-            expectedSessionId &&
-            reconciled.sessionId !== expectedSessionId
+            reusable &&
+            (
+              currentActive.kind !== "native-session-unresolved" ||
+              getRecentResult(scope.sessionHash, fingerprint)
+            )
           ) {
-            throw coordinatorError(
-              "HERMES_NATIVE_SESSION_DRIFT",
-              "Hermes reported a different sessionId while reconciling the active Run.",
-              {
-                sessionHash: scope.sessionHash,
-                expectedSessionId,
-                returnedSessionId: reconciled.sessionId,
-                active: activeSummary(record.active),
-              },
-            );
+            setRecentResult(scope.sessionHash, fingerprint, {
+              settledAtMs: Date.now(),
+              traceId: currentActive.traceId || null,
+              payload: reconciled.replayPayload,
+            });
+          } else if (fingerprint) {
+            deleteRecentResult(scope.sessionHash, fingerprint);
           }
 
-          if (reconciled.sessionId && !record.canonicalSessionId) {
-            record.canonicalSessionId = reconciled.sessionId;
-            changed = true;
+          if (
+            reusable &&
+            !sessionBindingResolved(
+              record,
+              currentActive,
+              reconciled.sessionId || null,
+            )
+          ) {
+            record.active = {
+              ...currentActive,
+              kind: "native-session-unresolved",
+              runId: currentActive.runId || null,
+              sessionId: null,
+              ownerInstanceId: instanceId,
+            };
+          } else {
+            record.active = null;
           }
-
-          if (reconciled.terminal === true) {
-            const currentActive = record.active;
-            const fingerprint = currentActive.fingerprint || null;
-            const reusable =
-              fingerprint &&
-              reconciled.replayPayload &&
-              payloadIsReusable(reconciled.replayPayload);
-
-            if (
-              reusable &&
-              (
-                currentActive.kind !== "native-session-unresolved" ||
-                getRecentResult(scope.sessionHash, fingerprint)
-              )
-            ) {
-              setRecentResult(scope.sessionHash, fingerprint, {
-                settledAtMs: Date.now(),
-                traceId: currentActive.traceId || null,
-                payload: reconciled.replayPayload,
-              });
-            } else if (fingerprint) {
-              deleteRecentResult(scope.sessionHash, fingerprint);
-            }
-
-            if (
-              reusable &&
-              !sessionBindingResolved(
-                record,
-                currentActive,
-                reconciled.sessionId || null,
-              )
-            ) {
-              record.active = {
-                ...currentActive,
-                kind: "native-session-unresolved",
-                runId: currentActive.runId || null,
-                sessionId: null,
-                ownerInstanceId: instanceId,
-              };
-            } else {
-              record.active = null;
-            }
-            changed = true;
-          }
+          changed = true;
         }
       }
 
@@ -794,9 +788,8 @@ export function createHermesSessionCoordinator({
     } = {},
   ) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
-    await ensureLoaded();
 
-    return withLock(scope.sessionHash, async () => {
+    return withStateTransaction(async () => {
       const record = getRecord(scope.sessionHash);
       const active = record.active;
       if (!active || active.operationId !== operationId) {
@@ -893,8 +886,7 @@ export function createHermesSessionCoordinator({
 
   async function fail(scope, operationId) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
-    await ensureLoaded();
-    return withLock(scope.sessionHash, async () => {
+    return withStateTransaction(async () => {
       const record = getRecord(scope.sessionHash);
       if (record.active?.operationId === operationId) {
         record.active = null;
@@ -907,8 +899,7 @@ export function createHermesSessionCoordinator({
 
   async function markSubmissionUnknown(scope, operationId) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
-    await ensureLoaded();
-    return withLock(scope.sessionHash, async () => {
+    return withStateTransaction(async () => {
       const record = getRecord(scope.sessionHash);
       if (record.active?.operationId === operationId) {
         record.active = {
@@ -934,9 +925,8 @@ export function createHermesSessionCoordinator({
     },
   ) {
     if (!scope?.tracked || !scope.sessionHash) return;
-    await ensureLoaded();
 
-    return withLock(scope.sessionHash, async () => {
+    return withStateTransaction(async () => {
       const record = getRecord(scope.sessionHash);
       const active = record.active;
       if (
@@ -1020,8 +1010,7 @@ export function createHermesSessionCoordinator({
 
   async function assertActiveRun(scope, runId) {
     if (!scope?.tracked || !scope.sessionHash) return;
-    await ensureLoaded();
-    return withLock(scope.sessionHash, async () => {
+    return withStateTransaction(async () => {
       const record = getRecord(scope.sessionHash);
       if (record.active?.kind === "run" && record.active.runId === runId) {
         return snapshot(scope, record);
