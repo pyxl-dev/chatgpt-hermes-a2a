@@ -89,6 +89,14 @@ recentResults[fingerprint]:
 
 There is deliberately no route discriminator, `contextId`, `taskId`, A2A state or restore-on-A2A-resumption logic.
 
+The JSON coordinator payload remains in
+`.runtime/chatgpt-session-coordinator.json`. A separate local
+`.mutex.sqlite` file is used only for `BEGIN IMMEDIATE` serialization across
+bridge processes. The mutex transaction never spans a Hermes network request:
+active state is snapshotted under the mutex, remote reconciliation runs after
+release, and the mutex is reacquired before applying the result. The result is
+applied only if the active lease identity is unchanged.
+
 ## State transitions
 
 ### First synchronous delegation
@@ -188,7 +196,7 @@ The trace includes timing, tool name, hashed ChatGPT session scope, instruction 
 ## Dependencies
 
 - Hermes Agent with native session CLI and authenticated API server;
-- Node.js >=20;
+- Node.js >=22.13 (for the built-in `node:sqlite` transaction mutex);
 - `@modelcontextprotocol/sdk` 1.30.0;
 - OpenAI `tunnel-client`.
 
