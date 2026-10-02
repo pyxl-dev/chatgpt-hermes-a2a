@@ -471,7 +471,9 @@ function recoveredNativeRunPayload(active, result) {
         sessionId: active.sessionId || null,
       },
       result,
-      Boolean(active.sessionId),
+      typeof active.reusedSession === "boolean"
+        ? active.reusedSession
+        : Boolean(active.sessionId),
     );
   }
   if (active?.tool === "continue_hermes_session") {
@@ -506,9 +508,15 @@ async function waitForNativeRun(runId) {
   let lastResult = null;
   let lastError = null;
 
-  while (Date.now() < deadline) {
+  while (true) {
+    const beforePoll = Date.now();
+    const remainingBeforePoll = deadline - beforePoll;
+    if (remainingBeforePoll <= 0) break;
+
     try {
-      lastResult = await control.getRun(runId);
+      lastResult = await control.getRun(runId, {
+        timeoutMs: remainingBeforePoll,
+      });
       lastError = null;
       if (runIsTerminal(lastResult)) {
         return {
@@ -520,7 +528,10 @@ async function waitForNativeRun(runId) {
     } catch (error) {
       lastError = error;
     }
-    await sleep(NATIVE_DELEGATE_POLL_MS);
+
+    const remainingBeforeSleep = deadline - Date.now();
+    if (remainingBeforeSleep <= 0) break;
+    await sleep(Math.min(NATIVE_DELEGATE_POLL_MS, remainingBeforeSleep));
   }
 
   return {
