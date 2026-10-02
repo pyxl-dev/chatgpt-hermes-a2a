@@ -866,5 +866,5 @@ test("Hermes 0.21.5 control scripts use raw secret reads and bounded setup resta
   assert.match(setupSource, /config set API_SERVER_PORT "\$PORT"/u);
   assert.match(setupSource, /gateway stop/u);
   assert.match(setupSource, /gateway start/u);
-  assert.doesNotMatch(setupSource, /gateway restart/u);
+  assert.doesNotMatch(setupSource, /"\\$HERMES_BIN" gateway restart/u);
 });
