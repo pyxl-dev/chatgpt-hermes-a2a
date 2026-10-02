@@ -1229,6 +1229,83 @@ test("coordinator transactions preserve concurrent independent conversations", a
   await fs.rm(root, { recursive: true, force: true });
 });
 
+test("waiting for another process mutex does not block the event loop", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-ipc-yield-"));
+  const runtimeDir = path.join(root, ".runtime");
+  const statePath = path.join(runtimeDir, "chatgpt-session-coordinator.json");
+  const mutexPath = statePath + ".mutex.sqlite";
+  const readyPath = path.join(root, "holder-ready");
+  await fs.mkdir(runtimeDir, { recursive: true });
+
+  const child = spawn(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `
+        import fs from "node:fs/promises";
+        import { DatabaseSync } from "node:sqlite";
+        const [mutexPath, readyPath] = process.argv.slice(1);
+        const database = new DatabaseSync(mutexPath);
+        database.exec("BEGIN IMMEDIATE");
+        await fs.writeFile(readyPath, "ready");
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        database.exec("COMMIT");
+        database.close();
+      `,
+      mutexPath,
+      readyPath,
+    ],
+    { stdio: ["ignore", "ignore", "pipe"] },
+  );
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+  const childDone = new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error("mutex holder failed: " + stderr));
+    });
+  });
+
+  const deadline = Date.now() + 2_000;
+  while (true) {
+    try {
+      await fs.access(readyPath);
+      break;
+    } catch {
+      if (Date.now() >= deadline) {
+        child.kill("SIGKILL");
+        throw new Error("mutex holder did not become ready");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  let counter = 0;
+  const coordinator = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "yield-" + ++counter,
+  });
+  const beginPromise = coordinator.begin(coordinator.scopeFromMeta(metaA), {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "wait without blocking loop",
+  });
+  const first = await Promise.race([
+    beginPromise.then(() => "begin"),
+    new Promise((resolve) => setTimeout(() => resolve("timer"), 50)),
+  ]);
+  assert.equal(first, "timer");
+
+  const lease = await beginPromise;
+  assert.ok(lease.operationId);
+  await childDone;
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 test("coordinator mutex is released automatically when a process exits", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-ipc-crash-"));
   const runtimeDir = path.join(root, ".runtime");
