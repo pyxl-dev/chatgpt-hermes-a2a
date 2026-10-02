@@ -39,7 +39,7 @@ The wrapper exposes exactly 10 tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `delegate_to_hermes` | Ordinary synchronous work in the ChatGPT conversation's durable Hermes session |
+| `delegate_to_hermes` | Ordinary work in the durable Hermes session; waits up to 90s, then hands back the active `runId` for polling |
 | `list_hermes_sessions` | Discover persisted Hermes sessions |
 | `get_hermes_session` | Read a persisted Hermes session |
 | `continue_hermes_session` | Continue a specific durable Hermes session through the Runs API |
@@ -71,6 +71,8 @@ Important invariants:
 - a different explicit `sessionId` is rejected;
 - ambiguous POST delivery keeps the conversation locked for an exact idempotent retry;
 - a known active `runId` remains locked until a terminal Run state is observed;
+- an exact normalized retry of the same in-flight operation reuses that active `runId` instead of returning `HERMES_SESSION_BUSY` or submitting duplicate work;
+- synchronous delegation waits at most 90 seconds, then returns a successful nonterminal handoff (`pending: true`, `runId`, `pollWith: "get_hermes_run"`) while the Run continues locally;
 - successful terminal results can be replayed for the bounded deduplication window, including across a bridge restart;
 - failed/rejected/cancelled/interrupted results are never replayed as success;
 - persisted replay payloads expire and are globally pruned.
