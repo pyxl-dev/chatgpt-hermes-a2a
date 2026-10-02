@@ -55,7 +55,7 @@ if [[ -z "${API_SERVER_KEY:-}" ]]; then
   DETECTED_API_KEY="$(read_hermes_env_value API_SERVER_KEY)"
   HERMES_BIN_FOR_SECRET="$(command -v hermes || true)"
   if [[ -z "$DETECTED_API_KEY" && -n "$HERMES_BIN_FOR_SECRET" ]]; then
-    DETECTED_API_KEY="$("$HERMES_BIN_FOR_SECRET" config get API_SERVER_KEY 2>/dev/null || true)"
+    DETECTED_API_KEY="$("$HERMES_BIN_FOR_SECRET" config get API_SERVER_KEY --raw 2>/dev/null || true)"
   fi
   if [[ -n "$DETECTED_API_KEY" ]]; then
     export API_SERVER_KEY="$DETECTED_API_KEY"
