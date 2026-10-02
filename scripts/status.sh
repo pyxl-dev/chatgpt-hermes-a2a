@@ -74,11 +74,10 @@ fi
 if ! valid_port "$API_PORT"; then
   API_PORT="8642"
 fi
-API_URL="${HERMES_API_SERVER_URL:-}"
+API_URL="$(node -e 'process.stdout.write(String(process.argv[1] || "").trim().replace(/\/+$/u, ""))' "${HERMES_API_SERVER_URL:-}")"
 if [[ -z "$API_URL" ]]; then
   API_URL="http://127.0.0.1:$API_PORT"
 fi
-API_URL="$(node -e 'process.stdout.write(String(process.argv[1] || "").trim().replace(/\/+$/u, ""))' "$API_URL")"
 
 NATIVE_READY=0
 CAPABILITIES_JSON=""
