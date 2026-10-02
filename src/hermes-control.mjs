@@ -101,6 +101,15 @@ export function createHermesControl({ redactText, redactValue }) {
     let requestHeaders;
     try {
       requestUrl = new URL(apiUrl + path);
+      if (
+        !["http:", "https:"].includes(requestUrl.protocol) ||
+        requestUrl.username !== "" ||
+        requestUrl.password !== ""
+      ) {
+        throw new Error(
+          "Hermes control API URL must use HTTP(S) and must not contain credentials",
+        );
+      }
       requestHeaders = new Headers({
         Authorization: "Bearer " + apiKey,
         Accept: "application/json",

@@ -368,6 +368,114 @@ test("malformed control URL fails definitively before submission", async () => {
   }
 });
 
+test("unsupported control URLs fail definitively before submission", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    for (const [label, url] of [
+      ["unsupported protocol", "ftp://hermes.example"],
+      ["embedded credentials", "http://user:pass@hermes.example"],
+    ]) {
+      process.env.HERMES_API_SERVER_URL = url;
+      let fetchCalled = false;
+      globalThis.fetch = async () => {
+        fetchCalled = true;
+        throw new Error("fetch should not be called");
+      };
+
+      const control = createHermesControl({
+        redactText: String,
+        redactValue: (value) => value,
+      });
+
+      await assert.rejects(
+        control.startRun("work", null, "scope"),
+        (error) => error?.deliveryAmbiguous === false,
+        label + " should be a definitive setup failure",
+      );
+      assert.equal(fetchCalled, false, label + " should be rejected before fetch");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
+
+test("setup script rejects capabilities without run_status", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-setup-run-status-"));
+  const hermesPath = path.join(tempDir, "hermes");
+  const curlPath = path.join(tempDir, "curl");
+  try {
+    await writeFile(
+      hermesPath,
+      "#!/bin/bash\n" +
+        "case \"$1:$2\" in\n" +
+        "  config:env-path) printf '%s\\n' \"$SETUP_ENV_FILE\" ;;\n" +
+        "  config:get)\n" +
+        "    case \"$3\" in\n" +
+        "      API_SERVER_KEY) printf '%s\\n' test-key ;;\n" +
+        "      API_SERVER_PORT) printf '%s\\n' 8642 ;;\n" +
+        "      *) exit 1 ;;\n" +
+        "    esac ;;\n" +
+        "  config:set|gateway:restart) exit 0 ;;\n" +
+        "  *) exit 0 ;;\n" +
+        "esac\n",
+      "utf8",
+    );
+    await chmod(hermesPath, 0o755);
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "if [[ \"$url\" == */v1/capabilities ]]; then\n" +
+        "  printf '%s\\n' \"$SETUP_CAPABILITIES\"\n" +
+        "fi\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+
+    const result = spawnSync(
+      "bash",
+      [path.join(projectRoot, "scripts", "setup-hermes-control.sh")],
+      {
+        cwd: projectRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: tempDir,
+          PATH: tempDir + path.delimiter + process.env.PATH,
+          HERMES_BIN: hermesPath,
+          SETUP_ENV_FILE: path.join(tempDir, ".env"),
+          SETUP_CAPABILITIES:
+            '{"features":{"run_submission":true,"run_status":false,' +
+            '"run_stop":true,"run_steer":true}}',
+        },
+      },
+    );
+
+    assert.notEqual(result.status, 0, "missing run_status must fail setup");
+    assert.match(
+      result.stderr + result.stdout,
+      /required Runs API capabilities are missing/u,
+    );
+    assert.doesNotMatch(result.stdout, /Run submission: READY/u);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test("invalid authorization header fails definitively before submission", async () => {
   const originalFetch = globalThis.fetch;
   const originalKey = process.env.HERMES_API_SERVER_KEY;

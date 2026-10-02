@@ -98,6 +98,7 @@ try {
   const endpoints = data.endpoints || {};
   const ok =
     features.run_submission === true &&
+    features.run_status === true &&
     features.run_stop === true &&
     (features.run_steer === true || Boolean(endpoints.run_steer));
   process.exit(ok ? 0 : 1);
