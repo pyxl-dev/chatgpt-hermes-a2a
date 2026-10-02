@@ -615,7 +615,7 @@ async function reuseActiveNativeRun(
         ? nativeDelegateResult(
             started,
             current,
-            Boolean(lease.sessionIdToUse),
+            lease.reusedSession === true,
           )
         : {
             ...current,
@@ -753,7 +753,7 @@ async function executeSynchronousNative(
         : nativeDelegateResult(
             started,
             completed,
-            Boolean(lease.sessionIdToUse),
+            lease.reusedSession === true,
           );
 
     await sessionCoordinator.complete(
