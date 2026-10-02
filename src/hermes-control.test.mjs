@@ -288,7 +288,7 @@ test("control smoke accepts both cancellation spellings", async () => {
   );
   assert.match(
     source,
-    /if \(!terminalStatuses\.has\(terminal\.status\)\)/u,
+    /\["cancelled", "canceled"\]\.includes\(terminal\.status\)/u,
   );
 });
 
@@ -379,6 +379,60 @@ test("status script falls back when API URL is whitespace only", async () => {
     );
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("terminal submission with run id preserves returned terminal payload", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          run_id: "run-completed",
+          session_id: "session-completed",
+          status: "completed",
+          output: "done immediately",
+          usage: { total_tokens: 7 },
+          last_event: "run.completed",
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+
+    const nativeControl = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+    const result = await nativeControl.startRun(
+      "immediate completion",
+      null,
+      "scope",
+    );
+
+    assert.equal(result.runId, "run-completed");
+    assert.equal(result.sessionId, "session-completed");
+    assert.equal(result.status, "completed");
+    assert.equal(result.output, "done immediately");
+    assert.deepEqual(result.usage, { total_tokens: 7 });
+    assert.equal(result.lastEvent, "run.completed");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
   }
 });
 

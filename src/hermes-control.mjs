@@ -259,6 +259,12 @@ export function createHermesControl({ redactText, redactValue }) {
       runId,
       sessionId: payload?.session_id || durableSessionId || null,
       status,
+      output: payload?.output || null,
+      error: payload?.error || null,
+      usage: payload?.usage || null,
+      pendingSteer: payload?.pending_steer || null,
+      lastEvent: payload?.last_event || null,
+      approval: payload?.approval || null,
       replayed: payload?.replayed === true,
     };
   }

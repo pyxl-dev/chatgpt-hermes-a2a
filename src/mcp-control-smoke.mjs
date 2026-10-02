@@ -188,9 +188,9 @@ try {
     error: terminal.error || null,
   };
 
-  if (!terminalStatuses.has(terminal.status) || terminal.status === "completed") {
+  if (!["cancelled", "canceled"].includes(terminal.status)) {
     throw new Error(
-      "Expected stopped run to settle in a cancellation/failure terminal state; got " +
+      "Expected stopped run to settle as cancelled/canceled; got " +
         terminal.status,
     );
   }
