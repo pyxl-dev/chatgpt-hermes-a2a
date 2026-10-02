@@ -814,3 +814,32 @@ test("invalid authorization header fails definitively before submission", async 
     }
   }
 });
+
+
+test("bridge clears stale run_not_found leases and preserves explicit pending handoff", async () => {
+  const source = await readFile(
+    path.join(projectRoot, "src", "hermes-mcp.mjs"),
+    "utf8",
+  );
+
+  assert.match(
+    source,
+    /function nativeRunNotFoundError\(error\)[\s\S]*run_not_found/su,
+  );
+  assert.match(
+    source,
+    /if \(nativeRunNotFoundError\(error\)\) \{[\s\S]*terminal: true,[\s\S]*runMissing: true/su,
+  );
+  assert.match(
+    source,
+    /HERMES_NATIVE_RUN_NOT_FOUND_RECOVERED/su,
+  );
+  assert.match(
+    source,
+    /handoffReason: "synchronous_wait_exhausted"/su,
+  );
+  assert.match(
+    source,
+    /nextAction:[\s\S]*get_hermes_run[\s\S]*Do not resubmit or stop/su,
+  );
+});
