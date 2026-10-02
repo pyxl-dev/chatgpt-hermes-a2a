@@ -729,7 +729,7 @@ test("setup script rejects capabilities without run_status", async () => {
         "      API_SERVER_PORT) printf '%s\\n' 8642 ;;\n" +
         "      *) exit 1 ;;\n" +
         "    esac ;;\n" +
-        "  config:set|gateway:restart) exit 0 ;;\n" +
+        "  config:set|gateway:stop|gateway:start) exit 0 ;;\n" +
         "  *) exit 0 ;;\n" +
         "esac\n",
       "utf8",
@@ -842,4 +842,29 @@ test("bridge clears stale run_not_found leases and preserves explicit pending ha
     source,
     /nextAction:[\s\S]*get_hermes_run[\s\S]*Do not resubmit or stop/su,
   );
+});
+
+
+test("Hermes 0.21.5 control scripts use raw secret reads and bounded setup restart", async () => {
+  const setupSource = await readFile(
+    path.join(projectRoot, "scripts", "setup-hermes-control.sh"),
+    "utf8",
+  );
+  const startSource = await readFile(
+    path.join(projectRoot, "scripts", "start-bridge.sh"),
+    "utf8",
+  );
+  const statusSource = await readFile(
+    path.join(projectRoot, "scripts", "status.sh"),
+    "utf8",
+  );
+
+  assert.match(setupSource, /config get "\$key" --raw/u);
+  assert.match(startSource, /config get API_SERVER_KEY --raw/u);
+  assert.match(statusSource, /config get API_SERVER_KEY --raw/u);
+  assert.match(setupSource, /config set API_SERVER_HOST 127\.0\.0\.1/u);
+  assert.match(setupSource, /config set API_SERVER_PORT "\$PORT"/u);
+  assert.match(setupSource, /gateway stop/u);
+  assert.match(setupSource, /gateway start/u);
+  assert.doesNotMatch(setupSource, /gateway restart/u);
 });
