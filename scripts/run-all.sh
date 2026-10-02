@@ -21,19 +21,22 @@ if (( NODE_MAJOR < 20 )); then
   exit 2
 fi
 
-echo "[1/5] Installing pinned Node dependencies"
+echo "[1/6] Installing pinned Node dependencies"
 npm install --no-package-lock --no-audit --no-fund
 
-echo "[2/5] Configuring/verifying Hermes native Runs API"
+echo "[2/6] Configuring/verifying Hermes native Runs API"
 bash "$ROOT/scripts/setup-hermes-control.sh"
 
-echo "[3/5] Running unit tests"
+echo "[3/6] Running unit tests"
 npm test
 
-echo "[4/5] Running syntax checks"
+echo "[4/6] Running syntax checks"
 npm run check
 
-echo "[5/5] Running native MCP smoke"
+echo "[5/6] Running native control smoke"
+npm run smoke:control
+
+echo "[6/6] Running native MCP smoke"
 npm run smoke
 
 echo
