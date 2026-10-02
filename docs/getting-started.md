@@ -207,6 +207,8 @@ Then delegate something harmless:
 Use delegate_to_hermes and ask Hermes to inspect the current project status without modifying files.
 ```
 
+`delegate_to_hermes` waits up to 90 seconds. If Hermes is still working, the tool returns `pending: true` with the active `runId` instead of failing the MCP call; continue with `get_hermes_run`. If the same tool invocation is retried while that Run is active, the bridge reuses the same `runId` rather than submitting the work again.
+
 For persisted-session discovery:
 
 1. `list_hermes_sessions`
