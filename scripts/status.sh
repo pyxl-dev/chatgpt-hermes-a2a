@@ -58,7 +58,7 @@ HERMES_ENV_FILE="$(resolve_hermes_env_file)"
 API_KEY="${HERMES_API_SERVER_KEY:-${API_SERVER_KEY:-$(read_env_value API_SERVER_KEY "$HERMES_ENV_FILE")}}"
 HERMES_BIN_FOR_CONFIG="$(command -v hermes || true)"
 if [[ -z "$API_KEY" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
-  API_KEY="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_KEY 2>/dev/null || true)"
+  API_KEY="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_KEY --raw 2>/dev/null || true)"
 fi
 
 API_PORT="${API_SERVER_PORT:-}"
