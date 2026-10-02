@@ -95,6 +95,11 @@ export function createHermesSessionCoordinator({
     path.join(runtimeDir, "chatgpt-session-coordinator.json");
 
   const replayWindowMs = normalizedDedupWindowMs(dedupWindowMs);
+  const stateLockPath = filePath + ".lock";
+  const stateLockOwnerPath = path.join(stateLockPath, "owner.json");
+  const stateLockRetryMs = 25;
+  const stateLockWaitMs = 90_000;
+  const ownerlessLockStaleMs = 10_000;
 
   const state = { version: 3, sessions: {}, recentResults: {} };
   const instanceId = randomUUID();
@@ -248,48 +253,163 @@ export function createHermesSessionCoordinator({
     await writeChain;
   }
 
+  function resetState() {
+    state.version = 3;
+    state.sessions = {};
+    state.recentResults = {};
+  }
+
+  async function loadStateFromDisk({ persistRepairs = false } = {}) {
+    resetState();
+    let migrated = false;
+
+    try {
+      const raw = await fs.readFile(filePath, "utf8");
+      const parsed = JSON.parse(raw);
+
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw coordinatorError(
+          "HERMES_COORDINATOR_STATE_INVALID",
+          "Hermes coordinator state is not a valid object.",
+        );
+      }
+
+      if (![1, 2, 3].includes(parsed.version)) {
+        throw coordinatorError(
+          "HERMES_COORDINATOR_STATE_VERSION_UNSUPPORTED",
+          "Hermes coordinator state uses an unsupported schema version; refusing to overwrite it.",
+          { version: parsed.version ?? null },
+        );
+      }
+
+      if (
+        !parsed.sessions ||
+        typeof parsed.sessions !== "object" ||
+        Array.isArray(parsed.sessions)
+      ) {
+        throw coordinatorError(
+          "HERMES_COORDINATOR_STATE_INVALID",
+          "Hermes coordinator state has an invalid sessions object.",
+          { version: parsed.version },
+        );
+      }
+
+      if (parsed.version === 1) {
+        migrateV1(parsed);
+        migrated = true;
+      } else if (parsed.version === 2) {
+        state.sessions = parsed.sessions;
+        state.recentResults = migrateLegacyRecentResults(
+          parsed.recentResults,
+        );
+        state.version = 3;
+        migrated = true;
+      } else {
+        state.sessions = parsed.sessions;
+        state.recentResults =
+          parsed.recentResults &&
+          typeof parsed.recentResults === "object" &&
+          !Array.isArray(parsed.recentResults)
+            ? parsed.recentResults
+            : {};
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+
+    const pruned = pruneExpiredRecentResults();
+    if (persistRepairs && (migrated || pruned)) await persist();
+  }
+
+  async function lockOwnerIsAlive() {
+    try {
+      const owner = JSON.parse(await fs.readFile(stateLockOwnerPath, "utf8"));
+      const pid = Number(owner?.pid);
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, 0);
+          return true;
+        } catch (error) {
+          if (error?.code === "ESRCH") return false;
+          return true;
+        }
+      }
+    } catch {
+      // The owner file may not exist yet between mkdir() and writeFile().
+    }
+
+    try {
+      const stat = await fs.stat(stateLockPath);
+      return Date.now() - stat.mtimeMs <= ownerlessLockStaleMs;
+    } catch (error) {
+      return error?.code !== "ENOENT";
+    }
+  }
+
+  async function acquireStateFileLock() {
+    await fs.mkdir(path.dirname(filePath), {
+      recursive: true,
+      mode: 0o700,
+    });
+
+    const deadline = Date.now() + stateLockWaitMs;
+    while (true) {
+      try {
+        await fs.mkdir(stateLockPath, { mode: 0o700 });
+        try {
+          await fs.writeFile(
+            stateLockOwnerPath,
+            JSON.stringify({
+              pid: process.pid,
+              instanceId,
+              acquiredAt: new Date().toISOString(),
+            }) + "\n",
+            { encoding: "utf8", mode: 0o600 },
+          );
+        } catch (error) {
+          await fs.rm(stateLockPath, { recursive: true, force: true });
+          throw error;
+        }
+
+        let released = false;
+        return async () => {
+          if (released) return;
+          released = true;
+          await fs.rm(stateLockPath, { recursive: true, force: true });
+        };
+      } catch (error) {
+        if (error?.code !== "EEXIST") throw error;
+
+        if (!(await lockOwnerIsAlive())) {
+          await fs.rm(stateLockPath, { recursive: true, force: true });
+          continue;
+        }
+
+        if (Date.now() >= deadline) {
+          throw coordinatorError(
+            "HERMES_COORDINATOR_LOCK_TIMEOUT",
+            "Timed out waiting for the Hermes coordinator interprocess state lock.",
+            { lockPath: stateLockPath },
+          );
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, stateLockRetryMs));
+      }
+    }
+  }
+
   async function ensureLoaded() {
     if (loaded) return;
     if (loadPromise) return loadPromise;
 
     loadPromise = (async () => {
-      let migrated = false;
+      const releaseStateLock = await acquireStateFileLock();
       try {
-        const raw = await fs.readFile(filePath, "utf8");
-        const parsed = JSON.parse(raw);
-        if (
-          parsed &&
-          parsed.sessions &&
-          typeof parsed.sessions === "object" &&
-          !Array.isArray(parsed.sessions)
-        ) {
-          if (parsed.version === 1) {
-            migrateV1(parsed);
-            migrated = true;
-          } else if (parsed.version === 2) {
-            state.sessions = parsed.sessions;
-            state.recentResults = migrateLegacyRecentResults(
-              parsed.recentResults,
-            );
-            state.version = 3;
-            migrated = true;
-          } else if (parsed.version === 3) {
-            state.sessions = parsed.sessions;
-            state.recentResults =
-              parsed.recentResults &&
-              typeof parsed.recentResults === "object" &&
-              !Array.isArray(parsed.recentResults)
-                ? parsed.recentResults
-                : {};
-          }
-        }
-      } catch (error) {
-        if (error?.code !== "ENOENT") throw error;
+        await loadStateFromDisk({ persistRepairs: true });
+        loaded = true;
+      } finally {
+        await releaseStateLock();
       }
-
-      const pruned = pruneExpiredRecentResults();
-      loaded = true;
-      if (migrated || pruned) await persist();
     })();
 
     try {
@@ -308,9 +428,14 @@ export function createHermesSessionCoordinator({
     const queued = previous.catch(() => {}).then(() => current);
     locks.set(sessionHash, queued);
     await previous.catch(() => {});
+
+    let releaseStateLock = null;
     try {
+      releaseStateLock = await acquireStateFileLock();
+      await loadStateFromDisk({ persistRepairs: true });
       return await fn();
     } finally {
+      if (releaseStateLock) await releaseStateLock();
       release();
       if (locks.get(sessionHash) === queued) locks.delete(sessionHash);
     }
@@ -423,8 +548,9 @@ export function createHermesSessionCoordinator({
         let reconciled = null;
         try {
           reconciled = await reconcileActive(activeSummary(record.active));
-        } catch {
-          // A status failure is not evidence that the active Run ended.
+        } catch (error) {
+          if (error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH") throw error;
+          // A transient status failure is not evidence that the active Run ended.
         }
 
         if (reconciled) {

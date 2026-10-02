@@ -1054,6 +1054,116 @@ test("all live replay results remain available inside the dedup window", async (
   assert.equal(lastReplay.replayPayload.runId, "run-69");
 });
 
+test("coordinator serializes leases across independent bridge instances", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-ipc-"));
+  let aCounter = 0;
+  let bCounter = 0;
+  const coordinatorA = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "a-" + ++aCounter,
+  });
+  const coordinatorB = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "b-" + ++bCounter,
+  });
+  const scopeA = coordinatorA.scopeFromMeta(metaA);
+  const scopeB = coordinatorB.scopeFromMeta(metaA);
+
+  const results = await Promise.allSettled([
+    coordinatorA.begin(scopeA, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "bridge A work",
+    }),
+    coordinatorB.begin(scopeB, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "bridge B work",
+    }),
+  ]);
+
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  const rejection = results.find((result) => result.status === "rejected");
+  assert.equal(rejection?.reason?.code, "HERMES_SESSION_BUSY");
+
+  const disk = await readCoordinatorState(root);
+  assert.equal(Object.keys(disk.sessions).length, 1);
+  assert.ok(disk.sessions[scopeA.sessionHash]?.active?.operationId);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("coordinator transactions preserve concurrent independent conversations", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-ipc-independent-"));
+  let aCounter = 0;
+  let bCounter = 0;
+  const coordinatorA = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "a-" + ++aCounter,
+  });
+  const coordinatorB = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "b-" + ++bCounter,
+  });
+
+  const [leaseA, leaseB] = await Promise.all([
+    coordinatorA.begin(coordinatorA.scopeFromMeta(metaA), {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "conversation A",
+    }),
+    coordinatorB.begin(coordinatorB.scopeFromMeta(metaB), {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "conversation B",
+    }),
+  ]);
+
+  assert.ok(leaseA.operationId);
+  assert.ok(leaseB.operationId);
+  const disk = await readCoordinatorState(root);
+  assert.equal(Object.keys(disk.sessions).length, 2);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("unknown coordinator state versions fail closed without overwrite", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-native-future-state-"));
+  const statePath = path.join(
+    root,
+    ".runtime",
+    "chatgpt-session-coordinator.json",
+  );
+  await fs.mkdir(path.dirname(statePath), { recursive: true });
+  await fs.writeFile(
+    statePath,
+    JSON.stringify({
+      version: 4,
+      sessions: {
+        future: {
+          canonicalSessionId: "future-session",
+          active: { kind: "run", runId: "future-run" },
+        },
+      },
+      recentResults: {},
+    }, null, 2) + "\n",
+  );
+
+  let counter = 0;
+  const coordinator = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "future-" + ++counter,
+  });
+
+  await assert.rejects(
+    coordinator.inspect(coordinator.scopeFromMeta(metaA)),
+    (error) => error?.code === "HERMES_COORDINATOR_STATE_VERSION_UNSUPPORTED",
+  );
+
+  const untouched = JSON.parse(await fs.readFile(statePath, "utf8"));
+  assert.equal(untouched.version, 4);
+  assert.equal(untouched.sessions.future.active.runId, "future-run");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 test("v1 native state migrates and v1 A2A state is dropped", async () => {
   const { root, coordinator } = await makeCoordinator();
   const scopeA = coordinator.scopeFromMeta(metaA);

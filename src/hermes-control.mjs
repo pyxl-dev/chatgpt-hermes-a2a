@@ -81,6 +81,27 @@ export function createHermesControl({ redactText, redactValue }) {
     }
   }
 
+  function assertReturnedRunId(expectedRunId, payload, operation) {
+    const rawReturnedRunId = payload?.run_id ?? payload?.id ?? null;
+    const returnedRunId =
+      typeof rawReturnedRunId === "string"
+        ? rawReturnedRunId.trim()
+        : "";
+    if (returnedRunId && returnedRunId !== expectedRunId) {
+      const error = new Error(
+        "Hermes returned a different runId than the requested Run.",
+      );
+      error.code = "HERMES_NATIVE_RUN_ID_MISMATCH";
+      error.deliveryAmbiguous = false;
+      error.details = {
+        operation,
+        expectedRunId,
+        returnedRunId,
+      };
+      throw error;
+    }
+  }
+
   async function request(
     path,
     {
@@ -274,6 +295,7 @@ export function createHermesControl({ redactText, redactValue }) {
     const payload = await request("/v1/runs/" + encodeURIComponent(id), {
       timeoutOverrideMs,
     });
+    assertReturnedRunId(id, payload, "get_hermes_run");
     return {
       ok: true,
       operation: "get_hermes_run",
@@ -316,6 +338,7 @@ export function createHermesControl({ redactText, redactValue }) {
       "/v1/runs/" + encodeURIComponent(id) + "/stop",
       { method: "POST", body: {} },
     );
+    assertReturnedRunId(id, payload, "stop_hermes_run");
     return {
       ok: true,
       operation: "stop_hermes_run",

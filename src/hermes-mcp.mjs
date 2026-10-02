@@ -526,6 +526,7 @@ async function waitForNativeRun(runId) {
         };
       }
     } catch (error) {
+      if (error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH") throw error;
       lastError = error;
     }
 
@@ -569,6 +570,7 @@ async function reuseActiveNativeRun(
   try {
     current = await control.getRun(lease.runId);
   } catch (error) {
+    if (error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH") throw error;
     pollError = error;
   }
 

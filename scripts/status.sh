@@ -109,9 +109,13 @@ if [[ -n "$CAPABILITIES_JSON" ]] &&
      const fs = require("fs");
      try {
        const payload = JSON.parse(fs.readFileSync(0, "utf8"));
+       const features = payload?.features || {};
+       const endpoints = payload?.endpoints || {};
        process.exit(
-         payload?.features?.run_submission === true &&
-         payload?.features?.run_status === true
+         features.run_submission === true &&
+         features.run_status === true &&
+         features.run_stop === true &&
+         (features.run_steer === true || Boolean(endpoints.run_steer))
            ? 0
            : 1
        );
