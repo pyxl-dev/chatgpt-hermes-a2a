@@ -7,7 +7,14 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, "..");
 const bridge = path.join(root, "scripts", "start-bridge.sh");
 const timeoutMs = Number(process.env.HERMES_CONTROL_SMOKE_TIMEOUT_MS || 45000);
-const terminalStatuses = new Set(["completed", "failed", "cancelled", "interrupted"]);
+const terminalStatuses = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "canceled",
+  "interrupted",
+  "rejected",
+]);
 
 const childEnv = Object.fromEntries(
   Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
@@ -114,7 +121,7 @@ try {
     "CONTROL SMOKE " +
     nonce +
     ": use your local terminal tool to run exactly " +
-    '`python3 -c "import time; time.sleep(60)"`' +
+    '`node -e "setTimeout(() => {}, 60000)"`' +
     ". Do not create, edit, or delete any files. After the command finishes, reply exactly CONTROL_SMOKE_NATURAL_COMPLETION.";
 
   const startResult = await client.callTool({
@@ -181,9 +188,10 @@ try {
     error: terminal.error || null,
   };
 
-  if (terminal.status !== "cancelled") {
+  if (!["cancelled", "canceled"].includes(terminal.status)) {
     throw new Error(
-      "Expected stopped run to settle as cancelled; got " + terminal.status,
+      "Expected stopped run to settle as cancelled/canceled; got " +
+        terminal.status,
     );
   }
 
