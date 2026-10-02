@@ -69,6 +69,13 @@ Session coordination is persisted at:
 
 Permissions are restricted to the current user where supported.
 
+Cross-process coordinator writes are serialized by a separate SQLite mutex
+file next to the JSON state. The mutex database contains no prompts, Run
+payloads or session records. SQLite transaction locks are owned by the
+operating system and are released when a bridge process exits. Hermes network
+requests are never made while that global transaction is held; any remote
+reconciliation result is applied only after the active lease is revalidated.
+
 State version 3 contains hashed ChatGPT session keys, canonical Hermes session IDs, active native Run metadata and a time-bounded replay map keyed by operation fingerprint. All still-live replay entries are retained until expiry so a later successful operation cannot make an earlier exact retry execute again.
 
 When upgrading from the former mixed native/A2A schema or the intermediate native version-2 schema, native state is migrated, old A2A context/task state is discarded, and legacy single-slot replay is converted to the version-3 per-fingerprint map.
