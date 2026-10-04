@@ -569,6 +569,15 @@ async function reconcileCoordinatorActive(active) {
       };
     } catch (error) {
       if (nativeRunNotFoundError(error)) {
+        if (active.kind === "native-session-unresolved") {
+          return {
+            terminal: false,
+            sessionId: active.sessionId || null,
+            replayPayload: null,
+            runMissing: true,
+            preserveUnresolved: true,
+          };
+        }
         return {
           terminal: true,
           sessionId: active.sessionId || null,
@@ -698,6 +707,29 @@ async function releaseOrPreserveSubmissionFailure(
   }
 }
 
+async function preserveKnownSubmittedRun(
+  sessionScope,
+  operationId,
+  runId,
+  sessionId,
+  originalError,
+) {
+  try {
+    await sessionCoordinator.preserveSubmittedRun(
+      sessionScope,
+      operationId,
+      { runId, sessionId },
+    );
+  } catch (recoveryError) {
+    if (originalError && typeof originalError === "object") {
+      originalError.details = {
+        ...(originalError.details || {}),
+        coordinatorRecoveryError: errorMessage(recoveryError),
+      };
+    }
+  }
+}
+
 async function executeSynchronousNative(
   {
     operation,
@@ -734,7 +766,9 @@ async function executeSynchronousNative(
   }
 
   let runSubmitted = false;
+  let runRecorded = false;
   let runId = null;
+  let submittedSessionId = null;
   try {
     const started = await control.startRun(
       instruction,
@@ -743,6 +777,8 @@ async function executeSynchronousNative(
     );
     runId = requireNativeRunId(started, sessionScope);
     runSubmitted = true;
+    submittedSessionId =
+      started.sessionId || lease.sessionIdToUse || null;
 
     if (runIsTerminal(started)) {
       if (!nativeRunSucceeded(started)) {
@@ -756,6 +792,7 @@ async function executeSynchronousNative(
             runId,
           },
         );
+        runRecorded = true;
         throw nativeRunFailureError(started, runId, sessionScope);
       }
 
@@ -782,6 +819,7 @@ async function executeSynchronousNative(
           runId,
         },
       );
+      runRecorded = true;
       return result;
     }
 
@@ -797,6 +835,7 @@ async function executeSynchronousNative(
         activeKind: "run",
       },
     );
+    runRecorded = true;
 
     const waited = await waitForNativeRun(runId);
     if (!waited.terminal) {
@@ -857,12 +896,23 @@ async function executeSynchronousNative(
         lease.operationId,
         error,
       );
-    } else if (!error?.details?.runId) {
-      error.details = {
-        ...(error?.details || {}),
-        runId,
-        sessionHash: sessionScope?.sessionHash || null,
-      };
+    } else {
+      if (!runRecorded) {
+        await preserveKnownSubmittedRun(
+          sessionScope,
+          lease.operationId,
+          runId,
+          submittedSessionId,
+          error,
+        );
+      }
+      if (!error?.details?.runId) {
+        error.details = {
+          ...(error?.details || {}),
+          runId,
+          sessionHash: sessionScope?.sessionHash || null,
+        };
+      }
     }
     throw error;
   }
@@ -931,7 +981,9 @@ async function executePublicTool(name, args, traceId, sessionScope) {
       }
 
       let submitted = false;
+      let runRecorded = false;
       let runId = null;
+      let submittedSessionId = null;
       try {
         const result = await control.startRun(
           instruction,
@@ -940,6 +992,8 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         );
         runId = requireNativeRunId(result, sessionScope);
         submitted = true;
+        submittedSessionId =
+          result.sessionId || lease.sessionIdToUse || null;
         const terminal = runIsTerminal(result);
 
         await sessionCoordinator.complete(
@@ -954,6 +1008,7 @@ async function executePublicTool(name, args, traceId, sessionScope) {
             activeKind: !terminal ? "run" : null,
           },
         );
+        runRecorded = true;
 
         if (terminal && !nativeRunSucceeded(result)) {
           throw nativeRunFailureError(result, runId, sessionScope);
@@ -966,12 +1021,23 @@ async function executePublicTool(name, args, traceId, sessionScope) {
             lease.operationId,
             error,
           );
-        } else if (!error?.details?.runId) {
-          error.details = {
-            ...(error?.details || {}),
-            runId,
-            sessionHash: sessionScope?.sessionHash || null,
-          };
+        } else {
+          if (!runRecorded) {
+            await preserveKnownSubmittedRun(
+              sessionScope,
+              lease.operationId,
+              runId,
+              submittedSessionId,
+              error,
+            );
+          }
+          if (!error?.details?.runId) {
+            error.details = {
+              ...(error?.details || {}),
+              runId,
+              sessionHash: sessionScope?.sessionHash || null,
+            };
+          }
         }
         throw error;
       }
@@ -986,7 +1052,7 @@ async function executePublicTool(name, args, traceId, sessionScope) {
       } catch (error) {
         if (
           nativeRunNotFoundError(error) &&
-          ["run", "native-session-unresolved"].includes(before?.active?.kind) &&
+          before?.active?.kind === "run" &&
           before.active.runId === runId
         ) {
           await sessionCoordinator.observe(sessionScope, {
