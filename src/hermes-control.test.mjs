@@ -816,7 +816,7 @@ test("invalid authorization header fails definitively before submission", async 
 });
 
 
-test("bridge clears stale run_not_found leases and preserves explicit pending handoff", async () => {
+test("bridge clears ordinary missing runs but preserves unresolved session bindings", async () => {
   const source = await readFile(
     path.join(projectRoot, "src", "hermes-mcp.mjs"),
     "utf8",
@@ -828,11 +828,15 @@ test("bridge clears stale run_not_found leases and preserves explicit pending ha
   );
   assert.match(
     source,
-    /if \(nativeRunNotFoundError\(error\)\) \{[\s\S]*terminal: true,[\s\S]*runMissing: true/su,
+    /if \(active\.kind === "native-session-unresolved"\) \{[\s\S]*terminal: false,[\s\S]*preserveUnresolved: true/su,
   );
   assert.match(
     source,
     /HERMES_NATIVE_RUN_NOT_FOUND_RECOVERED/su,
+  );
+  assert.match(
+    source,
+    /before\?\.active\?\.kind === "run"[\s\S]*before\.active\.runId === runId/su,
   );
   assert.match(
     source,
@@ -841,6 +845,30 @@ test("bridge clears stale run_not_found leases and preserves explicit pending ha
   assert.match(
     source,
     /nextAction:[\s\S]*get_hermes_run[\s\S]*Do not resubmit or stop/su,
+  );
+});
+
+test("bridge preserves a returned runId if first coordinator persistence fails", async () => {
+  const source = await readFile(
+    path.join(projectRoot, "src", "hermes-mcp.mjs"),
+    "utf8",
+  );
+
+  assert.match(
+    source,
+    /async function preserveKnownSubmittedRun\([\s\S]*preserveSubmittedRun/su,
+  );
+  assert.match(
+    source,
+    /let runRecorded = false;[\s\S]*if \(!runRecorded\) \{[\s\S]*preserveKnownSubmittedRun/su,
+  );
+  const asyncStart = source.slice(
+    source.indexOf('case "start_hermes_run"'),
+    source.indexOf('case "get_hermes_run"'),
+  );
+  assert.match(
+    asyncStart,
+    /let runRecorded = false;[\s\S]*if \(!runRecorded\) \{[\s\S]*preserveKnownSubmittedRun/su,
   );
 });
 
