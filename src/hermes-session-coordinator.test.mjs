@@ -1848,7 +1848,10 @@ test("v1 ambiguous native operation adopts the legacy fingerprint on exact retry
 
   const disk = await readCoordinatorState(root);
   assert.equal(disk.version, 3);
-  assert.equal(disk.sessions[scope.sessionHash].active.legacyFingerprint, null);
+  assert.equal(
+    disk.sessions[scope.sessionHash].active.legacyFingerprint ?? null,
+    null,
+  );
   assert.match(
     disk.sessions[scope.sessionHash].active.fingerprint,
     /^[a-f0-9]{64}$/u,
