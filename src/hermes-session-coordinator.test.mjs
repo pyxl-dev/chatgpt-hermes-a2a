@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import { spawn } from "node:child_process";
 import os from "node:os";
@@ -47,6 +48,23 @@ async function readCoordinatorState(root) {
 
 const metaA = { "openai/session": "chat-a" };
 const metaB = { "openai/session": "chat-b" };
+
+function legacyV1Fingerprint(
+  mode,
+  instruction,
+  { contextId = "", sessionId = "", taskId = "" } = {},
+) {
+  const normalized = String(instruction || "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/gu, " ");
+  return createHash("sha256")
+    .update(
+      [mode, contextId, sessionId, taskId, normalized].join("\n"),
+      "utf8",
+    )
+    .digest("hex");
+}
 
 test("hashes raw ChatGPT session ids", async () => {
   const { coordinator } = await makeCoordinator();
@@ -1661,4 +1679,314 @@ test("assertActiveRun rejects unrelated run ids", async () => {
     coordinator.assertActiveRun(scope, "r2"),
     (error) => error?.code === "HERMES_RUN_MISMATCH",
   );
+});
+
+
+test("different bridge instance cannot steal a live native-pending exact lease", async () => {
+  const root = await fs.mkdtemp(
+    path.join(os.tmpdir(), "hermes-native-pending-owner-"),
+  );
+  let aCounter = 0;
+  let bCounter = 0;
+  const coordinatorA = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "owner-a-" + ++aCounter,
+  });
+  const coordinatorB = createHermesSessionCoordinator({
+    root,
+    randomUUID: () => "owner-b-" + ++bCounter,
+  });
+  const scopeA = coordinatorA.scopeFromMeta(metaA);
+  const scopeB = coordinatorB.scopeFromMeta(metaA);
+
+  const first = await coordinatorA.begin(scopeA, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "same pending work",
+  });
+
+  await assert.rejects(
+    coordinatorB.begin(scopeB, {
+      mode: "delegate_to_hermes",
+      tool: "delegate_to_hermes",
+      instruction: "same   pending work",
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+
+  const disk = await readCoordinatorState(root);
+  assert.equal(
+    disk.sessions[scopeA.sessionHash].active.operationId,
+    first.operationId,
+  );
+  assert.equal(
+    disk.sessions[scopeA.sessionHash].active.ownerInstanceId,
+    "owner-a-1",
+  );
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("known submitted run can replace a pending lease after bookkeeping failure", async () => {
+  const { coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+  const lease = await coordinator.begin(scope, {
+    mode: "start_hermes_run",
+    tool: "start_hermes_run",
+    instruction: "submitted before persist failed",
+  });
+
+  await coordinator.preserveSubmittedRun(scope, lease.operationId, {
+    runId: "run-known-after-failure",
+    sessionId: "session-known-after-failure",
+  });
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.active?.kind, "run");
+  assert.equal(snapshot.active?.runId, "run-known-after-failure");
+  assert.equal(snapshot.canonicalSessionId, "session-known-after-failure");
+
+  const retry = await coordinator.begin(scope, {
+    mode: "start_hermes_run",
+    tool: "start_hermes_run",
+    instruction: "submitted before persist failed",
+    reconcileActive: async () => ({
+      terminal: false,
+      sessionId: "session-known-after-failure",
+      replayPayload: null,
+    }),
+  });
+  assert.equal(retry.activeRun, true);
+  assert.equal(retry.runId, "run-known-after-failure");
+});
+
+test("missing unresolved run preserves replay and unresolved lock", async () => {
+  const { coordinator } = await makeCoordinator({ dedupWindowMs: 60_000 });
+  const scope = coordinator.scopeFromMeta(metaA);
+  await completeSessionlessSuccess(
+    coordinator,
+    scope,
+    "missing unresolved run",
+    "run-missing-unresolved",
+  );
+
+  const replay = await coordinator.begin(scope, {
+    mode: "delegate",
+    tool: "delegate_to_hermes",
+    instruction: "missing   unresolved run",
+    reconcileActive: async () => ({
+      terminal: false,
+      sessionId: null,
+      replayPayload: null,
+      runMissing: true,
+      preserveUnresolved: true,
+    }),
+  });
+  assert.equal(replay.replay, true);
+  assert.equal(replay.replayPayload.runId, "run-missing-unresolved");
+
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate",
+      tool: "delegate_to_hermes",
+      instruction: "different after missing unresolved",
+      reconcileActive: async () => ({
+        terminal: false,
+        sessionId: null,
+        replayPayload: null,
+        runMissing: true,
+        preserveUnresolved: true,
+      }),
+    }),
+    (error) => error?.code === "HERMES_NATIVE_SESSION_UNRESOLVED",
+  );
+
+  const snapshot = await coordinator.inspect(scope);
+  assert.equal(snapshot.active?.kind, "native-session-unresolved");
+  assert.equal(snapshot.active?.runId, "run-missing-unresolved");
+});
+
+test("v1 ambiguous native operation adopts the legacy fingerprint on exact retry", async () => {
+  const { root, coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+  const statePath = path.join(
+    root,
+    ".runtime",
+    "chatgpt-session-coordinator.json",
+  );
+  await fs.mkdir(path.dirname(statePath), { recursive: true });
+  const instruction = "legacy ambiguous retry";
+  const legacyFingerprint = legacyV1Fingerprint("delegate", instruction);
+
+  await fs.writeFile(
+    statePath,
+    JSON.stringify({
+      version: 1,
+      sessions: {
+        [scope.sessionHash]: {
+          canonicalRoute: "native",
+          canonicalSessionId: null,
+          active: {
+            operationId: "legacy-op",
+            tool: "delegate_to_hermes",
+            kind: "native-submission-unknown",
+            route: "native",
+            fingerprint: legacyFingerprint,
+            idempotencyKey: "legacy-idempotency-key",
+          },
+        },
+      },
+      recentResults: {},
+    }, null, 2) + "\n",
+  );
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "legacy   ambiguous retry",
+  });
+  assert.equal(retry.idempotencyKey, "legacy-idempotency-key");
+
+  const disk = await readCoordinatorState(root);
+  assert.equal(disk.version, 3);
+  assert.equal(disk.sessions[scope.sessionHash].active.legacyFingerprint, null);
+  assert.match(
+    disk.sessions[scope.sessionHash].active.fingerprint,
+    /^[a-f0-9]{64}$/u,
+  );
+  assert.notEqual(
+    disk.sessions[scope.sessionHash].active.fingerprint,
+    legacyFingerprint,
+  );
+});
+
+test("v1 active run only reconciles after the incoming request matches its legacy fingerprint", async () => {
+  const { root, coordinator } = await makeCoordinator();
+  const scope = coordinator.scopeFromMeta(metaA);
+  const statePath = path.join(
+    root,
+    ".runtime",
+    "chatgpt-session-coordinator.json",
+  );
+  await fs.mkdir(path.dirname(statePath), { recursive: true });
+  const instruction = "legacy active run";
+  const legacyFingerprint = legacyV1Fingerprint("delegate", instruction);
+
+  await fs.writeFile(
+    statePath,
+    JSON.stringify({
+      version: 1,
+      sessions: {
+        [scope.sessionHash]: {
+          canonicalRoute: "native",
+          canonicalSessionId: "legacy-session",
+          active: {
+            operationId: "legacy-run-op",
+            tool: "delegate_to_hermes",
+            kind: "run",
+            route: "native",
+            runId: "legacy-run",
+            sessionId: "legacy-session",
+            fingerprint: legacyFingerprint,
+          },
+        },
+      },
+      recentResults: {},
+    }, null, 2) + "\n",
+  );
+
+  let wrongReconcileCalls = 0;
+  await assert.rejects(
+    coordinator.begin(scope, {
+      mode: "delegate_to_hermes",
+      tool: "delegate_to_hermes",
+      instruction: "different request",
+      reconcileActive: async () => {
+        wrongReconcileCalls += 1;
+        return { terminal: true, sessionId: "legacy-session" };
+      },
+    }),
+    (error) => error?.code === "HERMES_SESSION_BUSY",
+  );
+  assert.equal(wrongReconcileCalls, 0);
+
+  const retry = await coordinator.begin(scope, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "legacy active   run",
+    reconcileActive: async (active) => {
+      assert.equal(active.runId, "legacy-run");
+      return {
+        terminal: true,
+        sessionId: "legacy-session",
+        replayPayload: {
+          ok: true,
+          operation: "delegate_to_hermes",
+          runId: "legacy-run",
+          sessionId: "legacy-session",
+          status: "completed",
+          text: "legacy done",
+        },
+      };
+    },
+  });
+  assert.equal(retry.replay, true);
+  assert.equal(retry.replayPayload.runId, "legacy-run");
+  assert.equal(retry.replayPayload.text, "legacy done");
+});
+
+test("v1 completed replay matches the legacy fingerprint and is re-keyed", async () => {
+  const { root, coordinator } = await makeCoordinator({
+    dedupWindowMs: 60_000,
+  });
+  const scope = coordinator.scopeFromMeta(metaA);
+  const statePath = path.join(
+    root,
+    ".runtime",
+    "chatgpt-session-coordinator.json",
+  );
+  await fs.mkdir(path.dirname(statePath), { recursive: true });
+  const instruction = "legacy completed replay";
+  const legacyFingerprint = legacyV1Fingerprint("delegate", instruction);
+
+  await fs.writeFile(
+    statePath,
+    JSON.stringify({
+      version: 1,
+      sessions: {
+        [scope.sessionHash]: {
+          canonicalRoute: "native",
+          canonicalSessionId: "legacy-session",
+          active: null,
+        },
+      },
+      recentResults: {
+        [scope.sessionHash]: {
+          fingerprint: legacyFingerprint,
+          settledAtMs: Date.now(),
+          traceId: "legacy-trace",
+          payload: {
+            ok: true,
+            operation: "delegate_to_hermes",
+            runId: "legacy-replay-run",
+            sessionId: "legacy-session",
+            status: "completed",
+            text: "legacy replay",
+          },
+        },
+      },
+    }, null, 2) + "\n",
+  );
+
+  const replay = await coordinator.begin(scope, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "legacy completed   replay",
+  });
+  assert.equal(replay.replay, true);
+  assert.equal(replay.replayPayload.runId, "legacy-replay-run");
+
+  const disk = await readCoordinatorState(root);
+  const keys = Object.keys(disk.recentResults[scope.sessionHash]);
+  assert.equal(keys.length, 1);
+  assert.doesNotMatch(keys[0], /^legacy:/u);
 });
