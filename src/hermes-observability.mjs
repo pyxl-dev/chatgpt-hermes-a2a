@@ -2,29 +2,26 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const DEFAULT_DEDUP_WINDOW_MS = 60000;
+const DEFAULT_DEDUP_WINDOW_MS = 60_000;
 const DEFAULT_ACTIVITY_LIMIT = 50;
 const MAX_ACTIVITY_LIMIT = 200;
 const INSTRUCTION_PREVIEW_MAX = 240;
 
 const TOOL_PURPOSE = {
-  delegate_to_hermes: "new-mission",
-  continue_with_hermes: "continue-existing-context",
+  delegate_to_hermes: "delegate-native-session",
   list_hermes_sessions: "list-native-sessions",
   get_hermes_session: "read-native-session",
   continue_hermes_session: "continue-native-session",
-  start_hermes_run: "start-controllable-run",
-  get_hermes_run: "read-controllable-run",
-  steer_hermes_run: "steer-controllable-run",
-  stop_hermes_run: "stop-controllable-run",
-  get_hermes_task: "read-task-state",
-  cancel_hermes_task: "cancel-task",
-  hermes_status: "health-check",
+  start_hermes_run: "start-native-run",
+  get_hermes_run: "read-native-run",
+  steer_hermes_run: "steer-native-run",
+  stop_hermes_run: "stop-native-run",
+  hermes_status: "native-health-check",
   hermes_activity: "read-local-activity",
 };
 
 function normalizeInstruction(value) {
-  return String(value).normalize("NFKC").trim().replace(/\s+/gu, " ");
+  return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
 }
 
 function configuredPositiveNumber(value, fallback, minimum = 1) {
@@ -50,8 +47,6 @@ export function createHermesObservability({
 
   let activityWriteChain = Promise.resolve();
   const recentActivity = [];
-  const delegationCache = new Map();
-  const sessionContinuationCache = new Map();
 
   function instructionHash(value) {
     if (typeof value !== "string" || value.trim() === "") return null;
@@ -68,7 +63,7 @@ export function createHermesObservability({
       : safe;
   }
 
-  function beginTrace(tool, args) {
+  function beginTrace(tool, args, metadata = {}) {
     const startedAtMs = Date.now();
     return {
       traceId: randomUUID(),
@@ -76,15 +71,15 @@ export function createHermesObservability({
       startedAtMs,
       tool,
       purpose: TOOL_PURPOSE[tool] || "unknown",
+      chatgptSessionHash:
+        typeof metadata?.chatgptSessionHash === "string"
+          ? metadata.chatgptSessionHash
+          : null,
       instructionHash: instructionHash(args?.instruction),
       instructionPreview: instructionPreview(args?.instruction),
-      inputContextId:
-        typeof args?.contextId === "string" ? args.contextId : null,
-      inputTaskId: typeof args?.taskId === "string" ? args.taskId : null,
       inputRunId: typeof args?.runId === "string" ? args.runId : null,
       inputSessionId:
         typeof args?.sessionId === "string" ? args.sessionId : null,
-      background: args?.background === true,
     };
   }
 
@@ -97,16 +92,9 @@ export function createHermesObservability({
       durationMs: Math.max(0, endedAtMs - base.startedAtMs),
       tool: base.tool,
       purpose: base.purpose,
+      chatgptSessionHash: base.chatgptSessionHash || null,
       instructionHash: base.instructionHash,
       instructionPreview: base.instructionPreview,
-      inputContextId: base.inputContextId,
-      inputTaskId: base.inputTaskId,
-      outputContextId:
-        payload && typeof payload.contextId === "string"
-          ? payload.contextId
-          : null,
-      outputTaskId:
-        payload && typeof payload.taskId === "string" ? payload.taskId : null,
       inputRunId: base.inputRunId,
       outputRunId:
         payload && typeof payload.runId === "string" ? payload.runId : null,
@@ -115,17 +103,19 @@ export function createHermesObservability({
         payload && typeof payload.sessionId === "string"
           ? payload.sessionId
           : null,
-      state: payload?.state ?? null,
-      stateName: payload?.stateName ?? null,
+      status: payload?.status ?? null,
       ok: !error && payload?.ok !== false,
       error: error
-        ? { message: redactText(error instanceof Error ? error.message : String(error)) }
+        ? {
+            message: redactText(
+              error instanceof Error ? error.message : String(error),
+            ),
+          }
         : payload?.error
           ? redactValue(payload.error)
           : null,
       deduplicated: payload?.deduplicated === true,
       duplicateOfTraceId: payload?.duplicateOfTraceId || null,
-      background: base.background,
     };
   }
 
@@ -211,7 +201,9 @@ export function createHermesObservability({
 
     const sinceMs = parseSince(args.since);
     const tool =
-      typeof args.tool === "string" && args.tool.trim() ? args.tool : null;
+      typeof args.tool === "string" && args.tool.trim()
+        ? args.tool.trim()
+        : null;
     const records = await loadActivityRecords();
 
     const filtered = records.filter((record) => {
@@ -247,142 +239,6 @@ export function createHermesObservability({
     };
   }
 
-  function pruneCache(cache, now = Date.now()) {
-    for (const [key, entry] of cache.entries()) {
-      if (
-        entry.settledAtMs !== null &&
-        now - entry.settledAtMs > dedupWindowMs
-      ) {
-        cache.delete(key);
-      }
-    }
-  }
-
-  function wrapDelegate(executeDelegate) {
-    return async function deduplicatedDelegate(
-      instruction,
-      background = false,
-      traceId = null,
-    ) {
-      const hash = instructionHash(instruction);
-      const now = Date.now();
-      pruneCache(delegationCache, now);
-
-      const existing = delegationCache.get(hash);
-      const reusable =
-        existing &&
-        (existing.settledAtMs === null ||
-          now - existing.settledAtMs <= dedupWindowMs);
-
-      if (reusable) {
-        try {
-          const result = await existing.promise;
-          return {
-            ...result,
-            deduplicated: true,
-            duplicateOfTraceId: existing.traceId,
-            dedupWindowMs,
-          };
-        } catch (error) {
-          if (error && typeof error === "object") {
-            error.deduplicated = true;
-            error.duplicateOfTraceId = existing.traceId;
-          }
-          throw error;
-        }
-      }
-
-      const promise = executeDelegate(instruction, background);
-      const entry = {
-        traceId,
-        createdAtMs: now,
-        settledAtMs: null,
-        promise,
-      };
-      delegationCache.set(hash, entry);
-
-      try {
-        const result = await promise;
-        entry.settledAtMs = Date.now();
-        entry.promise = Promise.resolve(result);
-        return {
-          ...result,
-          deduplicated: false,
-          duplicateOfTraceId: null,
-          dedupWindowMs,
-        };
-      } catch (error) {
-        if (delegationCache.get(hash) === entry) {
-          delegationCache.delete(hash);
-        }
-        throw error;
-      }
-    };
-  }
-
-  function wrapSessionContinue(executeContinue) {
-    return async function deduplicatedSessionContinue(
-      sessionId,
-      instruction,
-      traceId = null,
-    ) {
-      const hash = instructionHash(instruction);
-      const key = String(sessionId) + ":" + hash;
-      const now = Date.now();
-      pruneCache(sessionContinuationCache, now);
-
-      const existing = sessionContinuationCache.get(key);
-      const reusable =
-        existing &&
-        (existing.settledAtMs === null ||
-          now - existing.settledAtMs <= dedupWindowMs);
-
-      if (reusable) {
-        try {
-          const result = await existing.promise;
-          return {
-            ...result,
-            deduplicated: true,
-            duplicateOfTraceId: existing.traceId,
-            dedupWindowMs,
-          };
-        } catch (error) {
-          if (error && typeof error === "object") {
-            error.deduplicated = true;
-            error.duplicateOfTraceId = existing.traceId;
-          }
-          throw error;
-        }
-      }
-
-      const promise = executeContinue(sessionId, instruction);
-      const entry = {
-        traceId,
-        createdAtMs: now,
-        settledAtMs: null,
-        promise,
-      };
-      sessionContinuationCache.set(key, entry);
-
-      try {
-        const result = await promise;
-        entry.settledAtMs = Date.now();
-        entry.promise = Promise.resolve(result);
-        return {
-          ...result,
-          deduplicated: false,
-          duplicateOfTraceId: null,
-          dedupWindowMs,
-        };
-      } catch (error) {
-        if (sessionContinuationCache.get(key) === entry) {
-          sessionContinuationCache.delete(key);
-        }
-        throw error;
-      }
-    };
-  }
-
   return {
     activityLog,
     dedupWindowMs,
@@ -391,7 +247,5 @@ export function createHermesObservability({
     appendTrace,
     flush,
     readActivity,
-    wrapDelegate,
-    wrapSessionContinue,
   };
 }
