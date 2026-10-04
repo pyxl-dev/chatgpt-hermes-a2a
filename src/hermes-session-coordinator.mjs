@@ -41,6 +41,41 @@ function normalizeInstruction(value) {
   return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
 }
 
+function legacyNativeMode(mode) {
+  switch (mode) {
+    case "delegate_to_hermes":
+      return "delegate";
+    case "continue_hermes_session":
+      return "continue-session";
+    case "start_hermes_run":
+      return "start-run";
+    default:
+      return mode;
+  }
+}
+
+function currentFingerprint(mode, requestedSessionId, instruction) {
+  return sha256(
+    [
+      mode,
+      requestedSessionId || "",
+      normalizeInstruction(instruction),
+    ].join("\n"),
+  );
+}
+
+function legacyNativeFingerprint(mode, requestedSessionId, instruction) {
+  return sha256(
+    [
+      legacyNativeMode(mode),
+      "",
+      requestedSessionId || "",
+      "",
+      normalizeInstruction(instruction),
+    ].join("\n"),
+  );
+}
+
 function normalizedDedupWindowMs(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 1000
@@ -75,6 +110,7 @@ function activeSummary(active) {
     startedAt: active.startedAt || null,
     sessionId: active.sessionId || null,
     runId: active.runId || null,
+    legacyFingerprint: active.legacyFingerprint || null,
     reusedSession:
       typeof active.reusedSession === "boolean"
         ? active.reusedSession
@@ -176,7 +212,7 @@ export function createHermesSessionCoordinator({
     return changed;
   }
 
-  function migrateLegacyRecentResults(input) {
+  function migrateLegacyRecentResults(input, { markV1 = false } = {}) {
     const next = {};
     if (!input || typeof input !== "object" || Array.isArray(input)) {
       return next;
@@ -188,11 +224,17 @@ export function createHermesSessionCoordinator({
         recent?.payload &&
         nativeReplayPayload(recent.payload)
       ) {
+        const key = markV1
+          ? "legacy:" + recent.fingerprint
+          : recent.fingerprint;
         next[sessionHash] = {
-          [recent.fingerprint]: {
+          [key]: {
             settledAtMs: recent.settledAtMs,
             traceId: recent.traceId || null,
             payload: recent.payload,
+            ...(markV1
+              ? { legacyFingerprint: recent.fingerprint }
+              : {}),
           },
         };
       }
@@ -202,7 +244,10 @@ export function createHermesSessionCoordinator({
 
   function migrateV1(parsed) {
     const nextSessions = {};
-    const nextRecent = migrateLegacyRecentResults(parsed.recentResults);
+    const nextRecent = migrateLegacyRecentResults(
+      parsed.recentResults,
+      { markV1: true },
+    );
 
     for (const [sessionHash, record] of Object.entries(parsed.sessions || {})) {
       if (!record || typeof record !== "object" || Array.isArray(record)) {
@@ -224,7 +269,8 @@ export function createHermesSessionCoordinator({
               startedAt: active.startedAt || null,
               sessionId: active.sessionId || null,
               runId: active.runId || null,
-              fingerprint: active.fingerprint || null,
+              fingerprint: null,
+              legacyFingerprint: active.fingerprint || null,
               ownerInstanceId: active.ownerInstanceId || null,
               idempotencyKey: active.idempotencyKey || null,
             }
@@ -416,6 +462,25 @@ export function createHermesSessionCoordinator({
       : null;
   }
 
+  function findLegacyRecentResult(sessionHash, legacyFingerprint) {
+    if (!legacyFingerprint) return null;
+    const bucket = state.recentResults?.[sessionHash];
+    if (!bucket || typeof bucket !== "object" || Array.isArray(bucket)) {
+      return null;
+    }
+    for (const [key, recent] of Object.entries(bucket)) {
+      if (
+        recent &&
+        typeof recent === "object" &&
+        !Array.isArray(recent) &&
+        recent.legacyFingerprint === legacyFingerprint
+      ) {
+        return { key, recent };
+      }
+    }
+    return null;
+  }
+
   function setRecentResult(sessionHash, fingerprint, value) {
     if (!fingerprint) return;
     let bucket = state.recentResults[sessionHash];
@@ -449,6 +514,7 @@ export function createHermesSessionCoordinator({
       runId: active.runId || null,
       sessionId: active.sessionId || null,
       fingerprint: active.fingerprint || null,
+      legacyFingerprint: active.legacyFingerprint || null,
       ownerInstanceId: active.ownerInstanceId || null,
       idempotencyKey: active.idempotencyKey || null,
       startedAt: active.startedAt || null,
@@ -469,6 +535,7 @@ export function createHermesSessionCoordinator({
       current.runId === expected.runId &&
       current.sessionId === expected.sessionId &&
       current.fingerprint === expected.fingerprint &&
+      current.legacyFingerprint === expected.legacyFingerprint &&
       current.ownerInstanceId === expected.ownerInstanceId &&
       current.idempotencyKey === expected.idempotencyKey &&
       current.startedAt === expected.startedAt &&
@@ -515,6 +582,15 @@ export function createHermesSessionCoordinator({
         ? requestedSessionId.trim()
         : null;
 
+    const fingerprint =
+      typeof instruction === "string" && instruction.trim()
+        ? currentFingerprint(mode, requested, instruction)
+        : null;
+    const legacyFingerprint =
+      typeof instruction === "string" && instruction.trim()
+        ? legacyNativeFingerprint(mode, requested, instruction)
+        : null;
+
     if (!scope?.tracked || !scope.sessionHash) {
       return {
         tracked: false,
@@ -530,12 +606,31 @@ export function createHermesSessionCoordinator({
     if (typeof reconcileActive === "function") {
       reconcileTarget = await withStateTransaction(async () => {
         const record = state.sessions[scope.sessionHash];
-        const active =
+        let active =
           record &&
           typeof record === "object" &&
           !Array.isArray(record)
             ? record.active
             : null;
+
+        if (active?.legacyFingerprint) {
+          if (
+            !fingerprint ||
+            !legacyFingerprint ||
+            active.legacyFingerprint !== legacyFingerprint
+          ) {
+            return null;
+          }
+          record.active = {
+            ...active,
+            fingerprint,
+            legacyFingerprint: null,
+          };
+          record.updatedAt = new Date().toISOString();
+          await persist();
+          active = record.active;
+        }
+
         return active
           ? {
               identity: activeIdentity(active),
@@ -639,30 +734,48 @@ export function createHermesSessionCoordinator({
         await persist();
       }
 
-      const fingerprint =
-        typeof instruction === "string" && instruction.trim()
-          ? sha256(
-              [
-                mode,
-                requested || "",
-                normalizeInstruction(instruction),
-              ].join("\n"),
-            )
-          : null;
+      if (
+        record.active?.legacyFingerprint &&
+        fingerprint &&
+        legacyFingerprint &&
+        record.active.legacyFingerprint === legacyFingerprint
+      ) {
+        record.active = {
+          ...record.active,
+          fingerprint,
+          legacyFingerprint: null,
+        };
+        record.updatedAt = new Date().toISOString();
+        await persist();
+      }
 
       const active = record.active;
       const recoverablePending =
-        active &&
-        ["native-pending", "native-submission-unknown"].includes(active.kind) &&
+        active?.kind === "native-submission-unknown" &&
         fingerprint &&
-        active.fingerprint === fingerprint &&
-        (
-          active.kind === "native-submission-unknown" ||
-          active.ownerInstanceId !== instanceId
-        );
+        active.fingerprint === fingerprint;
 
       const now = Date.now();
-      const recent = getRecentResult(scope.sessionHash, fingerprint);
+      let recent = getRecentResult(scope.sessionHash, fingerprint);
+
+      if (!recent && fingerprint && legacyFingerprint) {
+        const legacyRecent = findLegacyRecentResult(
+          scope.sessionHash,
+          legacyFingerprint,
+        );
+        if (legacyRecent) {
+          recent = legacyRecent.recent;
+          setRecentResult(scope.sessionHash, fingerprint, {
+            ...legacyRecent.recent,
+            legacyFingerprint: null,
+          });
+          if (legacyRecent.key !== fingerprint) {
+            deleteRecentResult(scope.sessionHash, legacyRecent.key);
+          }
+          record.updatedAt = new Date().toISOString();
+          await persist();
+        }
+      }
 
       if (
         fingerprint &&
@@ -912,6 +1025,61 @@ export function createHermesSessionCoordinator({
     });
   }
 
+  async function preserveSubmittedRun(
+    scope,
+    operationId,
+    { runId, sessionId = null } = {},
+  ) {
+    if (
+      !scope?.tracked ||
+      !scope.sessionHash ||
+      !operationId ||
+      typeof runId !== "string" ||
+      !runId.trim()
+    ) {
+      return;
+    }
+
+    return withStateTransaction(async () => {
+      const record = getRecord(scope.sessionHash);
+      const active = record.active;
+      if (!active || active.operationId !== operationId) {
+        return snapshot(scope, record);
+      }
+
+      const returnedSessionId =
+        typeof sessionId === "string" && sessionId.trim()
+          ? sessionId.trim()
+          : null;
+      const expectedSessionId =
+        record.canonicalSessionId || active.sessionId || null;
+      const safeSessionId =
+        returnedSessionId &&
+        (!expectedSessionId || returnedSessionId === expectedSessionId)
+          ? returnedSessionId
+          : active.sessionId || record.canonicalSessionId || null;
+
+      if (returnedSessionId && !record.canonicalSessionId && safeSessionId === returnedSessionId) {
+        record.canonicalSessionId = returnedSessionId;
+      }
+
+      record.active = {
+        ...active,
+        kind: "run",
+        runId: runId.trim(),
+        sessionId:
+          safeSessionId ||
+          active.sessionId ||
+          record.canonicalSessionId ||
+          null,
+        ownerInstanceId: instanceId,
+      };
+      record.updatedAt = new Date().toISOString();
+      await persist();
+      return snapshot(scope, record);
+    });
+  }
+
   async function markSubmissionUnknown(scope, operationId) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
     return withStateTransaction(async () => {
@@ -1048,6 +1216,7 @@ export function createHermesSessionCoordinator({
     begin,
     complete,
     fail,
+    preserveSubmittedRun,
     markSubmissionUnknown,
     observe,
     assertActiveRun,
