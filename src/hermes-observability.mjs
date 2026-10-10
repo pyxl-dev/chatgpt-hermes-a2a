@@ -2,10 +2,19 @@ import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import {
+  positiveInteger,
+  readSegments,
+  rotateIfNeeded,
+} from "./hermes-log-rotation.mjs";
+
 const DEFAULT_DEDUP_WINDOW_MS = 60_000;
 const DEFAULT_ACTIVITY_LIMIT = 50;
 const MAX_ACTIVITY_LIMIT = 200;
 const INSTRUCTION_PREVIEW_MAX = 240;
+const DEFAULT_ACTIVITY_MAX_BYTES = 2_000_000;
+const DEFAULT_ACTIVITY_BACKUPS = 3;
+const DEFAULT_ACTIVITY_READ_MAX_BYTES = 8_000_000;
 
 const TOOL_PURPOSE = {
   delegate_to_hermes: "delegate-native-session",
@@ -18,6 +27,7 @@ const TOOL_PURPOSE = {
   stop_hermes_run: "stop-native-run",
   hermes_status: "native-health-check",
   hermes_activity: "read-local-activity",
+  hermes_tool_timeline: "read-tool-timeline",
 };
 
 function normalizeInstruction(value) {
@@ -44,9 +54,25 @@ export function createHermesObservability({
     DEFAULT_DEDUP_WINDOW_MS,
     1000,
   );
+  const activityMaxBytes = configuredPositiveNumber(
+    process.env.HERMES_ACTIVITY_MAX_BYTES,
+    DEFAULT_ACTIVITY_MAX_BYTES,
+    1024,
+  );
+  const activityBackups = positiveInteger(
+    process.env.HERMES_ACTIVITY_BACKUPS,
+    DEFAULT_ACTIVITY_BACKUPS,
+    0,
+  );
+  const activityReadMaxBytes = configuredPositiveNumber(
+    process.env.HERMES_ACTIVITY_READ_MAX_BYTES,
+    DEFAULT_ACTIVITY_READ_MAX_BYTES,
+    1024,
+  );
 
   let activityWriteChain = Promise.resolve();
   const recentActivity = [];
+  let lastReadTruncated = false;
 
   function instructionHash(value) {
     if (typeof value !== "string" || value.trim() === "") return null;
@@ -132,6 +158,22 @@ export function createHermesObservability({
           recursive: true,
           mode: 0o700,
         });
+        // Rotation is best-effort: a rotation failure must never drop a trace,
+        // so an unbounded file wins over a lost record.
+        try {
+          await rotateIfNeeded(activityLog, {
+            maxBytes: activityMaxBytes,
+            backups: activityBackups,
+          });
+        } catch (error) {
+          process.stderr.write(
+            "[hermes-activity] rotation failed: " +
+              redactText(
+                error instanceof Error ? error.message : String(error),
+              ) +
+              "\n",
+          );
+        }
         await fs.appendFile(activityLog, line, {
           encoding: "utf8",
           mode: 0o600,
@@ -172,20 +214,28 @@ export function createHermesObservability({
 
   async function loadActivityRecords() {
     try {
-      const raw = await fs.readFile(activityLog, "utf8");
-      return raw
+      const { text, truncated } = await readSegments(activityLog, {
+        backups: activityBackups,
+        maxBytes: activityReadMaxBytes,
+      });
+      lastReadTruncated = truncated;
+      return text
         .split("\n")
         .filter(Boolean)
         .map((line) => {
           try {
             return JSON.parse(line);
           } catch {
+            // A segment boundary or the read budget can cut a line in half.
             return null;
           }
         })
         .filter(Boolean);
     } catch (error) {
-      if (error?.code === "ENOENT") return [...recentActivity];
+      if (error?.code === "ENOENT") {
+        lastReadTruncated = false;
+        return [...recentActivity];
+      }
       throw error;
     }
   }
@@ -236,11 +286,20 @@ export function createHermesObservability({
       dedupWindowMs,
       records: selected,
       deduplicated: false,
+      rotation: {
+        maxBytes: activityMaxBytes,
+        backups: activityBackups,
+        readBudgetBytes: activityReadMaxBytes,
+        readTruncated: lastReadTruncated,
+        segments: activityBackups + 1,
+      },
     };
   }
 
   return {
     activityLog,
+    activityMaxBytes,
+    activityBackups,
     dedupWindowMs,
     beginTrace,
     finishTrace,

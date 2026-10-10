@@ -21,6 +21,7 @@ const expectedTools = [
   "stop_hermes_run",
   "hermes_status",
   "hermes_activity",
+  "hermes_tool_timeline",
 ];
 
 const childEnv = Object.fromEntries(
@@ -71,6 +72,8 @@ const summary = {
   sessionCount: null,
   delegate: null,
   proof: false,
+  activity: null,
+  timeline: null,
   error: null,
 };
 
@@ -178,6 +181,31 @@ try {
   if (!Array.isArray(activity?.records)) {
     throw new Error("hermes_activity did not return records");
   }
+  summary.activity = {
+    count: activity.records.length,
+    readTruncated: activity.rotation?.readTruncated ?? null,
+    maxBytes: activity.rotation?.maxBytes ?? null,
+    backups: activity.rotation?.backups ?? null,
+  };
+
+  const timeline = assertOk(
+    await client.callTool({
+      name: "hermes_tool_timeline",
+      arguments: { sessionId: delegated.sessionId, limit: 20 },
+    }),
+    "hermes_tool_timeline",
+  );
+  if (!Array.isArray(timeline?.entries) || timeline?.contentFree !== true) {
+    throw new Error(
+      "hermes_tool_timeline did not return a content-free timeline",
+    );
+  }
+  summary.timeline = {
+    sessionId: timeline.sessionId,
+    entryCount: timeline.entries.length,
+    toolCallCount: timeline.totals?.toolCallCount ?? null,
+    errorCount: timeline.totals?.errorCount ?? null,
+  };
 
   summary.ok = true;
 } catch (error) {
