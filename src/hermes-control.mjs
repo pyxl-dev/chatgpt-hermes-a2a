@@ -21,6 +21,21 @@ function normalizeInstruction(value) {
   return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
 }
 
+export const DEFAULT_MESSAGE_HEADER = "[Message From ChatGPT]";
+
+export function resolveMessageHeader(
+  configured = process.env.HERMES_MESSAGE_HEADER,
+) {
+  if (configured === undefined) return DEFAULT_MESSAGE_HEADER;
+  return String(configured).trim();
+}
+
+export function withMessageHeader(text, header = resolveMessageHeader()) {
+  if (!header) return text;
+  if (text.startsWith(header)) return text;
+  return header + "\n\n" + text;
+}
+
 function normalizedApiPort(value) {
   const text = String(value ?? "").trim();
   if (!/^\d+$/u.test(text)) return null;
@@ -67,6 +82,7 @@ export function createHermesControl({ redactText, redactValue }) {
   const apiUrl = resolveHermesApiUrl();
   const apiKey =
     process.env.HERMES_API_SERVER_KEY || process.env.API_SERVER_KEY || "";
+  const messageHeader = resolveMessageHeader();
   const configuredTimeout = Number(process.env.HERMES_CONTROL_TIMEOUT_MS);
   const timeoutMs =
     Number.isFinite(configuredTimeout) && configuredTimeout >= 1000
@@ -243,7 +259,7 @@ export function createHermesControl({ redactText, redactValue }) {
         ),
       },
       body: {
-        input: text,
+        input: withMessageHeader(text, messageHeader),
         ...(durableSessionId ? { session_id: durableSessionId } : {}),
       },
     });
@@ -319,7 +335,7 @@ export function createHermesControl({ redactText, redactValue }) {
       "/v1/runs/" + encodeURIComponent(id) + "/steer",
       {
         method: "POST",
-        body: { input: text },
+        body: { input: withMessageHeader(text, messageHeader) },
       },
     );
     assertReturnedRunId(id, payload, "steer_hermes_run");

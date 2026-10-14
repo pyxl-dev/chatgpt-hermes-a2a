@@ -150,6 +150,21 @@ The bridge launcher reads only the values it needs from the active Hermes profil
 
 It does not source the complete Hermes environment file.
 
+## Message provenance header
+
+Every instruction the bridge sends to Hermes (`start`, `continue`, `delegate` and
+`steer`) is prefixed with a header so Hermes knows the message comes from ChatGPT:
+
+```text
+[Message From ChatGPT]
+
+<instruction>
+```
+
+Set `HERMES_MESSAGE_HEADER` to change the text, or to an empty string to disable it.
+The header is added only to the payload sent to Hermes; idempotency keys are still
+computed on the raw instruction.
+
 ## Secure MCP Tunnel
 
 The tunnel profile points OpenAI `tunnel-client` at:
