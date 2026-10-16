@@ -15,6 +15,7 @@ import { createHermesControl } from "./hermes-control.mjs";
 import { createHermesObservability } from "./hermes-observability.mjs";
 import { createHermesSessionCoordinator } from "./hermes-session-coordinator.mjs";
 import { createHermesSessionAccess } from "./hermes-sessions.mjs";
+import { createRunNotifierFromEnv } from "./hermes-run-notifier.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const AGENT = "hermes";
@@ -63,6 +64,7 @@ function redactText(value) {
     "OPENAI_API_KEY",
     "API_SERVER_KEY",
     "HERMES_API_SERVER_KEY",
+    "HERMES_A2A_TELEGRAM_BOT_TOKEN",
   ]) {
     const secret = process.env[key];
     if (secret) text = text.split(secret).join("[REDACTED]");
@@ -165,6 +167,49 @@ const sessionCoordinator = createHermesSessionCoordinator({
   root: ROOT,
   randomUUID,
 });
+
+const runNotifier = createRunNotifierFromEnv({
+  getRun: (runId) => control.getRun(runId),
+  onError: (error, runId) =>
+    console.error(
+      "Run-finished notifier error for " + runId + ": " + errorMessage(error),
+    ),
+});
+
+// Every tool answer that carries a runId tells the notifier whether ChatGPT
+// still has to come back for that Run (watch) or already holds its outcome
+// (settle).
+const RUN_TOOLS = new Set([
+  "delegate_to_hermes",
+  "continue_hermes_session",
+  "start_hermes_run",
+  "get_hermes_run",
+  "steer_hermes_run",
+  "stop_hermes_run",
+]);
+
+function trackRunForNotification(name, args, payload, failure) {
+  if (!runNotifier.enabled || !RUN_TOOLS.has(name)) return;
+  if (name === "stop_hermes_run") {
+    if (!failure) runNotifier.settle(optionalString(args, "runId"));
+    return;
+  }
+  if (failure) {
+    if (failure?.code === "HERMES_NATIVE_RUN_FAILED") {
+      runNotifier.settle(failure.details?.runId || null);
+    }
+    return;
+  }
+  const runId = typeof payload?.runId === "string" ? payload.runId : null;
+  if (!runId) return;
+  if (runIsTerminal(payload)) {
+    runNotifier.settle(runId);
+  } else if (payload.pending === true || payload.status) {
+    runNotifier.watch(runId, {
+      instruction: typeof args.instruction === "string" ? args.instruction : null,
+    });
+  }
+}
 
 const TOOLS = [
   {
@@ -1345,9 +1390,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       sessionScope,
     );
     payload = { ...payload, traceId: trace.traceId };
+    trackRunForNotification(name, args, payload, null);
     return toolText(payload);
   } catch (error) {
     failure = error;
+    trackRunForNotification(name, args, null, error);
     payload = {
       ok: false,
       operation: name,
@@ -1386,7 +1433,8 @@ try {
       observability.activityLog +
       "; dedup=" +
       observability.dedupWindowMs +
-      "ms",
+      "ms; runNotify=" +
+      (runNotifier.enabled ? "telegram" : "off"),
   );
 } catch (error) {
   console.error("Failed to start Hermes Mac native MCP: " + errorMessage(error));

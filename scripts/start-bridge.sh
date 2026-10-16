@@ -103,5 +103,20 @@ if ! "$NODE_BIN" -e '
   exit 1
 fi
 
+# Run-finished notifications reuse Hermes' own Telegram bot and home channel.
+# Set HERMES_A2A_NOTIFY=off to disable them.
+if [[ "${HERMES_A2A_NOTIFY:-}" != "off" ]]; then
+  if [[ -z "${HERMES_A2A_TELEGRAM_BOT_TOKEN:-}" ]]; then
+    HERMES_A2A_TELEGRAM_BOT_TOKEN="$(read_hermes_env_value TELEGRAM_BOT_TOKEN)"
+  fi
+  if [[ -z "${HERMES_A2A_TELEGRAM_CHAT_ID:-}" ]]; then
+    HERMES_A2A_TELEGRAM_CHAT_ID="$(read_hermes_env_value TELEGRAM_HOME_CHANNEL)"
+  fi
+  if [[ -z "${HERMES_A2A_TELEGRAM_THREAD_ID:-}" ]]; then
+    HERMES_A2A_TELEGRAM_THREAD_ID="$(read_hermes_env_value TELEGRAM_HOME_CHANNEL_THREAD_ID)"
+  fi
+  export HERMES_A2A_TELEGRAM_BOT_TOKEN HERMES_A2A_TELEGRAM_CHAT_ID HERMES_A2A_TELEGRAM_THREAD_ID
+fi
+
 unset HERMES_ENV_FILE
 exec "$NODE_BIN" "$ROOT/src/hermes-mcp.mjs"

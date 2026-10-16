@@ -703,3 +703,118 @@ test("get_hermes_run without a runId answers no-active-run when nothing is bound
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+async function createFakeTelegram() {
+  const messages = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      messages.push({ path: request.url, body: JSON.parse(body || "{}") });
+      sendJson(response, { ok: true, result: { message_id: messages.length } });
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return {
+    messages,
+    baseUrl: "http://127.0.0.1:" + server.address().port,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function waitFor(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return predicate();
+}
+
+function notifyEnv(telegram) {
+  return {
+    HERMES_A2A_TELEGRAM_BOT_TOKEN: "test-bot-token",
+    HERMES_A2A_TELEGRAM_CHAT_ID: "4242",
+    HERMES_A2A_TELEGRAM_API_BASE: telegram.baseUrl,
+    HERMES_A2A_NOTIFY_POLL_MS: "100",
+    HERMES_A2A_NOTIFY_GRACE_MS: "200",
+  };
+}
+
+test("a Run ChatGPT stopped polling is announced on Telegram when it finishes", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-notify-"));
+  const api = await createPollingApi({ terminalAfterMs: 1200 });
+  const telegram = await createFakeTelegram();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, notifyEnv(telegram));
+    const delegated = await client.callTool({
+      name: "delegate_to_hermes",
+      arguments: { instruction: "abandoned long work" },
+      _meta: { "openai/session": "abandoned-conversation" },
+    });
+    assert.equal(delegated.structuredContent?.pending, true);
+
+    // ChatGPT never calls get_hermes_run again.
+    assert.ok(
+      await waitFor(() => telegram.messages.length > 0, 8000),
+      "the finished Run must be announced",
+    );
+    const [message] = telegram.messages;
+    assert.equal(message.path, "/bottest-bot-token/sendMessage");
+    assert.equal(message.body.chat_id, "4242");
+    assert.match(message.body.text, /completed/);
+    assert.match(message.body.text, /abandoned long work/);
+    assert.match(message.body.text, /run-polled/);
+    assert.doesNotMatch(message.body.text, /polled work finished/, "Hermes output must not be sent");
+
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(telegram.messages.length, 1, "exactly one notification per Run");
+  } finally {
+    await client?.close();
+    await telegram.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("a Run ChatGPT collects itself is never announced", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-quiet-"));
+  const api = await createPollingApi({ terminalAfterMs: 1200 });
+  const telegram = await createFakeTelegram();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      ...notifyEnv(telegram),
+      HERMES_A2A_NOTIFY_GRACE_MS: "1500",
+    });
+    const metadata = { "openai/session": "attentive-conversation" };
+    const delegated = await client.callTool({
+      name: "delegate_to_hermes",
+      arguments: { instruction: "watched work" },
+      _meta: metadata,
+    });
+    assert.equal(delegated.structuredContent?.pending, true);
+
+    const polled = await client.callTool({
+      name: "get_hermes_run",
+      arguments: {},
+      _meta: metadata,
+    });
+    assert.equal(polled.structuredContent?.status, "completed");
+
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    assert.equal(telegram.messages.length, 0);
+  } finally {
+    await client?.close();
+    await telegram.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
