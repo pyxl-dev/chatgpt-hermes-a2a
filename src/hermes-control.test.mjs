@@ -959,3 +959,73 @@ test("start and steer send the header to Hermes but keep idempotency on raw text
     }
   }
 });
+
+test("an idempotency key conflict is an ambiguous delivery, other 4xx stay definitive", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  let nextResponse = null;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify(nextResponse.body), {
+        status: nextResponse.status,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    // Same key, different body: Hermes already admitted an earlier request
+    // (e.g. one sent before the message header), which may still be running.
+    nextResponse = {
+      status: 409,
+      body: {
+        error: {
+          message: "Idempotency-Key reused with a different request body",
+          code: "idempotency_key_conflict",
+        },
+      },
+    };
+    await assert.rejects(
+      control.startRun("work sent before the header", null, "scope"),
+      (error) =>
+        error?.status === 409 &&
+        error?.code === "idempotency_key_conflict" &&
+        error?.deliveryAmbiguous === true,
+    );
+
+    nextResponse = {
+      status: 409,
+      body: { error: { message: "session busy", code: "session_busy" } },
+    };
+    await assert.rejects(
+      control.startRun("other conflict", null, "scope"),
+      (error) => error?.status === 409 && error?.deliveryAmbiguous === false,
+    );
+
+    nextResponse = {
+      status: 400,
+      body: { error: { message: "Missing 'input' field" } },
+    };
+    await assert.rejects(
+      control.startRun("bad request", null, "scope"),
+      (error) => error?.status === 400 && error?.deliveryAmbiguous === false,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});

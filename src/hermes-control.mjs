@@ -197,8 +197,15 @@ export function createHermesControl({ redactText, redactValue }) {
         );
         error.status = response.status;
         error.code = payload?.error?.code || payload?.code || null;
+        // A 409 idempotency_key_conflict means Hermes already admitted a
+        // request under this key with a different body (e.g. sent before the
+        // message header existed, or under another header). That earlier Run
+        // may well be live, so the submission is ambiguous, not rejected.
         error.deliveryAmbiguous =
-          methodName !== "GET" && response.status >= 500;
+          methodName !== "GET" &&
+          (response.status >= 500 ||
+            (response.status === 409 &&
+              error.code === "idempotency_key_conflict"));
         throw error;
       }
       return redactValue(payload || {});
