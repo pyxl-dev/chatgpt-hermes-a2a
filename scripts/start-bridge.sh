@@ -4,16 +4,10 @@ umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_DIR="$ROOT/.runtime"
-RUNTIME_CONFIG="$RUNTIME_DIR/a2a-mcp.config.yaml"
-TEMPLATE="$ROOT/config/a2a-mcp.config.yaml"
-BIN="$ROOT/node_modules/.bin/a2a-mcp"
 
 mkdir -p "$RUNTIME_DIR"
 chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
 
-# launchd does not inherit the interactive shell environment. Resolve the
-# active Hermes profile's env file through the Hermes CLI, then read only the
-# exact values this bridge needs; never source the full Hermes .env.
 resolve_hermes_env_file() {
   local hermes_bin
   local resolved
@@ -48,22 +42,20 @@ read_hermes_env_value() {
   ' "$file"
 }
 
-if [[ -z "${A2A_BEARER_TOKEN:-}" ]]; then
-  DETECTED_A2A_TOKEN="$(read_hermes_env_value A2A_BEARER_TOKEN)"
-  if [[ -n "$DETECTED_A2A_TOKEN" ]]; then
-    export A2A_BEARER_TOKEN="$DETECTED_A2A_TOKEN"
-  fi
-  unset DETECTED_A2A_TOKEN
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] &&
+    (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
+if [[ -z "${API_SERVER_KEY:-}" && -n "${HERMES_API_SERVER_KEY:-}" ]]; then
+  export API_SERVER_KEY="$HERMES_API_SERVER_KEY"
 fi
 
 if [[ -z "${API_SERVER_KEY:-}" ]]; then
   DETECTED_API_KEY="$(read_hermes_env_value API_SERVER_KEY)"
   HERMES_BIN_FOR_SECRET="$(command -v hermes || true)"
   if [[ -z "$DETECTED_API_KEY" && -n "$HERMES_BIN_FOR_SECRET" ]]; then
-    # Hermes may resolve credentials from a managed/profile secret layer even
-    # when the literal key is absent from the profile .env. Ask Hermes itself
-    # for the resolved value rather than duplicating its secret precedence.
-    DETECTED_API_KEY="$("$HERMES_BIN_FOR_SECRET" config get API_SERVER_KEY 2>/dev/null || true)"
+    DETECTED_API_KEY="$("$HERMES_BIN_FOR_SECRET" config get API_SERVER_KEY --raw 2>/dev/null || true)"
   fi
   if [[ -n "$DETECTED_API_KEY" ]]; then
     export API_SERVER_KEY="$DETECTED_API_KEY"
@@ -71,53 +63,31 @@ if [[ -z "${API_SERVER_KEY:-}" ]]; then
   unset DETECTED_API_KEY HERMES_BIN_FOR_SECRET
 fi
 
-if [[ -z "${API_SERVER_PORT:-}" ]]; then
+if ! valid_port "${API_SERVER_PORT:-}"; then
+  unset API_SERVER_PORT
   DETECTED_API_PORT="$(read_hermes_env_value API_SERVER_PORT)"
   HERMES_BIN_FOR_CONFIG="$(command -v hermes || true)"
-  if [[ -z "$DETECTED_API_PORT" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+
+  if ! valid_port "$DETECTED_API_PORT" && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
     DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get API_SERVER_PORT 2>/dev/null || true)"
   fi
-  if [[ -z "$DETECTED_API_PORT" && -n "$HERMES_BIN_FOR_CONFIG" ]]; then
+  if ! valid_port "$DETECTED_API_PORT" && [[ -n "$HERMES_BIN_FOR_CONFIG" ]]; then
     DETECTED_API_PORT="$("$HERMES_BIN_FOR_CONFIG" config get platforms.api_server.extra.port 2>/dev/null || true)"
   fi
-  if [[ "$DETECTED_API_PORT" =~ ^[0-9]+$ ]] &&
-     (( DETECTED_API_PORT >= 1 && DETECTED_API_PORT <= 65535 )); then
+  if valid_port "$DETECTED_API_PORT"; then
     export API_SERVER_PORT="$DETECTED_API_PORT"
+  else
+    export API_SERVER_PORT="8642"
   fi
   unset DETECTED_API_PORT HERMES_BIN_FOR_CONFIG
 fi
 
-if [[ ! -x "$BIN" ]]; then
-  echo "a2a-mcp is not installed. Run: npm install --no-package-lock --no-audit --no-fund" >&2
+if [[ -z "${API_SERVER_KEY:-}" ]]; then
+  echo "Hermes native Runs API key is not configured." >&2
+  echo "Run: bash $ROOT/scripts/setup-hermes-control.sh" >&2
   exit 1
 fi
 
-if [[ -n "${A2A_BEARER_TOKEN:-}" ]]; then
-  cat >"$RUNTIME_CONFIG" <<'YAML'
-agents:
-  hermes:
-    cardUrl: "http://127.0.0.1:9900/.well-known/agent-card.json"
-    allowedBindings: ["JSONRPC", "HTTP+JSON"]
-    authProfile: "hermes-local"
-    signaturePolicy: "disabled"
-    directUrlPolicy: "disabled"
-
-authProfiles:
-  hermes-local:
-    type: "bearer-env"
-    env: "A2A_BEARER_TOKEN"
-
-network:
-  allowPrivateAddresses: true
-  requireHttps: false
-  timeoutMs: 330000
-  maxResponseBytes: 10485760
-YAML
-else
-  cp "$TEMPLATE" "$RUNTIME_CONFIG"
-fi
-
-export A2A_MCP_CONFIG="$RUNTIME_CONFIG"
 export HERMES_ACTIVITY_LOG="${HERMES_ACTIVITY_LOG:-$RUNTIME_DIR/hermes-activity.jsonl}"
 
 NODE_BIN="$(command -v node || true)"
@@ -125,9 +95,13 @@ if [[ -z "$NODE_BIN" ]]; then
   echo "node is not installed or is not on PATH." >&2
   exit 1
 fi
+if ! "$NODE_BIN" -e '
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  process.exit(major > 22 || (major === 22 && minor >= 13) ? 0 : 1);
+'; then
+  echo "Node.js >=22.13.0 is required; got $("$NODE_BIN" -v)" >&2
+  exit 1
+fi
 
-# Keep the proven generic a2a-mcp process as the private backend. The UX
-# wrapper owns the public MCP stdio connection and never forwards its tool list.
-export HERMES_A2A_BACKEND_BIN="${HERMES_A2A_BACKEND_BIN:-${A2A_MCP_BACKEND_BIN:-$BIN}}"
 unset HERMES_ENV_FILE
 exec "$NODE_BIN" "$ROOT/src/hermes-mcp.mjs"

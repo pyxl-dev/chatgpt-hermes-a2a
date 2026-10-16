@@ -1,0 +1,898 @@
+import assert from "node:assert/strict";
+import { chmod, mkdtemp, rm, writeFile, readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import test from "node:test";
+
+import {
+  controlIdempotencyKey,
+  createHermesControl,
+  resolveHermesApiUrl,
+} from "./hermes-control.mjs";
+
+const projectRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "..",
+);
+
+test("native idempotency key is scoped by ChatGPT conversation", () => {
+  const nowMs = 1_800_000;
+  const a = controlIdempotencyKey(
+    null,
+    "same instruction",
+    "chatgpt-scope-a",
+    nowMs,
+  );
+  const b = controlIdempotencyKey(
+    null,
+    "same instruction",
+    "chatgpt-scope-b",
+    nowMs,
+  );
+  const aRetry = controlIdempotencyKey(
+    null,
+    "same instruction",
+    "chatgpt-scope-a",
+    nowMs,
+  );
+
+  assert.notEqual(a, b);
+  assert.equal(a, aRetry);
+});
+
+test("native idempotency key keeps durable session and instruction boundaries", () => {
+  const nowMs = 1_800_000;
+  const base = controlIdempotencyKey(
+    "session-a",
+    "instruction-a",
+    "chatgpt-scope-a",
+    nowMs,
+  );
+
+  assert.notEqual(
+    base,
+    controlIdempotencyKey(
+      "session-b",
+      "instruction-a",
+      "chatgpt-scope-a",
+      nowMs,
+    ),
+  );
+  assert.notEqual(
+    base,
+    controlIdempotencyKey(
+      "session-a",
+      "instruction-b",
+      "chatgpt-scope-a",
+      nowMs,
+    ),
+  );
+});
+
+test("native idempotency key is stable across normalized retry text", () => {
+  const base = controlIdempotencyKey(
+    "session-a",
+    "do  x",
+    "operation-token",
+    1_800_000,
+  );
+  const retry = controlIdempotencyKey(
+    "session-a",
+    "do x",
+    "operation-token",
+    1_920_000,
+  );
+  const unicodeRetry = controlIdempotencyKey(
+    "session-a",
+    "do\u00a0x",
+    "operation-token",
+    1_920_000,
+  );
+
+  assert.equal(base, retry);
+  assert.equal(base, unicodeRetry);
+});
+
+test("scoped native idempotency remains stable across minute boundaries", () => {
+  const first = controlIdempotencyKey(
+    "session-a",
+    "same instruction",
+    "operation-token",
+    1_800_000,
+  );
+  const later = controlIdempotencyKey(
+    "session-a",
+    "same instruction",
+    "operation-token",
+    1_920_000,
+  );
+  assert.equal(first, later);
+
+  const unscopedFirst = controlIdempotencyKey(
+    "session-a",
+    "same instruction",
+    "unscoped",
+    1_800_000,
+  );
+  const unscopedLater = controlIdempotencyKey(
+    "session-a",
+    "same instruction",
+    "unscoped",
+    1_920_000,
+  );
+  assert.notEqual(unscopedFirst, unscopedLater);
+});
+
+test("native control URL validates explicit port overrides", () => {
+  assert.equal(
+    resolveHermesApiUrl(null, "9000"),
+    "http://127.0.0.1:9000",
+  );
+
+  for (const invalid of ["0", "70000", "abc", "", "  ", "12.5"]) {
+    assert.equal(
+      resolveHermesApiUrl(null, invalid),
+      "http://127.0.0.1:8642",
+      "invalid port " + JSON.stringify(invalid) + " should use default URL",
+    );
+  }
+});
+
+test("explicit Hermes API URL takes precedence over port", () => {
+  assert.equal(
+    resolveHermesApiUrl("http://127.0.0.1:9999///", "70000"),
+    "http://127.0.0.1:9999",
+  );
+});
+
+test("status script rejects unsupported API URLs before curl", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-invalid-url-"));
+  const curlPath = path.join(tempDir, "curl");
+  const launchctlPath = path.join(tempDir, "launchctl");
+  const capturedUrlsPath = path.join(tempDir, "curl-urls.txt");
+  try {
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "printf '%s\\n' \"$url\" >> \"$STATUS_CURL_CAPTURE\"\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+    await writeFile(launchctlPath, "#!/bin/bash\nexit 1\n", "utf8");
+    await chmod(launchctlPath, 0o755);
+
+    for (const apiUrl of [
+      "ftp://hermes.example",
+      "http://user:pass@hermes.example",
+    ]) {
+      await writeFile(capturedUrlsPath, "", "utf8");
+      const result = spawnSync(
+        "bash",
+        [path.join(projectRoot, "scripts", "status.sh")],
+        {
+          cwd: projectRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            HOME: tempDir,
+            PATH: tempDir + path.delimiter + process.env.PATH,
+            API_SERVER_PORT: "8642",
+            HERMES_API_SERVER_KEY: "test-key",
+            HERMES_API_SERVER_URL: apiUrl,
+            STATUS_CURL_CAPTURE: capturedUrlsPath,
+          },
+        },
+      );
+
+      assert.match(result.stdout, /Hermes native Runs API: NOT READY/u);
+      const capturedUrls = (await readFile(capturedUrlsPath, "utf8"))
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+      assert.equal(
+        capturedUrls.some((url) => url.startsWith(apiUrl)),
+        false,
+        "unsupported Hermes API URL must not be passed to curl",
+      );
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("status script trims API URL whitespace and all trailing slashes", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-url-"));
+  const curlPath = path.join(tempDir, "curl");
+  const launchctlPath = path.join(tempDir, "launchctl");
+  const capturedUrlsPath = path.join(tempDir, "curl-urls.txt");
+  try {
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "printf '%s\\n' \"$url\" >> \"$STATUS_CURL_CAPTURE\"\n" +
+        "if [[ \"$url\" == */v1/capabilities ]]; then\n" +
+        "  printf '%s\\n' '{\"features\":{\"run_submission\":true,\"run_status\":true}}'\n" +
+        "fi\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+    await writeFile(launchctlPath, "#!/bin/bash\nexit 1\n", "utf8");
+    await chmod(launchctlPath, 0o755);
+
+    spawnSync("bash", [path.join(projectRoot, "scripts", "status.sh")], {
+      cwd: projectRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        PATH: tempDir + path.delimiter + process.env.PATH,
+        API_SERVER_PORT: "8642",
+        HERMES_API_SERVER_KEY: "test-key",
+        HERMES_API_SERVER_URL: " \t https://hermes.example/api/// \n",
+        STATUS_CURL_CAPTURE: capturedUrlsPath,
+      },
+    });
+
+    const capturedUrls = (await readFile(capturedUrlsPath, "utf8"))
+      .trim()
+      .split("\n");
+    assert.ok(
+      capturedUrls.includes("https://hermes.example/api/v1/capabilities"),
+      "status should request capabilities from the trimmed base URL",
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("status script requires stop and steer capabilities before READY", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-capabilities-"));
+  const curlPath = path.join(tempDir, "curl");
+  const launchctlPath = path.join(tempDir, "launchctl");
+  try {
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "if [[ \"$url\" == */v1/capabilities ]]; then\n" +
+        "  printf '%s\\n' \"$STATUS_CAPABILITIES\"\n" +
+        "fi\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+    await writeFile(launchctlPath, "#!/bin/bash\nexit 1\n", "utf8");
+    await chmod(launchctlPath, 0o755);
+
+    for (const capabilities of [
+      '{"features":{"run_submission":true,"run_status":true,"run_stop":false,"run_steer":true}}',
+      '{"features":{"run_submission":true,"run_status":true,"run_stop":true,"run_steer":false}}',
+    ]) {
+      const result = spawnSync(
+        "bash",
+        [path.join(projectRoot, "scripts", "status.sh")],
+        {
+          cwd: projectRoot,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            HOME: tempDir,
+            PATH: tempDir + path.delimiter + process.env.PATH,
+            HERMES_API_SERVER_KEY: "test-key",
+            HERMES_API_SERVER_URL: "http://127.0.0.1:8642",
+            STATUS_CAPABILITIES: capabilities,
+          },
+        },
+      );
+      assert.match(result.stdout, /Hermes native Runs API: NOT READY/u);
+    }
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("status script accepts endpoint-based steer capability", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-steer-endpoint-"));
+  const curlPath = path.join(tempDir, "curl");
+  const launchctlPath = path.join(tempDir, "launchctl");
+  try {
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "if [[ \"$url\" == */v1/capabilities ]]; then\n" +
+        "  printf '%s\\n' \"$STATUS_CAPABILITIES\"\n" +
+        "fi\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+    await writeFile(launchctlPath, "#!/bin/bash\nexit 1\n", "utf8");
+    await chmod(launchctlPath, 0o755);
+
+    const result = spawnSync(
+      "bash",
+      [path.join(projectRoot, "scripts", "status.sh")],
+      {
+        cwd: projectRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: tempDir,
+          PATH: tempDir + path.delimiter + process.env.PATH,
+          HERMES_API_SERVER_KEY: "test-key",
+          HERMES_API_SERVER_URL: "http://127.0.0.1:8642",
+          STATUS_CAPABILITIES:
+            '{"features":{"run_submission":true,"run_status":true,' +
+            '"run_stop":true,"run_steer":false},' +
+            '"endpoints":{"run_steer":"/v1/runs/:id/steer"}}',
+        },
+      },
+    );
+
+    assert.match(result.stdout, /Hermes native Runs API: READY/u);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("control rejects mismatched run ids from get, steer, and stop responses", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          run_id: "run-other",
+          session_id: "session-a",
+          status: "completed",
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+
+    const nativeControl = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    for (const operation of [
+      () => nativeControl.getRun("run-requested"),
+      () => nativeControl.steerRun("run-requested", "steer"),
+      () => nativeControl.stopRun("run-requested"),
+    ]) {
+      await assert.rejects(
+        operation(),
+        (error) =>
+          error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH" &&
+          error?.deliveryAmbiguous === false &&
+          error?.details?.expectedRunId === "run-requested" &&
+          error?.details?.returnedRunId === "run-other",
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
+
+test("synchronous native path handles terminal submission before polling", async () => {
+  const source = await readFile(
+    path.join(projectRoot, "src", "hermes-mcp.mjs"),
+    "utf8",
+  );
+  const start = source.indexOf("async function executeSynchronousNative");
+  const end = source.indexOf("async function executePublicTool", start);
+  const body = source.slice(start, end);
+  const terminalCheck = body.indexOf("if (runIsTerminal(started))");
+  const polling = body.indexOf("const waited = await waitForNativeRun(runId)");
+
+  assert.ok(terminalCheck >= 0, "terminal submission branch should exist");
+  assert.ok(
+    terminalCheck < polling,
+    "terminal submission must be handled before polling",
+  );
+  assert.match(
+    body,
+    /throw nativeRunFailureError\(started, runId, sessionScope\);/u,
+  );
+  assert.match(
+    body,
+    /nativeDelegateResult\(\s*started,\s*started,/u,
+  );
+  assert.match(
+    source,
+    /if \(error\?\.code === "HERMES_NATIVE_RUN_ID_MISMATCH"\) throw error;/u,
+  );
+});
+
+test("control smoke accepts both cancellation spellings", async () => {
+  const source = await readFile(
+    path.join(projectRoot, "src", "mcp-control-smoke.mjs"),
+    "utf8",
+  );
+  assert.match(
+    source,
+    /terminalStatuses = new Set\(\[[^\]]*"cancelled"[^\]]*"canceled"/su,
+  );
+  assert.match(
+    source,
+    /\["cancelled", "canceled"\]\.includes\(terminal\.status\)/u,
+  );
+});
+
+test("native run status supports a shorter per-poll timeout", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    globalThis.fetch = (_url, options = {}) =>
+      new Promise((_resolve, reject) => {
+        const onAbort = () => {
+          const error = new Error("aborted");
+          error.name = "AbortError";
+          reject(error);
+        };
+        if (options.signal?.aborted) {
+          onAbort();
+        } else {
+          options.signal?.addEventListener("abort", onAbort, { once: true });
+        }
+      });
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    const startedAt = Date.now();
+    await assert.rejects(
+      control.getRun("run-timeout", { timeoutMs: 20 }),
+      /timed out after 20ms/,
+    );
+    assert.ok(
+      Date.now() - startedAt < 250,
+      "per-poll timeout should bound a status request well below the default 30s",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+  }
+});
+
+test("status script falls back when API URL is whitespace only", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-status-blank-url-"));
+  const curlPath = path.join(tempDir, "curl");
+  const launchctlPath = path.join(tempDir, "launchctl");
+  const capturedUrlsPath = path.join(tempDir, "curl-urls.txt");
+  try {
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "printf '%s\\n' \"$url\" >> \"$STATUS_CURL_CAPTURE\"\n" +
+        "if [[ \"$url\" == */v1/capabilities ]]; then\n" +
+        "  printf '%s\\n' '{\"features\":{\"run_submission\":true,\"run_status\":true}}'\n" +
+        "fi\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+    await writeFile(launchctlPath, "#!/bin/bash\nexit 1\n", "utf8");
+    await chmod(launchctlPath, 0o755);
+
+    spawnSync("bash", [path.join(projectRoot, "scripts", "status.sh")], {
+      cwd: projectRoot,
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: tempDir,
+        PATH: tempDir + path.delimiter + process.env.PATH,
+        API_SERVER_PORT: "9001",
+        HERMES_API_SERVER_KEY: "test-key",
+        HERMES_API_SERVER_URL: "   \t \n",
+        STATUS_CURL_CAPTURE: capturedUrlsPath,
+      },
+    });
+
+    const capturedUrls = (await readFile(capturedUrlsPath, "utf8"))
+      .trim()
+      .split("\n");
+    assert.ok(
+      capturedUrls.includes("http://127.0.0.1:9001/v1/capabilities"),
+      "blank normalized URL should fall back to the resolved loopback port",
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("terminal submission with run id preserves returned terminal payload", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          run_id: "run-completed",
+          session_id: "session-completed",
+          status: "completed",
+          output: "done immediately",
+          usage: { total_tokens: 7 },
+          last_event: "run.completed",
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+
+    const nativeControl = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+    const result = await nativeControl.startRun(
+      "immediate completion",
+      null,
+      "scope",
+    );
+
+    assert.equal(result.runId, "run-completed");
+    assert.equal(result.sessionId, "session-completed");
+    assert.equal(result.status, "completed");
+    assert.equal(result.output, "done immediately");
+    assert.deepEqual(result.usage, { total_tokens: 7 });
+    assert.equal(result.lastEvent, "run.completed");
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
+
+test("definitive terminal submission without run id is not treated as ambiguous", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    globalThis.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          status: "rejected",
+          error: { message: "policy rejected" },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        },
+      );
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    await assert.rejects(
+      control.startRun("rejected work", null, "scope"),
+      (error) =>
+        error?.code === "HERMES_NATIVE_RUN_FAILED" &&
+        error?.deliveryAmbiguous === false &&
+        error?.details?.status === "rejected",
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
+
+test("malformed control URL fails definitively before submission", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "not a valid url";
+    let fetchCalled = false;
+    globalThis.fetch = async () => {
+      fetchCalled = true;
+      throw new Error("fetch should not be called");
+    };
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    await assert.rejects(
+      control.startRun("work", null, "scope"),
+      (error) => error?.deliveryAmbiguous === false,
+    );
+    assert.equal(fetchCalled, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
+
+test("unsupported control URLs fail definitively before submission", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    for (const [label, url] of [
+      ["unsupported protocol", "ftp://hermes.example"],
+      ["embedded credentials", "http://user:pass@hermes.example"],
+    ]) {
+      process.env.HERMES_API_SERVER_URL = url;
+      let fetchCalled = false;
+      globalThis.fetch = async () => {
+        fetchCalled = true;
+        throw new Error("fetch should not be called");
+      };
+
+      const control = createHermesControl({
+        redactText: String,
+        redactValue: (value) => value,
+      });
+
+      await assert.rejects(
+        control.startRun("work", null, "scope"),
+        (error) => error?.deliveryAmbiguous === false,
+        label + " should be a definitive setup failure",
+      );
+      assert.equal(fetchCalled, false, label + " should be rejected before fetch");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
+
+test("setup script rejects capabilities without run_status", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-setup-run-status-"));
+  const hermesPath = path.join(tempDir, "hermes");
+  const curlPath = path.join(tempDir, "curl");
+  try {
+    await writeFile(
+      hermesPath,
+      "#!/bin/bash\n" +
+        "case \"$1:$2\" in\n" +
+        "  config:env-path) printf '%s\\n' \"$SETUP_ENV_FILE\" ;;\n" +
+        "  config:get)\n" +
+        "    case \"$3\" in\n" +
+        "      API_SERVER_KEY) printf '%s\\n' test-key ;;\n" +
+        "      API_SERVER_PORT) printf '%s\\n' 8642 ;;\n" +
+        "      *) exit 1 ;;\n" +
+        "    esac ;;\n" +
+        "  config:set|gateway:stop|gateway:start) exit 0 ;;\n" +
+        "  *) exit 0 ;;\n" +
+        "esac\n",
+      "utf8",
+    );
+    await chmod(hermesPath, 0o755);
+    await writeFile(
+      curlPath,
+      "#!/bin/bash\n" +
+        "for arg in \"$@\"; do url=\"$arg\"; done\n" +
+        "if [[ \"$url\" == */v1/capabilities ]]; then\n" +
+        "  printf '%s\\n' \"$SETUP_CAPABILITIES\"\n" +
+        "fi\n" +
+        "exit 0\n",
+      "utf8",
+    );
+    await chmod(curlPath, 0o755);
+
+    const result = spawnSync(
+      "bash",
+      [path.join(projectRoot, "scripts", "setup-hermes-control.sh")],
+      {
+        cwd: projectRoot,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HOME: tempDir,
+          PATH: tempDir + path.delimiter + process.env.PATH,
+          HERMES_BIN: hermesPath,
+          SETUP_ENV_FILE: path.join(tempDir, ".env"),
+          SETUP_CAPABILITIES:
+            '{"features":{"run_submission":true,"run_status":false,' +
+            '"run_stop":true,"run_steer":true}}',
+        },
+      },
+    );
+
+    assert.notEqual(result.status, 0, "missing run_status must fail setup");
+    assert.match(
+      result.stderr + result.stdout,
+      /required Runs API capabilities are missing/u,
+    );
+    assert.doesNotMatch(result.stdout, /Run submission: READY/u);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("invalid authorization header fails definitively before submission", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "bad\nkey";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    let fetchCalled = false;
+    globalThis.fetch = async () => {
+      fetchCalled = true;
+      throw new Error("fetch should not be called");
+    };
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    await assert.rejects(
+      control.startRun("work", null, "scope"),
+      (error) => error?.deliveryAmbiguous === false,
+    );
+    assert.equal(fetchCalled, false);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
+});
+
+
+test("bridge clears ordinary missing runs but preserves unresolved session bindings", async () => {
+  const source = await readFile(
+    path.join(projectRoot, "src", "hermes-mcp.mjs"),
+    "utf8",
+  );
+
+  assert.match(
+    source,
+    /function nativeRunNotFoundError\(error\)[\s\S]*run_not_found/su,
+  );
+  assert.match(
+    source,
+    /if \(active\.kind === "native-session-unresolved"\) \{[\s\S]*terminal: false,[\s\S]*preserveUnresolved: true/su,
+  );
+  assert.match(
+    source,
+    /HERMES_NATIVE_RUN_NOT_FOUND_RECOVERED/su,
+  );
+  assert.match(
+    source,
+    /before\?\.active\?\.kind === "run"[\s\S]*before\.active\.runId === runId/su,
+  );
+  assert.match(
+    source,
+    /handoffReason: "synchronous_wait_exhausted"/su,
+  );
+  assert.match(
+    source,
+    /nextAction:[\s\S]*get_hermes_run[\s\S]*Do not resubmit or stop/su,
+  );
+});
+
+test("bridge preserves a returned runId if first coordinator persistence fails", async () => {
+  const source = await readFile(
+    path.join(projectRoot, "src", "hermes-mcp.mjs"),
+    "utf8",
+  );
+
+  assert.match(
+    source,
+    /async function preserveKnownSubmittedRun\([\s\S]*preserveSubmittedRun/su,
+  );
+  assert.match(
+    source,
+    /let runRecorded = false;[\s\S]*if \(!runRecorded\) \{[\s\S]*preserveKnownSubmittedRun/su,
+  );
+  const asyncStart = source.slice(
+    source.indexOf('case "start_hermes_run"'),
+    source.indexOf('case "get_hermes_run"'),
+  );
+  assert.match(
+    asyncStart,
+    /let runRecorded = false;[\s\S]*if \(!runRecorded\) \{[\s\S]*preserveKnownSubmittedRun/su,
+  );
+});
+
+
+test("Hermes 0.21.5 control scripts use raw secret reads and bounded setup restart", async () => {
+  const setupSource = await readFile(
+    path.join(projectRoot, "scripts", "setup-hermes-control.sh"),
+    "utf8",
+  );
+  const startSource = await readFile(
+    path.join(projectRoot, "scripts", "start-bridge.sh"),
+    "utf8",
+  );
+  const statusSource = await readFile(
+    path.join(projectRoot, "scripts", "status.sh"),
+    "utf8",
+  );
+
+  assert.match(setupSource, /config get "\$key" --raw/u);
+  assert.match(startSource, /config get API_SERVER_KEY --raw/u);
+  assert.match(statusSource, /config get API_SERVER_KEY --raw/u);
+  assert.match(setupSource, /config set API_SERVER_HOST 127\.0\.0\.1/u);
+  assert.match(setupSource, /config set API_SERVER_PORT "\$PORT"/u);
+  assert.match(setupSource, /gateway stop/u);
+  assert.match(setupSource, /gateway start/u);
+  assert.doesNotMatch(setupSource, /"\\$HERMES_BIN" gateway restart/u);
+});

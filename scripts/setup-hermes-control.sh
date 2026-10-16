@@ -29,26 +29,36 @@ read_env_value() {
   ' "$ENV_FILE"
 }
 
+read_config_raw() {
+  local key="$1"
+  "$HERMES_BIN" config get "$key" --raw 2>/dev/null || true
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] &&
+    (( 10#$1 >= 1 && 10#$1 <= 65535 ))
+}
+
 API_KEY="$(read_env_value API_SERVER_KEY)"
 if [[ -z "$API_KEY" ]]; then
-  API_KEY="$("$HERMES_BIN" config get API_SERVER_KEY 2>/dev/null || true)"
+  API_KEY="$(read_config_raw API_SERVER_KEY)"
 fi
 
 if [[ -z "$API_KEY" ]]; then
   if command -v openssl >/dev/null 2>&1; then
     GENERATED_API_KEY="$(openssl rand -hex 32)"
   else
-    GENERATED_API_KEY="$(python3 - <<'PY'
-import secrets
-print(secrets.token_hex(32))
-PY
-)"
+    GENERATED_API_KEY="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
   fi
   "$HERMES_BIN" config set API_SERVER_KEY "$GENERATED_API_KEY" >/dev/null
 
-  # Do not trust the writer's exit code alone: resolve the value back through
-  # Hermes' own config/secret precedence and fail closed if it was not retained.
-  API_KEY="$("$HERMES_BIN" config get API_SERVER_KEY 2>/dev/null || true)"
+  # Hermes 0.21.5 masks credential-shaped values from "config get" unless
+  # --raw is requested. Prefer the file Hermes says it wrote, then use the
+  # raw CLI as a compatibility fallback.
+  API_KEY="$(read_env_value API_SERVER_KEY)"
+  if [[ -z "$API_KEY" ]]; then
+    API_KEY="$(read_config_raw API_SERVER_KEY)"
+  fi
   if [[ -z "$API_KEY" ]]; then
     unset GENERATED_API_KEY
     echo "Hermes did not retain API_SERVER_KEY after config set." >&2
@@ -60,25 +70,30 @@ else
   echo "Reusing the existing Hermes API server key."
 fi
 
-"$HERMES_BIN" config set API_SERVER_ENABLED true >/dev/null
-"$HERMES_BIN" config set platforms.api_server.extra.host 127.0.0.1 >/dev/null
-
 PORT="$(read_env_value API_SERVER_PORT)"
-if [[ -z "$PORT" ]]; then
+if ! valid_port "$PORT"; then
   PORT="$("$HERMES_BIN" config get API_SERVER_PORT 2>/dev/null || true)"
 fi
-if [[ -z "$PORT" ]]; then
-  PORT="$("$HERMES_BIN" config get platforms.api_server.extra.port 2>/dev/null || true)"
-fi
-if [[ ! "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+if ! valid_port "$PORT"; then
   PORT=8642
 fi
 
+# Use the public API_SERVER_* settings documented by current Hermes instead of
+# relying on legacy/internal platform config paths.
+"$HERMES_BIN" config set API_SERVER_ENABLED true >/dev/null
+"$HERMES_BIN" config set API_SERVER_HOST 127.0.0.1 >/dev/null
+"$HERMES_BIN" config set API_SERVER_PORT "$PORT" >/dev/null
+
+# "gateway restart" can intentionally drain active Runs for a very long time.
+# Control-API setup needs the new environment to take effect now, so perform a
+# bounded lifecycle restart instead. Hermes' stop path already escalates a
+# non-exiting gateway after its bounded grace period.
 echo "Restarting Hermes gateway with the control API enabled..."
-"$HERMES_BIN" gateway restart >/dev/null
+"$HERMES_BIN" gateway stop >/dev/null 2>&1 || true
+"$HERMES_BIN" gateway start >/dev/null
 
 READY=0
-for _ in $(seq 1 30); do
+for _ in $(seq 1 60); do
   if curl -fsS --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
     READY=1
     break
@@ -89,22 +104,34 @@ done
 if [[ "$READY" -ne 1 ]]; then
   echo "Hermes API server did not become ready on 127.0.0.1:$PORT." >&2
   "$HERMES_BIN" gateway status || true
+  LOG_DIR="$(dirname "$ENV_FILE")/logs"
+  if [[ -f "$LOG_DIR/gateway.error.log" ]]; then
+    echo >&2
+    echo "Hermes gateway stderr tail:" >&2
+    tail -n 50 "$LOG_DIR/gateway.error.log" >&2 || true
+  fi
   exit 2
 fi
 
-CAPS="$(curl -fsS --max-time 5   -H "Authorization: Bearer $API_KEY"   "http://127.0.0.1:$PORT/v1/capabilities")"
+CAPS="$(curl -fsS --max-time 5 \
+  -H "Authorization: Bearer $API_KEY" \
+  "http://127.0.0.1:$PORT/v1/capabilities")"
 
-if ! printf '%s' "$CAPS" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-features = data.get("features") or {}
-endpoints = data.get("endpoints") or {}
-ok = (
-    features.get("run_submission") is True
-    and features.get("run_stop") is True
-    and (features.get("run_steer") is True or bool(endpoints.get("run_steer")))
-)
-raise SystemExit(0 if ok else 1)
+if ! printf '%s' "$CAPS" | node -e '
+const fs = require("node:fs");
+try {
+  const data = JSON.parse(fs.readFileSync(0, "utf8"));
+  const features = data.features || {};
+  const endpoints = data.endpoints || {};
+  const ok =
+    features.run_submission === true &&
+    features.run_status === true &&
+    features.run_stop === true &&
+    (features.run_steer === true || Boolean(endpoints.run_steer));
+  process.exit(ok ? 0 : 1);
+} catch {
+  process.exit(1);
+}
 '; then
   echo "Hermes API server is reachable but required Runs API capabilities are missing." >&2
   exit 3
@@ -115,7 +142,7 @@ unset API_KEY CAPS
 echo "===== HERMES CONTROL API ====="
 echo "Enabled: YES"
 echo "Bind: 127.0.0.1:$PORT"
-echo "Authentication: bearer key resolved by Hermes config"
+echo "Authentication: bearer key resolved from Hermes .env/config"
 echo "Run submission: READY"
 echo "Run steer/stop: READY"
 echo "===== END HERMES CONTROL API ====="

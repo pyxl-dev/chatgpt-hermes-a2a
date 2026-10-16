@@ -151,7 +151,6 @@ export function createHermesSessionAccess({
   root,
   redactText,
   randomUUID,
-  cleanText,
 }) {
   const runtimeDir = path.join(root, ".runtime");
   const hermesBin = process.env.HERMES_BIN || "hermes";
@@ -324,38 +323,11 @@ export function createHermesSessionAccess({
     };
   }
 
-  async function continueSession(sessionId, instruction) {
-    const requestedSessionId = requireSessionId(sessionId);
-    if (typeof instruction !== "string" || instruction.trim() === "") {
-      throw new Error("instruction must be a non-empty string");
-    }
-
-    const { stdout } = await runHermes([
-      "chat",
-      "-q",
-      instruction,
-      "-Q",
-      "--resume",
-      requestedSessionId,
-    ]);
-
-    return {
-      ok: true,
-      operation: "continue_hermes_session",
-      agent: "hermes",
-      requestedSessionId,
-      sessionId: requestedSessionId,
-      state: 3,
-      stateName: "completed",
-      text: cleanText(stdout || "") || null,
-    };
-  }
 
   return {
     hermesBin,
     timeoutMs,
     listSessions,
     getSession,
-    continueSession,
   };
 }

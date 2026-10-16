@@ -11,7 +11,7 @@ CONNECTORS_URL="https://chatgpt.com/#settings/Connectors"
 
 cat <<'TXT'
 
-Next step: connect the validated local Hermes MCP→A2A bridge to ChatGPT.
+Next step: connect the validated Hermes native MCP bridge to ChatGPT.
 
 Two OpenAI values are required:
   1) a Tunnel ID (tunnel_...)
@@ -84,7 +84,7 @@ fi
 echo
 echo "TUNNEL READY"
 echo "Tunnel ID: $CONTROL_PLANE_TUNNEL_ID"
-echo "Local Hermes path: MCP -> A2A -> Hermes -> Mac"
+echo "Local Hermes path: MCP -> Hermes native Runs API -> Mac"
 echo
 echo "Opening ChatGPT connector settings."
 echo "Create/edit the plugin, choose Connection: Tunnel, then select or paste:"

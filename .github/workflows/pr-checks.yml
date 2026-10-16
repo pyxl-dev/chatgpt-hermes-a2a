@@ -1,0 +1,36 @@
+name: PR checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - fix/chatgpt-session-coordinator
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 22.16.0
+          - 26
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node-version }}
+      - run: npm install --no-package-lock --no-audit --no-fund
+      - run: npm test
+      - run: npm run check
+      - run: |
+          bash -n \
+            scripts/status.sh \
+            scripts/run-all.sh \
+            scripts/setup-hermes-control.sh \
+            scripts/start-bridge.sh

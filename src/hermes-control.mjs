@@ -2,6 +2,13 @@ import { createHash } from "node:crypto";
 
 const DEFAULT_API_URL = "http://127.0.0.1:8642";
 const DEFAULT_TIMEOUT_MS = 30000;
+const UNSUCCESSFUL_TERMINAL_RUN_STATUSES = new Set([
+  "failed",
+  "rejected",
+  "cancelled",
+  "canceled",
+  "interrupted",
+]);
 
 function requiredString(value, label) {
   if (typeof value !== "string" || value.trim() === "") {
@@ -10,20 +17,54 @@ function requiredString(value, label) {
   return value.trim();
 }
 
-function controlIdempotencyKey(sessionId, instruction) {
-  const bucket = Math.floor(Date.now() / 60000);
+function normalizeInstruction(value) {
+  return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
+}
+
+function normalizedApiPort(value) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/u.test(text)) return null;
+  const port = Number(text);
+  return Number.isInteger(port) && port >= 1 && port <= 65535
+    ? String(port)
+    : null;
+}
+
+export function resolveHermesApiUrl(
+  apiServerUrl = process.env.HERMES_API_SERVER_URL,
+  apiServerPort = process.env.API_SERVER_PORT,
+) {
+  const explicitUrl = String(apiServerUrl || "").trim();
+  if (explicitUrl) return explicitUrl.replace(/\/+$/u, "");
+
+  const port = normalizedApiPort(apiServerPort);
+  return port ? "http://127.0.0.1:" + port : DEFAULT_API_URL;
+}
+
+export function controlIdempotencyKey(
+  sessionId,
+  instruction,
+  scope = "unscoped",
+  nowMs = Date.now(),
+) {
+  const normalizedScope = String(scope || "unscoped");
+  const prefix =
+    normalizedScope === "unscoped"
+      ? "minute:" + Math.floor(nowMs / 60000)
+      : "operation:" + normalizedScope;
   return createHash("sha256")
-    .update(String(bucket) + "\n" + String(sessionId || "new") + "\n" + instruction)
+    .update(
+      prefix +
+        "\n" +
+        String(sessionId || "new") +
+        "\n" +
+        normalizeInstruction(instruction),
+    )
     .digest("hex");
 }
 
 export function createHermesControl({ redactText, redactValue }) {
-  const apiUrl = String(
-    process.env.HERMES_API_SERVER_URL ||
-      (process.env.API_SERVER_PORT
-        ? "http://127.0.0.1:" + process.env.API_SERVER_PORT
-        : DEFAULT_API_URL),
-  ).replace(/\/+$/u, "");
+  const apiUrl = resolveHermesApiUrl();
   const apiKey =
     process.env.HERMES_API_SERVER_KEY || process.env.API_SERVER_KEY || "";
   const configuredTimeout = Number(process.env.HERMES_CONTROL_TIMEOUT_MS);
@@ -40,20 +81,74 @@ export function createHermesControl({ redactText, redactValue }) {
     }
   }
 
-  async function request(path, { method = "GET", body, headers = {} } = {}) {
+  function assertReturnedRunId(expectedRunId, payload, operation) {
+    const rawReturnedRunId = payload?.run_id ?? payload?.id ?? null;
+    const returnedRunId =
+      typeof rawReturnedRunId === "string"
+        ? rawReturnedRunId.trim()
+        : "";
+    if (returnedRunId && returnedRunId !== expectedRunId) {
+      const error = new Error(
+        "Hermes returned a different runId than the requested Run.",
+      );
+      error.code = "HERMES_NATIVE_RUN_ID_MISMATCH";
+      error.deliveryAmbiguous = false;
+      error.details = {
+        operation,
+        expectedRunId,
+        returnedRunId,
+      };
+      throw error;
+    }
+  }
+
+  async function request(
+    path,
+    {
+      method = "GET",
+      body,
+      headers = {},
+      timeoutOverrideMs = null,
+    } = {},
+  ) {
     ensureConfigured();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const methodName = String(method || "GET").toUpperCase();
+    const configuredOverride = Number(timeoutOverrideMs);
+    const requestTimeoutMs =
+      Number.isFinite(configuredOverride) && configuredOverride > 0
+        ? Math.min(timeoutMs, Math.max(1, Math.floor(configuredOverride)))
+        : timeoutMs;
+    let requestUrl;
+    let requestHeaders;
     try {
-      const response = await fetch(apiUrl + path, {
+      requestUrl = new URL(apiUrl + path);
+      if (
+        !["http:", "https:"].includes(requestUrl.protocol) ||
+        requestUrl.username !== "" ||
+        requestUrl.password !== ""
+      ) {
+        throw new Error(
+          "Hermes control API URL must use HTTP(S) and must not contain credentials",
+        );
+      }
+      requestHeaders = new Headers({
+        Authorization: "Bearer " + apiKey,
+        Accept: "application/json",
+        ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+        ...headers,
+      });
+    } catch (error) {
+      error.deliveryAmbiguous = false;
+      throw error;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), requestTimeoutMs);
+    try {
+      const response = await fetch(requestUrl, {
         method,
         signal: controller.signal,
-        headers: {
-          Authorization: "Bearer " + apiKey,
-          Accept: "application/json",
-          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-          ...headers,
-        },
+        headers: requestHeaders,
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
       const raw = await response.text();
@@ -86,14 +181,25 @@ export function createHermesControl({ redactText, redactValue }) {
         );
         error.status = response.status;
         error.code = payload?.error?.code || payload?.code || null;
+        error.deliveryAmbiguous =
+          methodName !== "GET" && response.status >= 500;
         throw error;
       }
       return redactValue(payload || {});
     } catch (error) {
       if (error?.name === "AbortError") {
-        throw new Error(
-          "Hermes control API request timed out after " + timeoutMs + "ms",
+        const timeoutError = new Error(
+          "Hermes control API request timed out after " + requestTimeoutMs + "ms",
         );
+        timeoutError.deliveryAmbiguous = methodName !== "GET";
+        throw timeoutError;
+      }
+      if (
+        methodName !== "GET" &&
+        error?.deliveryAmbiguous === undefined &&
+        error?.status === undefined
+      ) {
+        error.deliveryAmbiguous = true;
       }
       throw error;
     } finally {
@@ -117,7 +223,11 @@ export function createHermesControl({ redactText, redactValue }) {
     };
   }
 
-  async function startRun(instruction, sessionId = null) {
+  async function startRun(
+    instruction,
+    sessionId = null,
+    idempotencyScope = "unscoped",
+  ) {
     const text = requiredString(instruction, "instruction");
     const durableSessionId =
       typeof sessionId === "string" && sessionId.trim()
@@ -126,27 +236,66 @@ export function createHermesControl({ redactText, redactValue }) {
     const payload = await request("/v1/runs", {
       method: "POST",
       headers: {
-        "Idempotency-Key": controlIdempotencyKey(durableSessionId, text),
+        "Idempotency-Key": controlIdempotencyKey(
+          durableSessionId,
+          text,
+          idempotencyScope,
+        ),
       },
       body: {
         input: text,
         ...(durableSessionId ? { session_id: durableSessionId } : {}),
       },
     });
+    const runId = payload?.run_id || payload?.id || null;
+    const status = payload?.status || "started";
+    if (
+      !runId &&
+      UNSUCCESSFUL_TERMINAL_RUN_STATUSES.has(
+        String(status).toLowerCase(),
+      )
+    ) {
+      const error = new Error(
+        redactText(
+          "Hermes rejected native Run submission before returning a runId" +
+            (status ? " (status: " + status + ")" : "") +
+            ".",
+        ),
+      );
+      error.code = "HERMES_NATIVE_RUN_FAILED";
+      error.deliveryAmbiguous = false;
+      error.details = {
+        runId: null,
+        sessionId: payload?.session_id || durableSessionId || null,
+        status,
+        error: payload?.error || null,
+      };
+      throw error;
+    }
+
     return {
       ok: true,
       operation: "start_hermes_run",
       agent: "hermes",
-      runId: payload?.run_id || payload?.id || null,
+      runId,
       sessionId: payload?.session_id || durableSessionId || null,
-      status: payload?.status || "started",
+      status,
+      output: payload?.output || null,
+      error: payload?.error || null,
+      usage: payload?.usage || null,
+      pendingSteer: payload?.pending_steer || null,
+      lastEvent: payload?.last_event || null,
+      approval: payload?.approval || null,
       replayed: payload?.replayed === true,
     };
   }
 
-  async function getRun(runId) {
+  async function getRun(runId, { timeoutMs: timeoutOverrideMs = null } = {}) {
     const id = requiredString(runId, "runId");
-    const payload = await request("/v1/runs/" + encodeURIComponent(id));
+    const payload = await request("/v1/runs/" + encodeURIComponent(id), {
+      timeoutOverrideMs,
+    });
+    assertReturnedRunId(id, payload, "get_hermes_run");
     return {
       ok: true,
       operation: "get_hermes_run",
@@ -173,6 +322,7 @@ export function createHermesControl({ redactText, redactValue }) {
         body: { input: text },
       },
     );
+    assertReturnedRunId(id, payload, "steer_hermes_run");
     return {
       ok: true,
       operation: "steer_hermes_run",
@@ -189,6 +339,7 @@ export function createHermesControl({ redactText, redactValue }) {
       "/v1/runs/" + encodeURIComponent(id) + "/stop",
       { method: "POST", body: {} },
     );
+    assertReturnedRunId(id, payload, "stop_hermes_run");
     return {
       ok: true,
       operation: "stop_hermes_run",
