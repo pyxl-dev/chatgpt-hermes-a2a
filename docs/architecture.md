@@ -66,11 +66,60 @@ The tunnel gives ChatGPT access to the wrapper, not arbitrary direct network or 
 
 The raw `_meta["openai/session"]` value is SHA-256 hashed immediately. Only the hash is persisted.
 
-Each record contains:
+### Slots
+
+One ChatGPT conversation drives up to three durable Hermes sessions, called
+slots (`MAX_SLOTS = 3`). Each slot is bound to at most one canonical Hermes
+session and holds at most one active Run, so a conversation never has more than
+three Runs in flight and one Hermes session never receives two concurrent Runs.
+
+- Slot 1 is the default. Every Run tool (`delegate_to_hermes`,
+  `continue_hermes_session`, `start_hermes_run`, `get_hermes_run`,
+  `steer_hermes_run`, `stop_hermes_run`) accepts an optional `slot` (1-3);
+  without it the call addresses slot 1 and behaves exactly as the single-session
+  bridge did.
+- Slots 2 and 3 exist only once work is started on them. Reads never create a
+  slot.
+- A slot stays bound to its session after its Run ends, so follow-ups keep the
+  context. Slots are never freed automatically.
+- `replaceSession: true` (idle slot only) moves the slot's binding to
+  `archivedSessions` and starts the slot on a fresh session, or on the given
+  `sessionId` for `continue_hermes_session`. The Hermes session itself is never
+  touched or deleted; if the submission is definitively rejected, the previous
+  binding is restored.
+- A session already bound to (or running in) another slot of the conversation
+  is refused with `HERMES_SESSION_BOUND_TO_OTHER_SLOT`.
+- `steer_hermes_run`, `stop_hermes_run`, `get_hermes_run` and
+  `hermes_tool_timeline` resolve the slot from `runId` when `slot` is omitted.
+- Every slot shares the Mac workspace Hermes runs in: the Runs API takes no
+  working directory. Starting work while another slot is active returns
+  `parallelRuns` and a `warnings` entry so ChatGPT keeps parallel instructions on
+  disjoint files.
+- Hermes caps concurrent Runs globally (`api_server.max_concurrent_runs`, 10
+  by default) and answers 429 beyond it. The bridge reports that as
+  `HERMES_RUN_CAPACITY_EXHAUSTED` and releases the slot, since nothing was
+  submitted.
+
+`get_hermes_run` with neither `runId` nor `slot` reads the whole conversation:
+with at most one busy slot it answers exactly as before (plus `slot`); with
+several busy slots it polls all of them for up to 55 seconds, returns as soon as
+one is terminal, and answers `resolution: "conversation-active-slots"` with one
+entry per slot in `runs` and a `slots` overview. Terminal entries are settled in
+the coordinator and the run-finished notifier the same way single Runs are, and
+Discord messages for slots 2/3 name the slot.
+
+Busy errors (`HERMES_SESSION_BUSY`) carry the slot and the conversation's
+`freeSlots`.
+
+### Persisted state
 
 ```text
-canonicalSessionId
-active:
+version: 4
+conversations[sessionHash].slots["1" | "2" | "3"]:
+  canonicalSessionId
+  history[]        last 10 Runs: runId, tool, traceId, sessionId, startedAt, endedAt, outcome
+  archivedSessions[]  sessionId, archivedAt, reason, lastRunId
+  active:
   operationId
   tool
   kind: native-pending | native-submission-unknown | run | native-session-unresolved
@@ -81,11 +130,16 @@ active:
   ownerInstanceId
   idempotencyKey
   reusedSession
-recentResults[fingerprint]:
+  replacedSessionId (only while a replacement is in flight)
+recentResults[sessionHash][fingerprint]:
   settledAtMs
   traceId
   payload
 ```
+
+Replay fingerprints for slot 1 are unchanged from version 3; slots 2 and 3
+hash the slot into the fingerprint, so the same instruction sent to two slots is
+never deduplicated across them.
 
 There is deliberately no route discriminator, `contextId`, `taskId`, A2A state or restore-on-A2A-resumption logic.
 
@@ -154,19 +208,26 @@ The active record also persists whether the operation already had a durable sess
 `start_hermes_run` exposes the same submission path asynchronously. The returned `runId` remains the active mutating operation.
 
 - `get_hermes_run` observes terminal state and can preserve replay for a successful original operation.
-- `steer_hermes_run` requires the active `runId` for tracked ChatGPT sessions.
+- `steer_hermes_run` requires the active `runId` of one of the conversation's slots for tracked ChatGPT sessions.
 - `stop_hermes_run` requires the active `runId`; if the stop races with natural successful completion, the coordinator preserves the successful replay instead of losing it.
 
 ## Persisted-state migration
 
-Coordinator state version 3 is native-only and stores replay results by fingerprint.
+Coordinator state version 4 nests the per-conversation record under slots.
+Loading version-3 state moves each conversation's record, unchanged, into slot
+1 (canonical session, active Run, idempotency key, ownership) and keeps the
+replay map as is, so exact retries recorded before the upgrade still replay and
+an active Run keeps slot 1 locked. A newer, unknown version fails closed
+without overwrite; the previous bridge build therefore refuses a version-4 file
+instead of silently dropping slots 2/3.
 
 When loading version-1 mixed-route state or version-2 native state:
 
 - native canonical `sessionId` and native Run state are retained;
 - legacy A2A contexts/tasks are discarded;
 - only native-looking replay payloads are retained;
-- legacy single-slot replay entries are migrated into the version-3 per-fingerprint replay map.
+- legacy single-slot replay entries are migrated into the per-fingerprint replay map;
+- the result lands in slot 1 of version 4.
 
 This migration exists so existing installations can move to the native-only bridge without keeping the old A2A state machine alive.
 
