@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 
+import { DEFAULT_PROFILE, profileOrDefault } from "./hermes-profiles.mjs";
+
 const DEFAULT_API_URL = "http://127.0.0.1:8642";
 const DEFAULT_TIMEOUT_MS = 30000;
 const UNSUCCESSFUL_TERMINAL_RUN_STATUSES = new Set([
@@ -78,7 +80,14 @@ export function controlIdempotencyKey(
     .digest("hex");
 }
 
-export function createHermesControl({ redactText, redactValue }) {
+// Hermes' multiplexed gateway serves every named profile on the default
+// listener under /p/<profile>/; the default profile keeps the bare paths.
+export function profilePathPrefix(profile) {
+  const name = profileOrDefault(profile);
+  return name === DEFAULT_PROFILE ? "" : "/p/" + encodeURIComponent(name);
+}
+
+export function createHermesControl({ redactText, redactValue, profiles = null }) {
   const apiUrl = resolveHermesApiUrl();
   const apiKey =
     process.env.HERMES_API_SERVER_KEY || process.env.API_SERVER_KEY || "";
@@ -118,6 +127,20 @@ export function createHermesControl({ redactText, redactValue }) {
     }
   }
 
+  async function bearerFor(profile) {
+    const name = profileOrDefault(profile);
+    if (name === DEFAULT_PROFILE) return apiKey;
+    if (!profiles) {
+      const error = new Error(
+        "Hermes profile '" + name + "' cannot be reached: profile routing is not configured.",
+      );
+      error.code = "HERMES_PROFILE_NOT_CONFIGURED";
+      error.deliveryAmbiguous = false;
+      throw error;
+    }
+    return profiles.requireApiKey(name);
+  }
+
   async function request(
     path,
     {
@@ -125,9 +148,11 @@ export function createHermesControl({ redactText, redactValue }) {
       body,
       headers = {},
       timeoutOverrideMs = null,
+      profile = null,
     } = {},
   ) {
     ensureConfigured();
+    const bearer = await bearerFor(profile);
     const methodName = String(method || "GET").toUpperCase();
     const configuredOverride = Number(timeoutOverrideMs);
     const requestTimeoutMs =
@@ -137,7 +162,7 @@ export function createHermesControl({ redactText, redactValue }) {
     let requestUrl;
     let requestHeaders;
     try {
-      requestUrl = new URL(apiUrl + path);
+      requestUrl = new URL(apiUrl + profilePathPrefix(profile) + path);
       if (
         !["http:", "https:"].includes(requestUrl.protocol) ||
         requestUrl.username !== "" ||
@@ -148,7 +173,7 @@ export function createHermesControl({ redactText, redactValue }) {
         );
       }
       requestHeaders = new Headers({
-        Authorization: "Bearer " + apiKey,
+        Authorization: "Bearer " + bearer,
         Accept: "application/json",
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
         ...headers,
@@ -230,13 +255,14 @@ export function createHermesControl({ redactText, redactValue }) {
     }
   }
 
-  async function status() {
-    const payload = await request("/v1/capabilities");
+  async function status({ profile = null } = {}) {
+    const payload = await request("/v1/capabilities", { profile });
     return {
       ok: true,
       operation: "hermes_control_status",
       agent: "hermes",
       apiUrl,
+      profile: profileOrDefault(profile),
       runSubmission: payload?.features?.run_submission === true,
       runStatus: payload?.features?.run_status === true,
       runSteer:
@@ -250,6 +276,7 @@ export function createHermesControl({ redactText, redactValue }) {
     instruction,
     sessionId = null,
     idempotencyScope = "unscoped",
+    { profile = null } = {},
   ) {
     const text = requiredString(instruction, "instruction");
     const durableSessionId =
@@ -258,6 +285,7 @@ export function createHermesControl({ redactText, redactValue }) {
         : null;
     const payload = await request("/v1/runs", {
       method: "POST",
+      profile,
       headers: {
         "Idempotency-Key": controlIdempotencyKey(
           durableSessionId,
@@ -302,6 +330,7 @@ export function createHermesControl({ redactText, redactValue }) {
       agent: "hermes",
       runId,
       sessionId: payload?.session_id || durableSessionId || null,
+      profile: profileOrDefault(profile),
       status,
       output: payload?.output || null,
       error: payload?.error || null,
@@ -313,10 +342,14 @@ export function createHermesControl({ redactText, redactValue }) {
     };
   }
 
-  async function getRun(runId, { timeoutMs: timeoutOverrideMs = null } = {}) {
+  async function getRun(
+    runId,
+    { timeoutMs: timeoutOverrideMs = null, profile = null } = {},
+  ) {
     const id = requiredString(runId, "runId");
     const payload = await request("/v1/runs/" + encodeURIComponent(id), {
       timeoutOverrideMs,
+      profile,
     });
     assertReturnedRunId(id, payload, "get_hermes_run");
     return {
@@ -325,6 +358,7 @@ export function createHermesControl({ redactText, redactValue }) {
       agent: "hermes",
       runId: payload?.run_id || id,
       sessionId: payload?.session_id || null,
+      profile: profileOrDefault(profile),
       status: payload?.status || null,
       output: payload?.output || null,
       error: payload?.error || null,
@@ -335,13 +369,14 @@ export function createHermesControl({ redactText, redactValue }) {
     };
   }
 
-  async function steerRun(runId, instruction) {
+  async function steerRun(runId, instruction, { profile = null } = {}) {
     const id = requiredString(runId, "runId");
     const text = requiredString(instruction, "instruction");
     const payload = await request(
       "/v1/runs/" + encodeURIComponent(id) + "/steer",
       {
         method: "POST",
+        profile,
         body: { input: withMessageHeader(text, messageHeader) },
       },
     );
@@ -356,11 +391,11 @@ export function createHermesControl({ redactText, redactValue }) {
     };
   }
 
-  async function stopRun(runId) {
+  async function stopRun(runId, { profile = null } = {}) {
     const id = requiredString(runId, "runId");
     const payload = await request(
       "/v1/runs/" + encodeURIComponent(id) + "/stop",
-      { method: "POST", body: {} },
+      { method: "POST", profile, body: {} },
     );
     assertReturnedRunId(id, payload, "stop_hermes_run");
     return {

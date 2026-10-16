@@ -408,7 +408,7 @@ test("synchronous native path handles terminal submission before polling", async
   const end = source.indexOf("async function executePublicTool", start);
   const body = source.slice(start, end);
   const terminalCheck = body.indexOf("if (runIsTerminal(started))");
-  const polling = body.indexOf("const waited = await waitForNativeRun(runId)");
+  const polling = body.indexOf("const waited = await waitForNativeRun(runId");
 
   assert.ok(terminalCheck >= 0, "terminal submission branch should exist");
   assert.ok(

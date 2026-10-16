@@ -35,8 +35,8 @@ There is no A2A backend in the runtime path. The wrapper does not depend on
 
 ## Public MCP tools
 
-The wrapper exposes exactly 11 tools: the 10 original native tools plus one
-read-only observability tool.
+The wrapper exposes exactly 12 tools: the 10 original native tools plus two
+read-only tools (tool timeline and profile list).
 
 | Tool | Purpose |
 | --- | --- |
@@ -48,7 +48,8 @@ read-only observability tool.
 | `get_hermes_run` | Poll a Run |
 | `steer_hermes_run` | Queue guidance into the active Run |
 | `stop_hermes_run` | Stop the active Run |
-| `hermes_status` | Check native Runs API capabilities |
+| `hermes_status` | Check native Runs API capabilities (optionally for one `profile`) |
+| `list_hermes_profiles` | List Hermes profiles with description, model and availability, so ChatGPT can pick one |
 | `hermes_activity` | Read local redacted activity traces |
 | `hermes_tool_timeline` | Read a content-free tool chronology for one session or Run (tool name, start/end, duration, ok/error kind) |
 
@@ -149,6 +150,42 @@ The bridge launcher reads only the values it needs from the active Hermes profil
 - `API_SERVER_PORT`
 
 It does not source the complete Hermes environment file.
+
+## Hermes profiles
+
+ChatGPT can choose which Hermes profile runs a task. It calls
+`list_hermes_profiles` to read each profile's description (from
+`profile.yaml`), then passes `profile` to `delegate_to_hermes`,
+`start_hermes_run` or `continue_hermes_session`. Without `profile`, work goes to
+the default profile, exactly as before.
+
+The bridge reaches named profiles through Hermes' multiplexed gateway
+(`gateway.multiplex_profiles: true`) at `/p/<profile>/v1/...`. Hermes requires
+each profile's own `API_SERVER_KEY` there, so a profile is usable from ChatGPT
+only once it has one. That key is the opt-in:
+
+```bash
+bash scripts/setup-hermes-control.sh --profile rea --profile youtube
+```
+
+The gateway reads the key live; no restart is needed. The bridge reads only
+`API_SERVER_KEY` from `~/.hermes/profiles/<name>/.env` (override the Hermes root
+with `HERMES_ROOT_HOME`), never returns it, and `list_hermes_profiles` reports
+`available: false` for profiles without one.
+
+A slot is bound to the profile of its Hermes session:
+
+- follow-ups to a slot stay in its profile without repeating `profile`;
+- `get_hermes_run`, `steer_hermes_run`, `stop_hermes_run` and the run-finished
+  notifier route to the profile the Run was started in;
+- asking a bound slot for another profile fails with `HERMES_PROFILE_MISMATCH`
+  (use a free slot, or `replaceSession: true` to archive the old session and
+  start a fresh one in the new profile);
+- replay deduplication is namespaced per profile, and session ownership checks
+  compare session ids within one profile.
+
+`list_hermes_sessions`, `get_hermes_session` and `hermes_tool_timeline` accept
+`profile` too (they run `hermes -p <profile> sessions ...`).
 
 ## Message provenance header
 

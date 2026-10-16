@@ -3,6 +3,12 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import {
+  DEFAULT_PROFILE,
+  normalizeProfile,
+  profileOrDefault,
+} from "./hermes-profiles.mjs";
+
 const DEFAULT_DEDUP_WINDOW_MS = 60_000;
 const STATE_VERSION = 4;
 // One ChatGPT conversation drives at most this many durable Hermes sessions
@@ -125,6 +131,13 @@ function slotFingerprint(slot, fingerprint) {
   return sha256("slot:" + slot + "\n" + fingerprint);
 }
 
+// The default profile keeps the pre-profile fingerprint; other profiles get
+// their own replay namespace so one instruction is never replayed across them.
+function profileFingerprint(profile, fingerprint) {
+  if (!fingerprint || !profile || profile === DEFAULT_PROFILE) return fingerprint;
+  return sha256("profile:" + profile + "\n" + fingerprint);
+}
+
 function emptySlotRecord() {
   return {
     canonicalSessionId: null,
@@ -181,6 +194,7 @@ function activeSummary(active) {
     startedAt: active.startedAt || null,
     sessionId: active.sessionId || null,
     runId: active.runId || null,
+    profile: profileOrDefault(active.profile),
     legacyFingerprint: active.legacyFingerprint || null,
     reusedSession:
       typeof active.reusedSession === "boolean"
@@ -568,7 +582,8 @@ export function createHermesSessionCoordinator({
 
   // The other slot, in any conversation, that holds sessionId: bound to it,
   // or running work in it.
-  function findSessionHolder(scope, sessionId) {
+  // Session ids are only compared within one Hermes profile.
+  function findSessionHolder(scope, sessionId, profile = DEFAULT_PROFILE) {
     const ownSlot = slotOf(scope);
     for (const [sessionHash, conversation] of Object.entries(
       state.conversations,
@@ -576,6 +591,10 @@ export function createHermesSessionCoordinator({
       if (!isPlainObject(conversation)) continue;
       for (const [slot, record] of slotEntries(sessionHash)) {
         if (sessionHash === scope.sessionHash && slot === ownSlot) continue;
+        const recordProfile = profileOrDefault(
+          record.active?.profile || record.profile,
+        );
+        if (recordProfile !== profile) continue;
         const busy =
           isPlainObject(record.active) &&
           (record.active.sessionId === sessionId ||
@@ -613,6 +632,7 @@ export function createHermesSessionCoordinator({
         runId: record.active.runId || null,
         sessionId:
           record.active.sessionId || record.canonicalSessionId || null,
+        profile: profileOrDefault(record.active.profile || record.profile),
         kind: record.active.kind || null,
         startedAt: record.active.startedAt || null,
       }));
@@ -629,6 +649,7 @@ export function createHermesSessionCoordinator({
       tool: active.tool || null,
       traceId: active.traceId || null,
       sessionId: active.sessionId || record.canonicalSessionId || null,
+      profile: profileOrDefault(active.profile || record.profile),
       startedAt: active.startedAt || null,
       endedAt: new Date().toISOString(),
       outcome: outcome ? String(outcome).toLowerCase() : null,
@@ -734,6 +755,7 @@ export function createHermesSessionCoordinator({
       sessionHash: scope?.sessionHash || null,
       slot: slotOf(scope),
       canonicalSessionId: record?.canonicalSessionId || null,
+      profile: profileOrDefault(record?.profile),
       active: activeSummary(record?.active),
       lastRun: lastRunSummary(record),
       archivedSessions: Array.isArray(record?.archivedSessions)
@@ -749,6 +771,7 @@ export function createHermesSessionCoordinator({
         sessionHash: null,
         slot: slotOf(scope),
         canonicalSessionId: null,
+        profile: DEFAULT_PROFILE,
         active: null,
         lastRun: null,
         archivedSessions: [],
@@ -804,8 +827,10 @@ export function createHermesSessionCoordinator({
       requestedSessionId = null,
       reconcileActive = null,
       replaceSession = false,
+      profile = null,
     },
   ) {
+    const requestedProfile = normalizeProfile(profile);
     const requested =
       typeof requestedSessionId === "string" && requestedSessionId.trim()
         ? requestedSessionId.trim()
@@ -814,11 +839,15 @@ export function createHermesSessionCoordinator({
 
     const fingerprint =
       typeof instruction === "string" && instruction.trim()
-        ? slotFingerprint(slot, currentFingerprint(mode, requested, instruction))
+        ? profileFingerprint(
+            requestedProfile,
+            slotFingerprint(slot, currentFingerprint(mode, requested, instruction)),
+          )
         : null;
     // Pre-slot (v1) state only ever described the default slot.
     const legacyFingerprint =
       slot === DEFAULT_SLOT &&
+      !requestedProfile &&
       typeof instruction === "string" &&
       instruction.trim()
         ? legacyNativeFingerprint(mode, requested, instruction)
@@ -833,6 +862,7 @@ export function createHermesSessionCoordinator({
         sessionIdToUse: requested,
         idempotencyKey: null,
         slot,
+        profile: requestedProfile || DEFAULT_PROFILE,
         parallelRuns: [],
       };
     }
@@ -1031,6 +1061,7 @@ export function createHermesSessionCoordinator({
           operationId: null,
           canonicalSessionId: record.canonicalSessionId || null,
           sessionIdToUse: requested || record.canonicalSessionId || null,
+          profile: profileOrDefault(recent.payload?.profile || record.profile),
           replayPayload: {
             ...recent.payload,
             deduplicated: true,
@@ -1069,6 +1100,7 @@ export function createHermesSessionCoordinator({
               : Boolean(record.canonicalSessionId),
           idempotencyKey: active.idempotencyKey || null,
           slot,
+          profile: profileOrDefault(active.profile),
           parallelRuns: parallelRunsFor(scope),
         };
       }
@@ -1106,10 +1138,50 @@ export function createHermesSessionCoordinator({
       // is always refused; an idle one bound elsewhere moves here only on an
       // explicit replaceSession. Older state may already share an idle
       // canonical session between conversations; that binding keeps working.
+      // A slot's Hermes session lives in one profile. An unbound slot takes
+      // whichever profile is asked for; a bound one changes profile only on
+      // an explicit replaceSession, which archives the old binding.
+      const boundProfile = profileOrDefault(record.profile);
+      const effectiveProfile = recoverablePending
+        ? profileOrDefault(active?.profile)
+        : requestedProfile || boundProfile;
+      if (
+        !recoverablePending &&
+        requestedProfile &&
+        requestedProfile !== boundProfile &&
+        record.canonicalSessionId &&
+        !replaceSession
+      ) {
+        throw coordinatorError(
+          "HERMES_PROFILE_MISMATCH",
+          "Slot " +
+            slot +
+            " of this ChatGPT conversation is bound to a Hermes session of profile '" +
+            boundProfile +
+            "'. Use a free slot for the '" +
+            requestedProfile +
+            "' profile, or pass replaceSession:true to start a fresh '" +
+            requestedProfile +
+            "' session in this slot.",
+          {
+            sessionHash: scope.sessionHash,
+            slot,
+            boundProfile,
+            requestedProfile,
+            canonicalSessionId: record.canonicalSessionId,
+            freeSlots: freeSlotsFor(scope).filter(
+              (free) =>
+                free !== slot &&
+                !peekRecord({ ...scope, slot: free })?.canonicalSessionId,
+            ),
+          },
+        );
+      }
+
       const targetSessionId =
         requested || (replaceSession ? null : record.canonicalSessionId) || null;
       const holder = targetSessionId
-        ? findSessionHolder(scope, targetSessionId)
+        ? findSessionHolder(scope, targetSessionId, effectiveProfile)
         : null;
       const newBinding =
         Boolean(holder) && targetSessionId !== record.canonicalSessionId;
@@ -1148,6 +1220,7 @@ export function createHermesSessionCoordinator({
         replacedSessionId = record.canonicalSessionId;
         record.archivedSessions.push({
           sessionId: record.canonicalSessionId,
+          profile: boundProfile,
           archivedAt: new Date().toISOString(),
           reason: "replaced",
           lastRunId: lastRunSummary(record)?.runId || null,
@@ -1176,6 +1249,7 @@ export function createHermesSessionCoordinator({
       if (holder && newBinding) {
         holder.record.archivedSessions.push({
           sessionId: targetSessionId,
+          profile: effectiveProfile,
           archivedAt: new Date().toISOString(),
           reason: holder.sameConversation
             ? "moved-to-slot-" + slot
@@ -1198,10 +1272,16 @@ export function createHermesSessionCoordinator({
           ? active.reusedSession
           : Boolean(requested || record.canonicalSessionId);
 
+      const previousProfile = recoverablePending
+        ? active?.previousProfile ?? null
+        : record.profile ?? null;
+      record.profile = effectiveProfile;
       record.active = {
         operationId,
         tool,
         kind: "native-pending",
+        profile: effectiveProfile,
+        previousProfile,
         traceId,
         startedAt: new Date().toISOString(),
         sessionId: requested || record.canonicalSessionId || null,
@@ -1225,6 +1305,7 @@ export function createHermesSessionCoordinator({
         reusedSession,
         idempotencyKey,
         slot,
+        profile: effectiveProfile,
         parallelRuns: parallelRunsFor(scope),
         replacedSessionId,
         movedFrom,
@@ -1355,7 +1436,10 @@ export function createHermesSessionCoordinator({
       const record = getRecord(scope);
       if (record.active?.operationId === operationId) {
         // Nothing reached Hermes, so an explicit replacement never happened:
-        // put the previous binding back.
+        // put the previous binding, and the profile it lives in, back.
+        if (Object.hasOwn(record.active, "previousProfile")) {
+          record.profile = record.active.previousProfile;
+        }
         const replaced = record.active.replacedSessionId || null;
         if (replaced && !record.canonicalSessionId) {
           record.canonicalSessionId = replaced;

@@ -336,8 +336,9 @@ The bridge no longer depends on `@cognicellai/a2a-mcp`.
 
 A valid local pipeline must prove:
 
-1. the MCP wrapper exposes exactly the native-only 11-tool surface (the 10
-   original tools plus the read-only `hermes_tool_timeline`);
+1. the MCP wrapper exposes exactly the native-only 12-tool surface (the 10
+   original tools plus the read-only `hermes_tool_timeline` and
+   `list_hermes_profiles`);
 2. Hermes native control capabilities are reachable;
 3. a real delegated Run reaches Hermes and uses a local tool;
 4. start/poll/steer/stop works;

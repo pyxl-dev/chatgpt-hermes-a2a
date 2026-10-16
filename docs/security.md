@@ -11,11 +11,11 @@ The repository name and LaunchAgent identifiers still contain `a2a` for backward
 3. Keep Hermes' API server bound to loopback.
 4. Protect the Hermes API server with `API_SERVER_KEY`; do not commit or print it.
 5. Never commit OpenAI API keys, tunnel runtime keys or Hermes secrets.
-6. The wrapper reads only the specific Hermes configuration values it needs rather than sourcing the full Hermes environment.
+6. The wrapper reads only the specific Hermes configuration values it needs rather than sourcing the full Hermes environment. For named profiles it reads only `API_SERVER_KEY` from `~/.hermes/profiles/<name>/.env`, and only when a call targets that profile; profile names are validated before any path is built, and `list_hermes_profiles` never returns keys.
 7. The OpenAI runtime key is stored in macOS Keychain by the persistent installer.
 8. `_meta["openai/session"]` is only a correlation key, never an authorization credential.
 9. The raw ChatGPT session value is SHA-256 hashed immediately and is never persisted or logged.
-10. The bridge exposes exactly 10 native/session/observability tools. No A2A context/task tools are exposed.
+10. The bridge exposes exactly 12 native/session/observability/profile tools. A Hermes profile is reachable from ChatGPT only after the user gives it its own key (`setup-hermes-control.sh --profile <name>`). No A2A context/task tools are exposed.
 11. Only one mutating Hermes Run is allowed per tracked ChatGPT conversation.
 12. A different explicit durable Hermes `sessionId` is rejected once a canonical session is bound.
 13. Known active `runId` state is persisted before polling continues.
