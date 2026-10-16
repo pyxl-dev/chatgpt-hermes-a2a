@@ -866,8 +866,8 @@ test("bridge preserves a returned runId if first coordinator persistence fails",
     /let runRecorded = false;[\s\S]*if \(!runRecorded\) \{[\s\S]*preserveKnownSubmittedRun/su,
   );
   const asyncStart = source.slice(
-    source.indexOf('case "start_hermes_run"'),
-    source.indexOf('case "get_hermes_run"'),
+    source.indexOf("async function runStartLease("),
+    source.indexOf("async function slotScopeFor("),
   );
   assert.match(
     asyncStart,

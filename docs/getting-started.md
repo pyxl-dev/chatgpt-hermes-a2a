@@ -222,6 +222,16 @@ For long-running controllable work:
 3. optionally `steer_hermes_run`
 4. optionally `stop_hermes_run`
 
+For two independent jobs in parallel, ask for it explicitly:
+
+```text
+Keep the refactor going in Hermes, and in parallel use slot 2 to fix the README typos.
+```
+
+Each slot is its own durable Hermes session with one Run at a time; up to three
+slots per conversation. `get_hermes_run` with no arguments waits on every busy
+slot and returns each slot's Run.
+
 ## 10. Conversation/session behavior
 
 For ChatGPT-scoped calls, the wrapper receives a ChatGPT session correlation value from MCP metadata and hashes it locally.
@@ -230,12 +240,19 @@ The first normal delegation may start a Hermes Run without an existing durable s
 
 Later normal delegations automatically reuse the same durable Hermes session.
 
+That binding is slot 1. A conversation can also start slots 2 and 3, each bound
+to its own durable session, when the user asks for parallel or genuinely
+independent work. A slot keeps its session after its Run ends; passing
+`replaceSession: true` starts it on a fresh session and archives (never
+deletes) the old binding.
+
 The coordinator enforces:
 
 - cross-process state transactions through an OS-backed SQLite mutex;
 - remote Run reconciliation outside the global transaction, followed by active-lease revalidation;
-- one active mutating Run per ChatGPT conversation;
-- one canonical durable Hermes session;
+- one active mutating Run per slot, so at most three per ChatGPT conversation;
+- one canonical durable Hermes session per slot, never shared with another slot or another ChatGPT conversation (an idle one moves only on an explicit `replaceSession: true`);
+- a warning when parallel slots may edit the same workspace;
 - exact idempotent recovery after ambiguous submission;
 - persisted active Run recovery across bridge restart;
 - bounded persisted replay for successful exact retries;
@@ -250,7 +267,13 @@ From old version-1 mixed-route state (and the intermediate version-2 native repl
 - native durable session and native Run state are retained;
 - A2A context/task state is discarded;
 - A2A replay payloads are discarded;
-- native single-slot replay entries are migrated into version 3's per-fingerprint replay map.
+- native single-slot replay entries are migrated into the per-fingerprint replay map.
+
+From version 3 (single session per conversation) to version 4 (slots), each
+conversation's binding, active Run and replay entries become slot 1 unchanged.
+Once a version-4 bridge has written the state file, an older bridge build
+refuses it (unsupported version) rather than overwriting it; to roll back,
+restore the file from before the upgrade.
 
 Before switching the persistent runtime to the native-only build, stop any old A2A job you intentionally left running. The new bridge has no A2A task-control surface because A2A is no longer part of the architecture.
 
@@ -336,6 +359,14 @@ Do not immediately resubmit different work. The coordinator persists the active 
 ### An ambiguous POST returned no runId
 
 An exact retry is allowed with the same persisted idempotency scope. Different work remains blocked until delivery is resolved.
+
+This is per slot: an uncertain submission in slot 2 blocks only slot 2.
+
+### HERMES_RUN_CAPACITY_EXHAUSTED
+
+Hermes is already running `api_server.max_concurrent_runs` Runs (10 by default)
+across all conversations. Nothing was submitted and the slot is free again; wait
+for a Run to finish, then retry.
 
 ## 15. Update
 

@@ -1172,7 +1172,7 @@ test("coordinator serializes leases across independent bridge processes", async 
   );
 
   const state = await readCoordinatorState(root);
-  assert.equal(Object.keys(state.sessions).length, 1);
+  assert.equal(Object.keys(state.conversations).length, 1);
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -1209,8 +1209,8 @@ test("coordinator serializes leases across independent bridge instances", async 
   assert.equal(rejection?.reason?.code, "HERMES_SESSION_BUSY");
 
   const disk = await readCoordinatorState(root);
-  assert.equal(Object.keys(disk.sessions).length, 1);
-  assert.ok(disk.sessions[scopeA.sessionHash]?.active?.operationId);
+  assert.equal(Object.keys(disk.conversations).length, 1);
+  assert.ok(disk.conversations[scopeA.sessionHash]?.slots?.["1"]?.active?.operationId);
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -1243,7 +1243,7 @@ test("coordinator transactions preserve concurrent independent conversations", a
   assert.ok(leaseA.operationId);
   assert.ok(leaseB.operationId);
   const disk = await readCoordinatorState(root);
-  assert.equal(Object.keys(disk.sessions).length, 2);
+  assert.equal(Object.keys(disk.conversations).length, 2);
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -1559,7 +1559,7 @@ test("unknown coordinator state versions fail closed without overwrite", async (
   await fs.writeFile(
     statePath,
     JSON.stringify({
-      version: 4,
+      version: 99,
       sessions: {
         future: {
           canonicalSessionId: "future-session",
@@ -1582,7 +1582,7 @@ test("unknown coordinator state versions fail closed without overwrite", async (
   );
 
   const untouched = JSON.parse(await fs.readFile(statePath, "utf8"));
-  assert.equal(untouched.version, 4);
+  assert.equal(untouched.version, 99);
   assert.equal(untouched.sessions.future.active.runId, "future-run");
   await fs.rm(root, { recursive: true, force: true });
 });
@@ -1643,7 +1643,7 @@ test("v1 native state migrates and v1 A2A state is dropped", async () => {
   assert.equal(b.active, null);
 
   const disk = JSON.parse(await fs.readFile(statePath, "utf8"));
-  assert.equal(disk.version, 3);
+  assert.equal(disk.version, 4);
 });
 
 test("independent ChatGPT conversations remain independent", async () => {
@@ -1716,11 +1716,11 @@ test("different bridge instance cannot steal a live native-pending exact lease",
 
   const disk = await readCoordinatorState(root);
   assert.equal(
-    disk.sessions[scopeA.sessionHash].active.operationId,
+    disk.conversations[scopeA.sessionHash]?.slots?.["1"].active.operationId,
     first.operationId,
   );
   assert.equal(
-    disk.sessions[scopeA.sessionHash].active.ownerInstanceId,
+    disk.conversations[scopeA.sessionHash]?.slots?.["1"].active.ownerInstanceId,
     "owner-a-1",
   );
   await fs.rm(root, { recursive: true, force: true });
@@ -1847,17 +1847,17 @@ test("v1 ambiguous native operation adopts the legacy fingerprint on exact retry
   assert.equal(retry.idempotencyKey, "legacy-idempotency-key");
 
   const disk = await readCoordinatorState(root);
-  assert.equal(disk.version, 3);
+  assert.equal(disk.version, 4);
   assert.equal(
-    disk.sessions[scope.sessionHash].active.legacyFingerprint ?? null,
+    disk.conversations[scope.sessionHash]?.slots?.["1"].active.legacyFingerprint ?? null,
     null,
   );
   assert.match(
-    disk.sessions[scope.sessionHash].active.fingerprint,
+    disk.conversations[scope.sessionHash]?.slots?.["1"].active.fingerprint,
     /^[a-f0-9]{64}$/u,
   );
   assert.notEqual(
-    disk.sessions[scope.sessionHash].active.fingerprint,
+    disk.conversations[scope.sessionHash]?.slots?.["1"].active.fingerprint,
     legacyFingerprint,
   );
 });

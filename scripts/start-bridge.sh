@@ -103,5 +103,16 @@ if ! "$NODE_BIN" -e '
   exit 1
 fi
 
+# Run-finished notifications go to a Discord webhook whose URL lives in the
+# macOS Keychain (service chatgpt-hermes-a2a.discord-webhook). Without it the
+# notifier stays off. Set HERMES_A2A_NOTIFY=off to disable it explicitly.
+if [[ "${HERMES_A2A_NOTIFY:-}" != "off" && -z "${HERMES_A2A_DISCORD_WEBHOOK_URL:-}" ]]; then
+  HERMES_A2A_DISCORD_WEBHOOK_URL="$(/usr/bin/security find-generic-password \
+    -a "$(id -un)" -s chatgpt-hermes-a2a.discord-webhook -w 2>/dev/null || true)"
+  if [[ -n "$HERMES_A2A_DISCORD_WEBHOOK_URL" ]]; then
+    export HERMES_A2A_DISCORD_WEBHOOK_URL
+  fi
+fi
+
 unset HERMES_ENV_FILE
 exec "$NODE_BIN" "$ROOT/src/hermes-mcp.mjs"

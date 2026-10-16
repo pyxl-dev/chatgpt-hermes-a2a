@@ -469,3 +469,559 @@ test("control smoke accepts both canceled and cancelled terminal statuses", asyn
     }
   }
 });
+
+async function createPollingApi({ terminalAfterMs = 1200 } = {}) {
+  const state = { submissions: 0, statusReads: 0, terminalAt: null };
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    request.resume();
+
+    if (request.method === "POST" && url.pathname === "/v1/runs") {
+      state.submissions += 1;
+      sendJson(response, {
+        run_id: "run-polled",
+        session_id: "polled-session",
+        status: "running",
+      });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
+      state.statusReads += 1;
+      const runId = url.pathname.slice("/v1/runs/".length);
+      if (state.terminalAt === null) {
+        state.terminalAt = Date.now() + terminalAfterMs;
+      }
+      if (Date.now() < state.terminalAt) {
+        sendJson(response, {
+          run_id: runId,
+          session_id: "polled-session",
+          status: "running",
+        });
+      } else {
+        sendJson(response, {
+          run_id: runId,
+          session_id: "polled-session",
+          status: "completed",
+          output: "polled work finished",
+        });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/capabilities") {
+      sendJson(response, {
+        features: {
+          run_submission: true,
+          run_status: true,
+          run_steer: true,
+          run_stop: true,
+        },
+      });
+      return;
+    }
+
+    sendJson(response, { error: { message: "not found" } }, 404);
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  return {
+    state,
+    baseUrl: "http://127.0.0.1:" + server.address().port,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function startBridgeForPollTest(api, tempDir, extraEnv = {}) {
+  const sandboxSrc = path.join(tempDir, "src");
+  await cp(path.join(projectRoot, "src"), sandboxSrc, { recursive: true });
+  await symlink(
+    path.join(projectRoot, "node_modules"),
+    path.join(tempDir, "node_modules"),
+    "dir",
+  );
+
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(sandboxSrc, "hermes-mcp.mjs")],
+    cwd: tempDir,
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      API_SERVER_KEY: "test-control-key",
+      HERMES_API_SERVER_KEY: "test-control-key",
+      HERMES_API_SERVER_URL: api.baseUrl,
+      HERMES_ACTIVITY_LOG: path.join(tempDir, "activity.jsonl"),
+      HERMES_NATIVE_DELEGATE_TIMEOUT_MS: "1000",
+      HERMES_NATIVE_DELEGATE_POLL_MS: "100",
+      HERMES_NATIVE_RUN_POLL_WAIT_MS: "5000",
+      ...extraEnv,
+    },
+  });
+
+  const client = new Client(
+    { name: "run-poll-regression", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  await client.connect(transport);
+  return client;
+}
+
+test("read tools are annotated read-only and advertise the delegate-then-poll loop", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-readonly-hints-"));
+  const api = await createPollingApi();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir);
+    const tools = (await client.listTools()).tools;
+    const byName = new Map(tools.map((tool) => [tool.name, tool]));
+
+    for (const name of [
+      "list_hermes_sessions",
+      "get_hermes_session",
+      "get_hermes_run",
+      "hermes_status",
+      "hermes_activity",
+      "hermes_tool_timeline",
+    ]) {
+      assert.equal(
+        byName.get(name)?.annotations?.readOnlyHint,
+        true,
+        name + " must be advertised as read-only so unattended turns are not stopped by a confirmation prompt",
+      );
+    }
+
+    for (const name of [
+      "delegate_to_hermes",
+      "continue_hermes_session",
+      "start_hermes_run",
+      "steer_hermes_run",
+      "stop_hermes_run",
+    ]) {
+      assert.notEqual(
+        byName.get(name)?.annotations?.readOnlyHint,
+        true,
+        name + " mutates the user's machine and must not claim read-only access",
+      );
+    }
+
+    const getRun = byName.get("get_hermes_run");
+    assert.equal(
+      getRun?.inputSchema?.required,
+      undefined,
+      "runId must be optional so a later turn can resume with no argument",
+    );
+
+    const instructions = String(client.getInstructions() || "");
+    assert.match(instructions, /get_hermes_run/);
+    assert.match(instructions, /same turn/i);
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("get_hermes_run without a runId resolves the conversation's active Run and holds the call until terminal", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-poll-"));
+  const api = await createPollingApi({ terminalAfterMs: 1200 });
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir);
+    const metadata = { "openai/session": "run-poll-regression" };
+
+    const delegated = await client.callTool({
+      name: "delegate_to_hermes",
+      arguments: { instruction: "long running work" },
+      _meta: metadata,
+    });
+    assert.equal(delegated.structuredContent?.pending, true);
+    assert.equal(delegated.structuredContent?.runId, "run-polled");
+
+    const first = await client.callTool({
+      name: "get_hermes_run",
+      arguments: {},
+      _meta: metadata,
+    });
+    assert.notEqual(first.isError, true);
+    assert.equal(first.structuredContent?.runId, "run-polled");
+    assert.equal(
+      first.structuredContent?.resolution,
+      "conversation-active-run",
+    );
+    assert.equal(first.structuredContent?.status, "completed");
+    assert.equal(first.structuredContent?.pending, false);
+    assert.ok(
+      (first.structuredContent?.waitedMs || 0) >= 100,
+      "the read must wait for the Run instead of returning immediately; waitedMs=" +
+        String(first.structuredContent?.waitedMs),
+    );
+    assert.ok(
+      api.state.statusReads >= 3,
+      "the bridge must poll the Run, not read it once",
+    );
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("get_hermes_run without a runId answers no-active-run when nothing is bound", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-idle-"));
+  const api = await createPollingApi();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      HERMES_NATIVE_RUN_POLL_WAIT_MS: "0",
+    });
+
+    const result = await client.callTool({
+      name: "get_hermes_run",
+      arguments: {},
+      _meta: { "openai/session": "idle-conversation" },
+    });
+    assert.notEqual(result.isError, true);
+    assert.equal(result.structuredContent?.ok, true);
+    assert.equal(result.structuredContent?.status, "no-active-run");
+    assert.equal(result.structuredContent?.runId, null);
+    assert.equal(
+      api.state.statusReads,
+      0,
+      "an idle conversation must not hit the Runs API",
+    );
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+async function createFakeDiscord() {
+  const messages = [];
+  const server = createServer((request, response) => {
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      messages.push({ path: request.url, body: JSON.parse(body || "{}") });
+      response.writeHead(204);
+      response.end();
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return {
+    messages,
+    baseUrl: "http://127.0.0.1:" + server.address().port,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function waitFor(predicate, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return predicate();
+}
+
+function notifyEnv(discord) {
+  return {
+    HERMES_A2A_DISCORD_WEBHOOK_URL: discord.baseUrl + "/api/webhooks/1/test-token",
+    HERMES_A2A_NOTIFY_POLL_MS: "100",
+    HERMES_A2A_NOTIFY_GRACE_MS: "200",
+  };
+}
+
+test("a Run ChatGPT stopped polling is announced on Discord when it finishes", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-notify-"));
+  const api = await createPollingApi({ terminalAfterMs: 1200 });
+  const discord = await createFakeDiscord();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, notifyEnv(discord));
+    const delegated = await client.callTool({
+      name: "delegate_to_hermes",
+      arguments: { instruction: "abandoned long work" },
+      _meta: { "openai/session": "abandoned-conversation" },
+    });
+    assert.equal(delegated.structuredContent?.pending, true);
+
+    // ChatGPT never calls get_hermes_run again.
+    assert.ok(
+      await waitFor(() => discord.messages.length > 0, 8000),
+      "the finished Run must be announced",
+    );
+    const [message] = discord.messages;
+    assert.equal(message.path, "/api/webhooks/1/test-token");
+    assert.deepEqual(message.body.allowed_mentions, { parse: [] });
+    assert.match(message.body.content, /completed/);
+    assert.match(message.body.content, /abandoned long work/);
+    assert.match(message.body.content, /run-polled/);
+    assert.doesNotMatch(message.body.content, /polled work finished/, "Hermes output must not be sent");
+
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(discord.messages.length, 1, "exactly one notification per Run");
+  } finally {
+    await client?.close();
+    await discord.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("a Run ChatGPT collects itself is never announced", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-quiet-"));
+  const api = await createPollingApi({ terminalAfterMs: 1200 });
+  const discord = await createFakeDiscord();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      ...notifyEnv(discord),
+      HERMES_A2A_NOTIFY_GRACE_MS: "1500",
+    });
+    const metadata = { "openai/session": "attentive-conversation" };
+    const delegated = await client.callTool({
+      name: "delegate_to_hermes",
+      arguments: { instruction: "watched work" },
+      _meta: metadata,
+    });
+    assert.equal(delegated.structuredContent?.pending, true);
+
+    const polled = await client.callTool({
+      name: "get_hermes_run",
+      arguments: {},
+      _meta: metadata,
+    });
+    assert.equal(polled.structuredContent?.status, "completed");
+
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    assert.equal(discord.messages.length, 0);
+  } finally {
+    await client?.close();
+    await discord.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+async function createSlotsApi({ maxConcurrent = 10 } = {}) {
+  const state = { submissions: [], runs: new Map(), statusReads: 0 };
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const now = Date.now();
+      const running = [...state.runs.values()].filter(
+        (run) => now < run.terminalAt,
+      ).length;
+
+      if (request.method === "POST" && url.pathname === "/v1/runs") {
+        const input = JSON.parse(body || "{}");
+        if (running >= maxConcurrent) {
+          sendJson(
+            response,
+            { error: { message: "Too many concurrent runs" } },
+            429,
+          );
+          return;
+        }
+        const index = state.submissions.length + 1;
+        const run = {
+          runId: "run-" + index,
+          sessionId: input.session_id || "session-" + index,
+          terminalAt: now + (/slow/u.test(input.input) ? 2500 : 700),
+        };
+        state.runs.set(run.runId, run);
+        state.submissions.push({ ...input, runId: run.runId });
+        sendJson(response, {
+          run_id: run.runId,
+          session_id: run.sessionId,
+          status: "running",
+        });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
+        state.statusReads += 1;
+        const run = state.runs.get(url.pathname.slice("/v1/runs/".length));
+        if (!run) {
+          sendJson(response, { error: { message: "run not found" } }, 404);
+          return;
+        }
+        sendJson(response, {
+          run_id: run.runId,
+          session_id: run.sessionId,
+          status: now < run.terminalAt ? "running" : "completed",
+          ...(now < run.terminalAt ? {} : { output: run.runId + " done" }),
+        });
+        return;
+      }
+
+      sendJson(response, { error: { message: "not found" } }, 404);
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  return {
+    state,
+    baseUrl: "http://127.0.0.1:" + server.address().port,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+test("one conversation drives two slots in parallel and collects both Runs", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-slots-bridge-"));
+  const api = await createSlotsApi();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      HERMES_NATIVE_DELEGATE_TIMEOUT_MS: "1000",
+    });
+    const metadata = { "openai/session": "parallel-conversation" };
+    const call = (name, args) =>
+      client.callTool({ name, arguments: args, _meta: metadata });
+
+    const tools = (await client.listTools()).tools;
+    for (const name of [
+      "delegate_to_hermes",
+      "continue_hermes_session",
+      "start_hermes_run",
+      "get_hermes_run",
+      "steer_hermes_run",
+      "stop_hermes_run",
+    ]) {
+      const slot = tools.find((tool) => tool.name === name)?.inputSchema
+        ?.properties?.slot;
+      assert.equal(slot?.maximum, 3, name + " must accept an optional slot");
+    }
+    assert.match(String(client.getInstructions()), /slot 2 or 3/i);
+
+    const first = await call("delegate_to_hermes", {
+      instruction: "slow refactor of module A",
+    });
+    assert.equal(first.structuredContent?.pending, true);
+    assert.equal(first.structuredContent?.slot, 1);
+    assert.equal(first.structuredContent?.warnings, undefined);
+
+    const busy = await call("delegate_to_hermes", {
+      instruction: "unrelated question",
+    });
+    assert.equal(busy.isError, true);
+    assert.equal(busy.structuredContent?.error?.code, "HERMES_SESSION_BUSY");
+    assert.deepEqual(busy.structuredContent?.error?.details?.freeSlots, [2, 3]);
+
+    const second = await call("start_hermes_run", {
+      instruction: "independent docs fix",
+      slot: 2,
+    });
+    assert.notEqual(second.isError, true);
+    assert.equal(second.structuredContent?.slot, 2);
+    assert.equal(second.structuredContent?.parallelRuns?.[0]?.slot, 1);
+    assert.match(
+      second.structuredContent?.warnings?.[0] || "",
+      /same Mac workspace/,
+    );
+
+    const seen = new Map();
+    let sawAllSlots = false;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const polled = await call("get_hermes_run", {});
+      assert.notEqual(polled.isError, true);
+      const content = polled.structuredContent;
+      for (const run of content.runs || [content]) {
+        if (run.runId && run.pending === false) seen.set(run.slot, run);
+      }
+      if (seen.size === 2) break;
+      if (!content.runs) {
+        assert.equal(content.resolution, "conversation-active-run");
+      } else {
+        assert.equal(content.resolution, "conversation-active-slots");
+        assert.equal(content.runs.length, 2);
+        sawAllSlots = true;
+      }
+    }
+    assert.ok(sawAllSlots, "get_hermes_run must report every busy slot at once");
+    assert.equal(seen.get(1)?.runId, "run-1");
+    assert.equal(seen.get(1)?.status, "completed");
+    assert.equal(seen.get(2)?.runId, "run-2");
+    assert.equal(seen.get(2)?.output, "run-2 done");
+
+    // Slot 2 keeps its own Hermes session for follow-ups.
+    const followUp = await call("start_hermes_run", {
+      instruction: "follow-up on the docs",
+      slot: 2,
+    });
+    assert.equal(followUp.structuredContent?.slot, 2);
+    assert.equal(api.state.submissions.at(-1).session_id, "session-2");
+
+    const idle = await call("get_hermes_run", { slot: 1 });
+    assert.equal(idle.structuredContent?.status, "no-active-run");
+    assert.equal(idle.structuredContent?.sessionId, "session-1");
+
+    // An explicit runId finds its slot without the slot argument.
+    const byRunId = await call("get_hermes_run", { runId: followUp.structuredContent.runId });
+    assert.equal(byRunId.structuredContent?.slot, 2);
+    assert.equal(byRunId.structuredContent?.status, "completed");
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Hermes' global Run cap surfaces as a clear error and frees the slot", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-slots-cap-"));
+  const api = await createSlotsApi({ maxConcurrent: 1 });
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      HERMES_NATIVE_RUN_POLL_WAIT_MS: "0",
+    });
+    const metadata = { "openai/session": "capped-conversation" };
+    const call = (name, args) =>
+      client.callTool({ name, arguments: args, _meta: metadata });
+
+    const first = await call("start_hermes_run", { instruction: "slow one" });
+    assert.notEqual(first.isError, true);
+
+    const rejected = await call("start_hermes_run", {
+      instruction: "slow two",
+      slot: 3,
+    });
+    assert.equal(rejected.isError, true);
+    assert.equal(
+      rejected.structuredContent?.error?.code,
+      "HERMES_RUN_CAPACITY_EXHAUSTED",
+    );
+
+    const slot3 = await call("get_hermes_run", { slot: 3 });
+    assert.equal(slot3.structuredContent?.status, "no-active-run");
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
