@@ -21,6 +21,21 @@ function normalizeInstruction(value) {
   return String(value || "").normalize("NFKC").trim().replace(/\s+/gu, " ");
 }
 
+export const DEFAULT_MESSAGE_HEADER = "[Message From ChatGPT]";
+
+export function resolveMessageHeader(
+  configured = process.env.HERMES_MESSAGE_HEADER,
+) {
+  if (configured === undefined) return DEFAULT_MESSAGE_HEADER;
+  return String(configured).trim();
+}
+
+export function withMessageHeader(text, header = resolveMessageHeader()) {
+  if (!header) return text;
+  if (text.startsWith(header)) return text;
+  return header + "\n\n" + text;
+}
+
 function normalizedApiPort(value) {
   const text = String(value ?? "").trim();
   if (!/^\d+$/u.test(text)) return null;
@@ -67,6 +82,7 @@ export function createHermesControl({ redactText, redactValue }) {
   const apiUrl = resolveHermesApiUrl();
   const apiKey =
     process.env.HERMES_API_SERVER_KEY || process.env.API_SERVER_KEY || "";
+  const messageHeader = resolveMessageHeader();
   const configuredTimeout = Number(process.env.HERMES_CONTROL_TIMEOUT_MS);
   const timeoutMs =
     Number.isFinite(configuredTimeout) && configuredTimeout >= 1000
@@ -181,8 +197,15 @@ export function createHermesControl({ redactText, redactValue }) {
         );
         error.status = response.status;
         error.code = payload?.error?.code || payload?.code || null;
+        // A 409 idempotency_key_conflict means Hermes already admitted a
+        // request under this key with a different body (e.g. sent before the
+        // message header existed, or under another header). That earlier Run
+        // may well be live, so the submission is ambiguous, not rejected.
         error.deliveryAmbiguous =
-          methodName !== "GET" && response.status >= 500;
+          methodName !== "GET" &&
+          (response.status >= 500 ||
+            (response.status === 409 &&
+              error.code === "idempotency_key_conflict"));
         throw error;
       }
       return redactValue(payload || {});
@@ -243,7 +266,7 @@ export function createHermesControl({ redactText, redactValue }) {
         ),
       },
       body: {
-        input: text,
+        input: withMessageHeader(text, messageHeader),
         ...(durableSessionId ? { session_id: durableSessionId } : {}),
       },
     });
@@ -319,7 +342,7 @@ export function createHermesControl({ redactText, redactValue }) {
       "/v1/runs/" + encodeURIComponent(id) + "/steer",
       {
         method: "POST",
-        body: { input: text },
+        body: { input: withMessageHeader(text, messageHeader) },
       },
     );
     assertReturnedRunId(id, payload, "steer_hermes_run");

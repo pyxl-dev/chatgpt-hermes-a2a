@@ -7,8 +7,11 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 import {
+  DEFAULT_MESSAGE_HEADER,
   controlIdempotencyKey,
   createHermesControl,
+  resolveMessageHeader,
+  withMessageHeader,
   resolveHermesApiUrl,
 } from "./hermes-control.mjs";
 
@@ -895,4 +898,134 @@ test("Hermes 0.21.5 control scripts use raw secret reads and bounded setup resta
   assert.match(setupSource, /gateway stop/u);
   assert.match(setupSource, /gateway start/u);
   assert.doesNotMatch(setupSource, /"\\$HERMES_BIN" gateway restart/u);
+});
+
+test("message header defaults, can be customized, and can be disabled", () => {
+  assert.equal(resolveMessageHeader(undefined), DEFAULT_MESSAGE_HEADER);
+  assert.equal(resolveMessageHeader("  [From GPT]  "), "[From GPT]");
+  assert.equal(resolveMessageHeader(""), "");
+  assert.equal(
+    withMessageHeader("do it", "[Message From ChatGPT]"),
+    "[Message From ChatGPT]\n\ndo it",
+  );
+  assert.equal(withMessageHeader("do it", ""), "do it");
+  assert.equal(
+    withMessageHeader("[Message From ChatGPT]\n\ndo it", "[Message From ChatGPT]"),
+    "[Message From ChatGPT]\n\ndo it",
+  );
+});
+
+test("start and steer send the header to Hermes but keep idempotency on raw text", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  const originalHeader = process.env.HERMES_MESSAGE_HEADER;
+  const calls = [];
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    delete process.env.HERMES_MESSAGE_HEADER;
+    globalThis.fetch = async (url, options = {}) => {
+      calls.push({ url: String(url), options });
+      return new Response(
+        JSON.stringify({ run_id: "run-1", session_id: "s-1", status: "started", accepted: true }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    };
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+    await control.startRun("hello", "s-1", "scope-a");
+    await control.steerRun("run-1", "nudge");
+    const startBody = JSON.parse(calls[0].options.body);
+    const steerBody = JSON.parse(calls[1].options.body);
+    assert.equal(startBody.input, DEFAULT_MESSAGE_HEADER + "\n\nhello");
+    assert.equal(steerBody.input, DEFAULT_MESSAGE_HEADER + "\n\nnudge");
+    const headers = new Headers(calls[0].options.headers);
+    assert.equal(
+      headers.get("Idempotency-Key"),
+      controlIdempotencyKey("s-1", "hello", "scope-a"),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    for (const [k, v] of [
+      ["HERMES_API_SERVER_KEY", originalKey],
+      ["HERMES_API_SERVER_URL", originalUrl],
+      ["HERMES_MESSAGE_HEADER", originalHeader],
+    ]) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test("an idempotency key conflict is an ambiguous delivery, other 4xx stay definitive", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalKey = process.env.HERMES_API_SERVER_KEY;
+  const originalUrl = process.env.HERMES_API_SERVER_URL;
+  let nextResponse = null;
+  try {
+    process.env.HERMES_API_SERVER_KEY = "test-key";
+    process.env.HERMES_API_SERVER_URL = "http://127.0.0.1:8642";
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify(nextResponse.body), {
+        status: nextResponse.status,
+        headers: { "Content-Type": "application/json" },
+      });
+
+    const control = createHermesControl({
+      redactText: String,
+      redactValue: (value) => value,
+    });
+
+    // Same key, different body: Hermes already admitted an earlier request
+    // (e.g. one sent before the message header), which may still be running.
+    nextResponse = {
+      status: 409,
+      body: {
+        error: {
+          message: "Idempotency-Key reused with a different request body",
+          code: "idempotency_key_conflict",
+        },
+      },
+    };
+    await assert.rejects(
+      control.startRun("work sent before the header", null, "scope"),
+      (error) =>
+        error?.status === 409 &&
+        error?.code === "idempotency_key_conflict" &&
+        error?.deliveryAmbiguous === true,
+    );
+
+    nextResponse = {
+      status: 409,
+      body: { error: { message: "session busy", code: "session_busy" } },
+    };
+    await assert.rejects(
+      control.startRun("other conflict", null, "scope"),
+      (error) => error?.status === 409 && error?.deliveryAmbiguous === false,
+    );
+
+    nextResponse = {
+      status: 400,
+      body: { error: { message: "Missing 'input' field" } },
+    };
+    await assert.rejects(
+      control.startRun("bad request", null, "scope"),
+      (error) => error?.status === 400 && error?.deliveryAmbiguous === false,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) {
+      delete process.env.HERMES_API_SERVER_KEY;
+    } else {
+      process.env.HERMES_API_SERVER_KEY = originalKey;
+    }
+    if (originalUrl === undefined) {
+      delete process.env.HERMES_API_SERVER_URL;
+    } else {
+      process.env.HERMES_API_SERVER_URL = originalUrl;
+    }
+  }
 });
