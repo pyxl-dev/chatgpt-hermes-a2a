@@ -58,7 +58,7 @@ const SERVER_INSTRUCTIONS = [
   "get_hermes_run accepts no runId: it then reads the Run currently bound to this conversation, which is what a later user follow-up needs.",
   "Slots: one conversation can drive up to " + MAX_SLOTS + " durable Hermes sessions (slot 1 to " + MAX_SLOTS + "), each with at most one Run, so up to " + MAX_SLOTS + " Runs can work in parallel. Omit slot for normal work: it uses slot 1.",
   "Use slot 2 or 3 only when the user explicitly asks for parallel work, or for a genuinely independent task that must not wait for the busy slot; never split one task across slots, and keep parallel slots on disjoint files because every slot shares the same Mac workspace.",
-  "A slot keeps its Hermes session and context after its Run ends: send follow-ups for that line of work to the same slot. Pass replaceSession:true only when the user wants that slot to start a fresh Hermes session; the old one is archived, never deleted.",
+  "A slot keeps its Hermes session and context after its Run ends: send follow-ups for that line of work to the same slot. Pass replaceSession:true only when the user wants that slot to start a fresh Hermes session; the old one is archived, never deleted. A Hermes session belongs to one conversation: HERMES_SESSION_BOUND_TO_OTHER_CONVERSATION means another chat uses it, so start a new session unless the user explicitly wants to move it here (replaceSession:true).",
   "With several slots running, call get_hermes_run with no arguments: it waits on every active slot at once and returns each slot's Run; keep calling it in the same turn until no slot is pending. A busy slot answers HERMES_SESSION_BUSY: poll it instead of resubmitting.",
   "Stop polling only when the Run is terminal, when the user asks you to stop, or after roughly 20 minutes of continuous waiting; then report the runId, the status and anything that needs the user's decision.",
   "Read tools never mutate the user's machine and need no confirmation.",
@@ -238,7 +238,7 @@ const REPLACE_SESSION_PROPERTY = {
   type: "boolean",
   default: false,
   description:
-    "Start this slot on a fresh Hermes session (or on the given sessionId) and archive its previous session binding. Only when the user asks for a fresh context; the slot must be idle.",
+    "Start this slot on a fresh Hermes session (or on the given sessionId) and archive its previous session binding. With a sessionId bound to another idle slot or ChatGPT conversation, moves it here and archives it there. Only when the user asks for it; the slot must be idle.",
 };
 
 const TOOLS = [
@@ -302,7 +302,7 @@ const TOOLS = [
   {
     name: "continue_hermes_session",
     description:
-      "Continue an explicitly chosen durable Hermes session through the authenticated Runs API. The wrapper rejects a different session once the addressed slot (slot 1 by default) has a canonical Hermes session, unless replaceSession is true, and never binds one session to two slots. Long work hands back the active runId after at most 90 seconds for polling, and exact retries reuse that Run.",
+      "Continue an explicitly chosen durable Hermes session through the authenticated Runs API. The wrapper rejects a different session once the addressed slot (slot 1 by default) has a canonical Hermes session, unless replaceSession is true. A session bound to another slot or another ChatGPT conversation is refused; replaceSession moves it here only if it is idle there. Long work hands back the active runId after at most 90 seconds for polling, and exact retries reuse that Run.",
     inputSchema: {
       type: "object",
       additionalProperties: false,

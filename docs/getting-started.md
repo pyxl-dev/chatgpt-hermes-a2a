@@ -251,7 +251,7 @@ The coordinator enforces:
 - cross-process state transactions through an OS-backed SQLite mutex;
 - remote Run reconciliation outside the global transaction, followed by active-lease revalidation;
 - one active mutating Run per slot, so at most three per ChatGPT conversation;
-- one canonical durable Hermes session per slot, never shared between slots;
+- one canonical durable Hermes session per slot, never shared with another slot or another ChatGPT conversation (an idle one moves only on an explicit `replaceSession: true`);
 - a warning when parallel slots may edit the same workspace;
 - exact idempotent recovery after ambiguous submission;
 - persisted active Run recovery across bridge restart;

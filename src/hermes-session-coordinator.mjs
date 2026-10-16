@@ -566,6 +566,37 @@ export function createHermesSessionCoordinator({
     return slotEntries(scope.sessionHash).filter(([other]) => other !== slot);
   }
 
+  // The other slot, in any conversation, that holds sessionId: bound to it,
+  // or running work in it.
+  function findSessionHolder(scope, sessionId) {
+    const ownSlot = slotOf(scope);
+    for (const [sessionHash, conversation] of Object.entries(
+      state.conversations,
+    )) {
+      if (!isPlainObject(conversation)) continue;
+      for (const [slot, record] of slotEntries(sessionHash)) {
+        if (sessionHash === scope.sessionHash && slot === ownSlot) continue;
+        const busy =
+          isPlainObject(record.active) &&
+          (record.active.sessionId === sessionId ||
+            record.canonicalSessionId === sessionId);
+        if (busy || record.canonicalSessionId === sessionId) {
+          if (!Array.isArray(record.archivedSessions)) {
+            record.archivedSessions = [];
+          }
+          return {
+            sessionHash,
+            slot,
+            record,
+            busy,
+            sameConversation: sessionHash === scope.sessionHash,
+          };
+        }
+      }
+    }
+    return null;
+  }
+
   function freeSlotsFor(scope) {
     const free = [];
     for (let slot = 1; slot <= MAX_SLOTS; slot += 1) {
@@ -1069,28 +1100,38 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      // A durable session accepts one Run at a time, so it may be bound to
-      // only one slot of the conversation.
+      // A durable Hermes session belongs to one slot of one conversation:
+      // two bindings would interleave unrelated work in the same context, and
+      // a session accepts one Run at a time anyway. A session in use elsewhere
+      // is always refused; an idle one bound elsewhere moves here only on an
+      // explicit replaceSession. Older state may already share an idle
+      // canonical session between conversations; that binding keeps working.
       const targetSessionId =
         requested || (replaceSession ? null : record.canonicalSessionId) || null;
-      const owningSlot = targetSessionId
-        ? otherSlotEntries(scope).find(
-            ([, other]) =>
-              other.canonicalSessionId === targetSessionId ||
-              other.active?.sessionId === targetSessionId,
-          )
+      const holder = targetSessionId
+        ? findSessionHolder(scope, targetSessionId)
         : null;
-      if (owningSlot) {
+      const newBinding =
+        Boolean(holder) && targetSessionId !== record.canonicalSessionId;
+      if (holder && (holder.busy || (newBinding && !replaceSession))) {
         throw coordinatorError(
-          "HERMES_SESSION_BOUND_TO_OTHER_SLOT",
-          "This Hermes sessionId is already bound to slot " +
-            owningSlot[0] +
-            " of this ChatGPT conversation; address that slot instead.",
+          holder.sameConversation
+            ? "HERMES_SESSION_BOUND_TO_OTHER_SLOT"
+            : "HERMES_SESSION_BOUND_TO_OTHER_CONVERSATION",
+          (holder.sameConversation
+            ? "This Hermes sessionId is bound to slot " +
+              holder.slot +
+              " of this ChatGPT conversation"
+            : "This Hermes sessionId is bound to another ChatGPT conversation") +
+            (holder.busy
+              ? ", which is running work in it right now."
+              : ". Pass replaceSession:true to move it here, or start a new session."),
           {
             sessionHash: scope.sessionHash,
             slot,
             requestedSessionId: targetSessionId,
-            boundSlot: owningSlot[0],
+            busy: holder.busy,
+            ...(holder.sameConversation ? { boundSlot: holder.slot } : {}),
           },
         );
       }
@@ -1131,6 +1172,21 @@ export function createHermesSessionCoordinator({
         );
       }
 
+      let movedFrom = recoverablePending ? active?.movedFrom || null : null;
+      if (holder && newBinding) {
+        holder.record.archivedSessions.push({
+          sessionId: targetSessionId,
+          archivedAt: new Date().toISOString(),
+          reason: holder.sameConversation
+            ? "moved-to-slot-" + slot
+            : "moved-to-other-conversation",
+          lastRunId: lastRunSummary(holder.record)?.runId || null,
+        });
+        holder.record.canonicalSessionId = null;
+        holder.record.updatedAt = new Date().toISOString();
+        movedFrom = { sessionHash: holder.sessionHash, slot: holder.slot };
+      }
+
       const operationId = randomUUID();
       const idempotencyKey =
         recoverablePending && active?.idempotencyKey
@@ -1155,6 +1211,7 @@ export function createHermesSessionCoordinator({
         idempotencyKey,
         reusedSession,
         ...(replacedSessionId ? { replacedSessionId } : {}),
+        ...(movedFrom ? { movedFrom } : {}),
       };
       record.updatedAt = new Date().toISOString();
       await persist();
@@ -1170,6 +1227,7 @@ export function createHermesSessionCoordinator({
         slot,
         parallelRuns: parallelRunsFor(scope),
         replacedSessionId,
+        movedFrom,
       };
     });
   }
@@ -1305,6 +1363,27 @@ export function createHermesSessionCoordinator({
             (entry) => entry?.sessionId === replaced,
           );
           if (index >= 0) record.archivedSessions.splice(index, 1);
+        }
+        // Likewise, a session moved here from another slot goes back.
+        const movedFrom = record.active.movedFrom || null;
+        const source = movedFrom
+          ? state.conversations[movedFrom.sessionHash]?.slots?.[
+              String(movedFrom.slot)
+            ]
+          : null;
+        const movedSessionId = record.active.sessionId || null;
+        if (
+          isPlainObject(source) &&
+          movedSessionId &&
+          !source.canonicalSessionId &&
+          !source.active
+        ) {
+          source.canonicalSessionId = movedSessionId;
+          const index = (source.archivedSessions || []).findLastIndex(
+            (entry) => entry?.sessionId === movedSessionId,
+          );
+          if (index >= 0) source.archivedSessions.splice(index, 1);
+          source.updatedAt = new Date().toISOString();
         }
         record.active = null;
         record.updatedAt = new Date().toISOString();

@@ -87,8 +87,15 @@ three Runs in flight and one Hermes session never receives two concurrent Runs.
   `sessionId` for `continue_hermes_session`. The Hermes session itself is never
   touched or deleted; if the submission is definitively rejected, the previous
   binding is restored.
-- A session already bound to (or running in) another slot of the conversation
-  is refused with `HERMES_SESSION_BOUND_TO_OTHER_SLOT`.
+- A Hermes session belongs to one slot of one conversation. A session bound
+  to another slot is refused with `HERMES_SESSION_BOUND_TO_OTHER_SLOT`; one
+  bound to another ChatGPT conversation with
+  `HERMES_SESSION_BOUND_TO_OTHER_CONVERSATION`. If the holder is idle,
+  `replaceSession: true` moves the session here and archives it in the holder
+  (`moved-to-slot-N` / `moved-to-other-conversation`; restored if the
+  submission is rejected). A session the holder is running work in is always
+  refused. Conversations that already shared an idle canonical session before
+  this rule keep using it, but never at the same time.
 - `steer_hermes_run`, `stop_hermes_run`, `get_hermes_run` and
   `hermes_tool_timeline` resolve the slot from `runId` when `slot` is omitted.
 - Every slot shares the Mac workspace Hermes runs in: the Runs API takes no

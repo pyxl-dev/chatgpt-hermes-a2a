@@ -531,3 +531,139 @@ test("slot history keeps only the most recent Runs", async () => {
     ["r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11"],
   );
 });
+
+const metaB = { "openai/session": "slots-chat-b" };
+
+function continueSession(coordinator, scope, sessionId, extra = {}) {
+  return coordinator.begin(scope, {
+    mode: "continue_hermes_session",
+    tool: "continue_hermes_session",
+    instruction: "pick up " + sessionId,
+    requestedSessionId: sessionId,
+    ...extra,
+  });
+}
+
+test("a session bound to one conversation is refused in another", async () => {
+  const { coordinator } = await makeCoordinator();
+  const a = coordinator.scopeFromMeta(metaA);
+  const b = coordinator.scopeFromMeta(metaB);
+  await startRun(coordinator, a, "work in A", "rA", "shared");
+
+  // While A runs in it, nobody else may touch it, even with replaceSession.
+  await assert.rejects(
+    continueSession(coordinator, b, "shared", { replaceSession: true }),
+    (error) =>
+      error?.code === "HERMES_SESSION_BOUND_TO_OTHER_CONVERSATION" &&
+      error.details?.busy === true,
+  );
+
+  await finishRun(coordinator, a, "rA", "shared");
+  await assert.rejects(
+    continueSession(coordinator, b, "shared"),
+    (error) =>
+      error?.code === "HERMES_SESSION_BOUND_TO_OTHER_CONVERSATION" &&
+      error.details?.busy === false &&
+      /replaceSession/.test(error.message),
+  );
+  // A keeps its binding.
+  assert.equal((await coordinator.inspect(a)).canonicalSessionId, "shared");
+});
+
+test("replaceSession moves an idle session from another conversation, and a rejected submission moves it back", async () => {
+  const { coordinator } = await makeCoordinator();
+  const a = coordinator.scopeFromMeta(metaA);
+  const b = coordinator.scopeFromMeta(metaB);
+  await startRun(coordinator, a, "work in A", "rA", "shared");
+  await finishRun(coordinator, a, "rA", "shared");
+
+  const rejected = await continueSession(coordinator, b, "shared", {
+    replaceSession: true,
+  });
+  assert.equal((await coordinator.inspect(a)).canonicalSessionId, null);
+  await coordinator.fail(b, rejected.operationId);
+  let snapshotA = await coordinator.inspect(a);
+  assert.equal(snapshotA.canonicalSessionId, "shared");
+  assert.deepEqual(snapshotA.archivedSessions, []);
+
+  const moved = await continueSession(coordinator, b, "shared", {
+    replaceSession: true,
+  });
+  assert.equal(moved.sessionIdToUse, "shared");
+  await coordinator.complete(b, moved.operationId, {
+    payload: { ok: true, runId: "rB", sessionId: "shared", status: "completed" },
+    runId: "rB",
+    sessionId: "shared",
+  });
+  assert.equal((await coordinator.inspect(b)).canonicalSessionId, "shared");
+
+  snapshotA = await coordinator.inspect(a);
+  assert.equal(snapshotA.canonicalSessionId, null);
+  assert.deepEqual(
+    snapshotA.archivedSessions.map((entry) => [entry.sessionId, entry.reason, entry.lastRunId]),
+    [["shared", "moved-to-other-conversation", "rA"]],
+  );
+
+  // A's next work starts a fresh session instead of reusing B's.
+  const nextA = await coordinator.begin(a, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "more work in A",
+  });
+  assert.equal(nextA.sessionIdToUse, null);
+  assert.equal(nextA.reusedSession, false);
+});
+
+test("replaceSession moves an idle session between slots of one conversation", async () => {
+  const { coordinator } = await makeCoordinator();
+  const a = coordinator.scopeFromMeta(metaA);
+  await startRun(coordinator, a, "slot one", "r1", "s1");
+  await finishRun(coordinator, a, "r1", "s1");
+
+  const moved = await continueSession(coordinator, { ...a, slot: 2 }, "s1", {
+    replaceSession: true,
+  });
+  assert.equal(moved.sessionIdToUse, "s1");
+  const slot1 = await coordinator.inspect(a);
+  assert.equal(slot1.canonicalSessionId, null);
+  assert.equal(slot1.archivedSessions[0]?.reason, "moved-to-slot-2");
+});
+
+test("conversations that already shared an idle session before the upgrade keep working, one Run at a time", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-slots-shared-"));
+  const { coordinator: probe } = await makeCoordinator(root);
+  const a = probe.scopeFromMeta(metaA);
+  const b = probe.scopeFromMeta(metaB);
+  await fs.mkdir(path.dirname(statePath(root)), { recursive: true });
+  await fs.writeFile(
+    statePath(root),
+    JSON.stringify({
+      version: 3,
+      sessions: {
+        [a.sessionHash]: { canonicalSessionId: "legacy", active: null },
+        [b.sessionHash]: { canonicalSessionId: "legacy", active: null },
+      },
+      recentResults: {},
+    }) + "\n",
+  );
+
+  const { coordinator } = await makeCoordinator(root);
+  await startRun(coordinator, a, "A first", "rA", "legacy");
+  await assert.rejects(
+    coordinator.begin(b, {
+      mode: "delegate_to_hermes",
+      tool: "delegate_to_hermes",
+      instruction: "B meanwhile",
+    }),
+    (error) =>
+      error?.code === "HERMES_SESSION_BOUND_TO_OTHER_CONVERSATION" &&
+      error.details?.busy === true,
+  );
+  await finishRun(coordinator, a, "rA", "legacy");
+  const lease = await coordinator.begin(b, {
+    mode: "delegate_to_hermes",
+    tool: "delegate_to_hermes",
+    instruction: "B afterwards",
+  });
+  assert.equal(lease.sessionIdToUse, "legacy");
+});
