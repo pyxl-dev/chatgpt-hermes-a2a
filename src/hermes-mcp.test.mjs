@@ -1027,6 +1027,50 @@ test("Hermes' global Run cap surfaces as a clear error and frees the slot", asyn
   }
 });
 
+test("with several slots running, every answer steers ChatGPT to one no-argument get_hermes_run", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-slots-guidance-"));
+  const api = await createSlotsApi();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      HERMES_NATIVE_RUN_POLL_WAIT_MS: "0",
+    });
+    const metadata = { "openai/session": "guided-conversation" };
+    const call = (name, args) =>
+      client.callTool({ name, arguments: args, _meta: metadata });
+
+    assert.match(String(client.getInstructions()), /NO arguments/);
+    const getRun = (await client.listTools()).tools.find(
+      (tool) => tool.name === "get_hermes_run",
+    );
+    assert.match(getRun.description, /^Wait for and read Hermes Runs\. Call it with NO arguments/);
+
+    const first = await call("start_hermes_run", { instruction: "slow job one" });
+    assert.equal(first.structuredContent?.pollWith, undefined, "a lone slot keeps the usual guidance");
+
+    const second = await call("start_hermes_run", {
+      instruction: "slow job two",
+      slot: 2,
+    });
+    assert.equal(second.structuredContent?.pollWith, "get_hermes_run with no arguments");
+    assert.match(second.structuredContent?.nextStep || "", /NO arguments/);
+
+    const perSlot = await call("get_hermes_run", { slot: 2 });
+    assert.equal(perSlot.structuredContent?.pending, true);
+    assert.deepEqual(perSlot.structuredContent?.otherActiveSlots, [1]);
+    assert.match(perSlot.structuredContent?.nextStep || "", /NO arguments/);
+
+    const all = await call("get_hermes_run", {});
+    assert.equal(all.structuredContent?.resolution, "conversation-active-slots");
+    assert.match(all.structuredContent?.nextStep || "", /no arguments/);
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 async function createProfileApi() {
   const keys = { "": "test-control-key", "/p/rea": "rea-key" };
   const state = { requests: [], runs: new Map() };
