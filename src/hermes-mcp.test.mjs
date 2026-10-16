@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { cp, mkdtemp, rm, symlink } from "node:fs/promises";
+import { chmod, cp, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -269,6 +269,154 @@ test("synchronous delegate finalizes terminal submission responses without polli
       0,
       "terminal success must not be polled",
     );
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("hermes_tool_timeline is exposed read-only and returns content-free entries", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-timeline-mcp-"));
+  const api = await createControlApi({ canceledStatus: "cancelled" });
+  let client = null;
+  const secretArgument = "SECRET_CALL_ARGUMENT_VALUE";
+  const secretResult = "SECRET_TOOL_RESULT_TEXT";
+  const fixture = {
+    id: "session-mcp-1",
+    title: "timeline fixture",
+    source: "api_server",
+    started_at: 1000,
+    ended_at: 1005,
+    message_count: 3,
+    messages: [
+      {
+        role: "assistant",
+        timestamp: 1000,
+        tool_calls: [
+          {
+            id: "call-mcp-1",
+            type: "function",
+            function: {
+              name: "terminal",
+              arguments: `{"command":"${secretArgument}"}`,
+            },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        tool_call_id: "call-mcp-1",
+        tool_name: "terminal",
+        timestamp: 1002,
+        content: `BLOCKED: ${secretResult}`,
+      },
+    ],
+  };
+
+  try {
+    const sandboxSrc = path.join(tempDir, "src");
+    await cp(path.join(projectRoot, "src"), sandboxSrc, { recursive: true });
+    await symlink(
+      path.join(projectRoot, "node_modules"),
+      path.join(tempDir, "node_modules"),
+      "dir",
+    );
+
+    const stubBin = path.join(tempDir, "hermes-stub.mjs");
+    await writeFile(
+      stubBin,
+      [
+        "#!/usr/bin/env node",
+        "import fs from 'node:fs/promises';",
+        "const args = process.argv.slice(2);",
+        "const marker = args.indexOf('export');",
+        "await fs.writeFile(args[marker + 1], process.env.TIMELINE_FIXTURE + '\\n');",
+        "process.stdout.write('Exported 1 session');",
+        "",
+      ].join("\n"),
+    );
+    await chmod(stubBin, 0o755);
+
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [path.join(sandboxSrc, "hermes-mcp.mjs")],
+      cwd: tempDir,
+      stderr: "pipe",
+      env: {
+        ...process.env,
+        API_SERVER_KEY: "test-control-key",
+        HERMES_API_SERVER_KEY: "test-control-key",
+        HERMES_API_SERVER_URL: api.baseUrl,
+        HERMES_ACTIVITY_LOG: path.join(tempDir, "activity.jsonl"),
+        HERMES_BIN: stubBin,
+        TIMELINE_FIXTURE: JSON.stringify(fixture),
+      },
+    });
+
+    client = new Client(
+      { name: "timeline-surface", version: "1.0.0" },
+      { capabilities: {} },
+    );
+    await client.connect(transport);
+
+    const listed = await client.listTools();
+    const names = (listed.tools || []).map((tool) => tool.name);
+    assert.equal(names.length, 11, "the 10 native tools plus the read-only timeline");
+    assert.ok(names.includes("hermes_tool_timeline"));
+    assert.ok(names.includes("delegate_to_hermes"), "existing tools stay exposed");
+
+    const missing = await client.callTool({
+      name: "hermes_tool_timeline",
+      arguments: {},
+    });
+    assert.equal(missing.isError, true);
+    assert.equal(
+      missing.structuredContent?.error?.code,
+      "HERMES_TIMELINE_TARGET_REQUIRED",
+    );
+
+    const timeline = await client.callTool({
+      name: "hermes_tool_timeline",
+      arguments: { sessionId: "session-mcp-1", runId: "run-mcp-1" },
+    });
+    assert.notEqual(timeline.isError, true);
+    const payload = timeline.structuredContent;
+    assert.equal(payload?.ok, true);
+    assert.equal(payload?.contentFree, true);
+    assert.equal(payload?.scope, "session");
+    assert.equal(payload?.requestedRunId, "run-mcp-1");
+    assert.equal(payload?.runFilterApplied, false);
+    assert.equal(payload?.correlation, "explicit-session-id");
+    assert.equal(payload?.entries?.length, 1);
+    assert.equal(payload?.entries?.[0]?.toolName, "terminal");
+    assert.equal(payload?.entries?.[0]?.errorKind, "blocked");
+    assert.equal(payload?.entries?.[0]?.durationMs, 2000);
+    assert.equal(payload?.totals?.errorCount, 1);
+    assert.equal(
+      Object.hasOwn(payload || {}, "runId"),
+      false,
+      "a per-run label must never be returned",
+    );
+
+    const serialized = JSON.stringify(payload);
+    assert.equal(serialized.includes(secretArgument), false);
+    assert.equal(serialized.includes(secretResult), false);
+
+    // runId alone never borrows the conversation's current canonical session
+    // and never claims per-run filtering.
+    const byRunId = await client.callTool({
+      name: "hermes_tool_timeline",
+      arguments: { runId: "run_old_unrelated" },
+    });
+    assert.notEqual(byRunId.isError, true);
+    const byRunIdPayload = byRunId.structuredContent;
+    assert.equal(byRunIdPayload?.correlation, "run-id-as-session-id");
+    assert.equal(byRunIdPayload?.requestedSessionId, "run_old_unrelated");
+    assert.equal(byRunIdPayload?.scope, "session");
+    assert.equal(byRunIdPayload?.runFilterApplied, false);
+    assert.equal(byRunIdPayload?.requestedRunId, "run_old_unrelated");
+    assert.equal(Object.hasOwn(byRunIdPayload || {}, "runId"), false);
   } finally {
     await client?.close();
     await api.close();

@@ -286,11 +286,46 @@ const TOOLS = [
             "stop_hermes_run",
             "hermes_status",
             "hermes_activity",
+            "hermes_tool_timeline",
           ],
         },
         since: { type: "string" },
         deduplicatedOnly: { type: "boolean", default: false },
         errorsOnly: { type: "boolean", default: false },
+      },
+    },
+  },
+  {
+    name: "hermes_tool_timeline",
+    description:
+      "Read a session-scoped, content-free tool timeline (tool name, start/end, duration, ok/error kind, call state) for one persisted Hermes session. sessionId selects the session directly; runId only locates that session (the coordinator's active run, then the run-bound session id) and never narrows the entries to one run. It never returns tool arguments, tool results, prompts, assistant text or reasoning, and it never contacts the network.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        sessionId: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Durable Hermes session id. Optional when runId is supplied.",
+        },
+        runId: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Hermes Run id used only to locate its session: the coordinator's active run is preferred, then the run-bound session id from GET /v1/runs/{id}.",
+        },
+        limit: { type: "integer", minimum: 1, maximum: 500, default: 100 },
+        since: {
+          type: "string",
+          description: "ISO-8601 timestamp; keep entries ending at or after it.",
+        },
+        errorsOnly: { type: "boolean", default: false },
+        tool: {
+          type: "string",
+          minLength: 1,
+          description: "Keep entries for one exact tool name.",
+        },
       },
     },
   },
@@ -1131,6 +1166,58 @@ async function executePublicTool(name, args, traceId, sessionScope) {
 
     case "hermes_activity":
       return observability.readActivity(args);
+
+    case "hermes_tool_timeline": {
+      const explicitSessionId =
+        typeof args.sessionId === "string" && args.sessionId.trim()
+          ? args.sessionId.trim()
+          : null;
+      const requestedRunId =
+        typeof args.runId === "string" && args.runId.trim()
+          ? args.runId.trim()
+          : null;
+      let sessionId = explicitSessionId;
+      let correlation = explicitSessionId ? "explicit-session-id" : null;
+
+      if (!sessionId && requestedRunId) {
+        // A runId is only used to locate its session. The coordinator's active
+        // run is authoritative when it matches this exact runId; otherwise the
+        // run-bound session id is the run id itself (GET /v1/runs/{id} binds
+        // them). The conversation's current canonical session is deliberately
+        // NOT used: it may belong to a different, later run.
+        const state = await sessionCoordinator
+          .inspect(sessionScope)
+          .catch(() => null);
+        const active = state?.active || null;
+        const activeMatches =
+          active &&
+          (active.runId === requestedRunId || active.id === requestedRunId) &&
+          Boolean(active.sessionId);
+        if (activeMatches) {
+          sessionId = active.sessionId;
+          correlation = "coordinator-active-run";
+        } else {
+          sessionId = requestedRunId;
+          correlation = "run-id-as-session-id";
+        }
+      }
+
+      if (!sessionId) {
+        throw codedError(
+          "HERMES_TIMELINE_TARGET_REQUIRED",
+          "sessionId or runId is required to read a tool timeline.",
+        );
+      }
+
+      return sessionAccess.getToolTimeline(sessionId, {
+        ...(args.limit === undefined ? {} : { limit: args.limit }),
+        ...(args.since === undefined ? {} : { since: args.since }),
+        errorsOnly: args.errorsOnly === true,
+        ...(typeof args.tool === "string" ? { tool: args.tool } : {}),
+        ...(requestedRunId ? { runId: requestedRunId } : {}),
+        ...(correlation ? { correlation } : {}),
+      });
+    }
 
     default:
       throw new Error("Unknown tool: " + name);

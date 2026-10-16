@@ -35,7 +35,8 @@ There is no A2A backend in the runtime path. The wrapper does not depend on
 
 ## Public MCP tools
 
-The wrapper exposes exactly 10 tools:
+The wrapper exposes exactly 11 tools: the 10 original native tools plus one
+read-only observability tool.
 
 | Tool | Purpose |
 | --- | --- |
@@ -49,6 +50,7 @@ The wrapper exposes exactly 10 tools:
 | `stop_hermes_run` | Stop the active Run |
 | `hermes_status` | Check native Runs API capabilities |
 | `hermes_activity` | Read local redacted activity traces |
+| `hermes_tool_timeline` | Read a content-free tool chronology for one session or Run (tool name, start/end, duration, ok/error kind) |
 
 ## Session model
 
@@ -182,7 +184,9 @@ The LaunchAgent/profile/keychain identifiers still contain `chatgpt-hermes-a2a` 
 
 ## Testing
 
-`npm test` covers the native coordinator, control idempotency and observability.
+`npm test` covers the native coordinator, control idempotency, observability,
+bounded log rotation, the bounded LaunchAgent log runner and the content-free
+tool timeline.
 
 `npm run smoke:control` verifies:
 
@@ -192,7 +196,7 @@ The LaunchAgent/profile/keychain identifiers still contain `chatgpt-hermes-a2a` 
 - cooperative stop;
 - terminal cancellation.
 
-`npm run smoke` starts the MCP wrapper over stdio, verifies the exact 10-tool native-only surface, checks native Hermes status/session discovery, delegates a harmless real task, and verifies Hermes used a local tool.
+`npm run smoke` starts the MCP wrapper over stdio, verifies the exact 11-tool native-only surface, checks native Hermes status/session discovery, delegates a harmless real task, verifies Hermes used a local tool, then reads the run's content-free tool timeline.
 
 ## Observability
 
@@ -203,6 +207,48 @@ Every public tool call appends a redacted trace to:
 ```
 
 The trace stores a hash and truncated/redacted preview of instructions rather than the full prompt. Use `hermes_activity` to inspect it from ChatGPT.
+
+That file is now bounded: it rotates at `HERMES_ACTIVITY_MAX_BYTES` (default
+2 MB) into `.runtime/hermes-activity.jsonl.1 … .N` (`HERMES_ACTIVITY_BACKUPS`,
+default 3), always mode `0600`, and `hermes_activity` reads across the rotated
+segments under an 8 MB budget (reporting `rotation.readTruncated` when older
+bytes were dropped).
+
+The LaunchAgent logs are bounded the same way. `scripts/daemon-run.sh` starts
+the tunnel client through `src/bounded-log-runner.mjs`, so
+`~/Library/Logs/chatgpt-hermes-a2a.out.log` (and `.err.log`) rotate at
+`A2A_LOG_MAX_BYTES` (default 2 MB) with `A2A_LOG_BACKUPS` generations
+(default 3). The paths `scripts/status.sh` tails do not change.
+
+Execution steps are readable per session with `hermes_tool_timeline`:
+
+```text
+hermes_tool_timeline { "sessionId": "run_…" }
+hermes_tool_timeline { "sessionId": "run_…", "errorsOnly": true }
+hermes_tool_timeline { "sessionId": "run_…", "tool": "terminal", "limit": 50 }
+hermes_tool_timeline { "sessionId": "run_…", "since": "2026-10-10T00:00:00Z" }
+hermes_tool_timeline { "runId": "run_…" }
+```
+
+Each entry carries `toolName`, `startedAt`, `endedAt`, `durationMs`, `ok`,
+`errorKind` (`blocked` / `denied` / `error` / `nonzero_exit`) and `state`
+(`completed` / `started_only` / `result_only`). The tool is derived from
+Hermes' own persisted session store, so it survives bridge restarts, and it
+never returns tool arguments, tool results, prompts, assistant text or
+reasoning.
+
+The result is always session-scoped and says so: `scope: "session"`,
+`requestedRunId` (the caller's input, echoed), `runFilterApplied: false` and a
+`runFilterNote`. A `runId` only *locates* its session — the coordinator's
+active run when that exact run matches, otherwise the run-bound session id —
+because a continued session holds tool calls from several runs and nothing can
+attribute a call to one run with proof. No result is ever labelled as one run's
+timeline.
+
+What is deliberately *not* collected: the live `/v1/runs/{id}/events` SSE
+stream (richer `tool.started` previews, but a 300-second transport buffer, not
+a store), any tool argument or result text, any prompt content, and anything
+leaving this machine — there is no OTLP, telemetry or cloud export.
 
 ## Security
 

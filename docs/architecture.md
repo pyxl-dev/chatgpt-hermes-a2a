@@ -193,6 +193,62 @@ The trace includes timing, tool name, hashed ChatGPT session scope, instruction 
 
 `hermes_activity` reads this file only; it does not contact Hermes.
 
+### Bounded logs
+
+Nothing operational grows without limit:
+
+- `.runtime/hermes-activity.jsonl` rotates at `HERMES_ACTIVITY_MAX_BYTES`
+  (default 2 MB) into `.runtime/hermes-activity.jsonl.1 … .N`
+  (`HERMES_ACTIVITY_BACKUPS`, default 3). Rotation runs inside the serialized
+  append chain, keeps mode `0600`, and is best-effort: if a rename fails the
+  trace is still appended and the failure is reported on stderr, because losing
+  a record is worse than an oversized file.
+- `hermes_activity` reads the live segment plus its rotations under
+  `HERMES_ACTIVITY_READ_MAX_BYTES` (default 8 MB, newest bytes win) and reports
+  `rotation.readTruncated` so a caller can tell that older bytes were skipped.
+- The persistent LaunchAgent runs the tunnel client through
+  `src/bounded-log-runner.mjs`, so `~/Library/Logs/chatgpt-hermes-a2a.out.log`
+  and `.err.log` are bounded too (`A2A_LOG_MAX_BYTES`, default 2 MB;
+  `A2A_LOG_BACKUPS`, default 3). launchd keeps its own `StandardOutPath` /
+  `StandardErrorPath` open, but after `exec` the bridge writes through the
+  runner, which owns the rotation. The runner serializes each stream through
+  its own promise queue, slices chunks larger than the cap so no segment can
+  exceed it, pauses the child's pipe under backpressure, and drains the queue
+  before closing.
+
+Rotating by rename assumes one writer per file family: the bridge activity log
+and the LaunchAgent runner each hold the only writer and serialize their own
+appends. A second writer sharing the same path would have to coordinate
+externally.
+
+### Tool timeline
+
+`hermes_tool_timeline` answers "what did this session actually do, and how long
+did each step take?" without returning content. The timeline is derived from
+Hermes' own persisted session store (the same redacted `hermes sessions export`
+used by `get_hermes_session`), so it is durable across restarts and is not a
+second copy of anything:
+
+- entry fields: `index`, `toolName`, `toolCallId`, `startedAt`, `endedAt`,
+  `durationMs`, `ok`, `errorKind` (`blocked`, `denied`, `error`,
+  `nonzero_exit`), `state` (`completed`, `started_only`, `result_only`);
+- filters: `sessionId` or `runId`, `limit` (1–500), `since`, `errorsOnly`,
+  `tool`;
+- never returned: tool arguments, tool results, prompts, assistant text,
+  reasoning;
+- scope: the chronology is always whole-session. The result states
+  `scope: "session"`, `requestedRunId`, `runFilterApplied: false` and a
+  `runFilterNote`; it never returns a `runId` field that would imply the
+  entries belong to one run. `correlation` reports how a `runId` located its
+  session (`explicit-session-id`, `coordinator-active-run`,
+  `run-id-as-session-id`), and the conversation's current canonical session is
+  never borrowed for a non-matching runId.
+
+Because the durable chronology comes from Hermes' transcript, the live
+`/v1/runs/{run_id}/events` SSE stream is not consumed: its tool events are
+richer (`tool.started` argument previews, result previews), but its buffers
+expire after 300 seconds and it is a transport, not a store.
+
 ## Dependencies
 
 - Hermes Agent with native session CLI and authenticated API server;
@@ -206,7 +262,8 @@ The bridge no longer depends on `@cognicellai/a2a-mcp`.
 
 A valid local pipeline must prove:
 
-1. the MCP wrapper exposes exactly the native-only 10-tool surface;
+1. the MCP wrapper exposes exactly the native-only 11-tool surface (the 10
+   original tools plus the read-only `hermes_tool_timeline`);
 2. Hermes native control capabilities are reachable;
 3. a real delegated Run reaches Hermes and uses a local tool;
 4. start/poll/steer/stop works;
