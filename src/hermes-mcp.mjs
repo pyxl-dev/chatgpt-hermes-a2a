@@ -59,7 +59,7 @@ const SERVER_INSTRUCTIONS = [
   "Slots: one conversation can drive up to " + MAX_SLOTS + " durable Hermes sessions (slot 1 to " + MAX_SLOTS + "), each with at most one Run, so up to " + MAX_SLOTS + " Runs can work in parallel. Omit slot for normal work: it uses slot 1.",
   "Use slot 2 or 3 only when the user explicitly asks for parallel work, or for a genuinely independent task that must not wait for the busy slot; never split one task across slots, and keep parallel slots on disjoint files because every slot shares the same Mac workspace.",
   "A slot keeps its Hermes session and context after its Run ends: send follow-ups for that line of work to the same slot. Pass replaceSession:true only when the user wants that slot to start a fresh Hermes session; the old one is archived, never deleted. A Hermes session belongs to one conversation: HERMES_SESSION_BOUND_TO_OTHER_CONVERSATION means another chat uses it, so start a new session unless the user explicitly wants to move it here (replaceSession:true).",
-  "With several slots running, call get_hermes_run with no arguments: it waits on every active slot at once and returns each slot's Run; keep calling it in the same turn until no slot is pending. A busy slot answers HERMES_SESSION_BUSY: poll it instead of resubmitting.",
+  "Polling several slots: as soon as two or more slots have a Run in progress, call get_hermes_run with NO arguments at all (no runId, no slot). That one call waits on every slot at once and returns the moment any of them finishes, with one entry per slot in runs. Never poll slots one at a time with slot or runId: a finished slot would then wait behind a slower one. Keep calling get_hermes_run with no arguments in the same turn until no slot is pending. A busy slot answers HERMES_SESSION_BUSY: poll it instead of resubmitting.",
   "Stop polling only when the Run is terminal, when the user asks you to stop, or after roughly 20 minutes of continuous waiting; then report the runId, the status and anything that needs the user's decision.",
   "Read tools never mutate the user's machine and need no confirmation.",
 ].join(" ");
@@ -334,7 +334,7 @@ const TOOLS = [
   {
     name: "get_hermes_run",
     description:
-      "Read the status/result of a Hermes Run by runId and reconcile coordinator state when it is the active Run. Holds the call open for up to 55 seconds while the Run is still running, so call it again immediately instead of ending the turn between polls. Omit runId to read the Run currently bound to this conversation; with several slots running and no slot given, waits on every active slot and returns each slot's Run.",
+      "Wait for and read Hermes Runs. Call it with NO arguments in the normal case: it reads this conversation's active Run, and when several slots are running it waits on all of them at once, returns as soon as any finishes and lists every slot's Run in runs. Pass slot or runId only to read one specific Run while nothing else is running. Holds the call open for up to 55 seconds while work is still running, so call it again immediately instead of ending the turn between polls.",
     annotations: {
       readOnlyHint: true,
       openWorldHint: false,
@@ -347,9 +347,13 @@ const TOOLS = [
           type: "string",
           minLength: 1,
           description:
-            "Optional. Defaults to the Run currently bound to this conversation.",
+            "Optional. Leave empty to wait on every running slot; only for reading one specific Run.",
         },
-        slot: SLOT_PROPERTY,
+        slot: {
+          ...SLOT_PROPERTY,
+          description:
+            "Optional. Leave empty while several slots are running, so one call waits on all of them; only for reading one specific slot.",
+        },
       },
     },
   },
@@ -885,6 +889,9 @@ function explainCapacityRejection(error) {
     error.message;
 }
 
+const POLL_ALL_SLOTS_HINT =
+  "Several slots of this conversation are running: call get_hermes_run with NO arguments (no runId, no slot), in this same turn. One call waits on every slot and returns as soon as any finishes; polling one slot at a time leaves finished slots waiting behind slower ones.";
+
 // Tool answers about a slot say which slot they used and warn when other
 // slots of the conversation are working in the same Hermes workspace.
 function withSlotContext(result, sessionScope, lease = null) {
@@ -902,10 +909,19 @@ function withSlotContext(result, sessionScope, lease = null) {
         " of this conversation also has Hermes work in progress. Every slot shares the same Mac workspace, so keep parallel instructions on disjoint files and directories.",
     );
   }
+  // While other slots work, the next poll must cover all of them at once.
+  const pollAllSlots = parallelRuns.length > 0 && !runIsTerminal(result);
   return {
     ...result,
     slot: sessionScope.slot ?? 1,
     ...(parallelRuns.length ? { parallelRuns } : {}),
+    ...(pollAllSlots
+      ? {
+          pollWith: "get_hermes_run with no arguments",
+          ...(result.nextAction ? { nextAction: POLL_ALL_SLOTS_HINT } : {}),
+          nextStep: POLL_ALL_SLOTS_HINT,
+        }
+      : {}),
     ...(lease?.replacedSessionId
       ? { archivedSessionId: lease.replacedSessionId }
       : {}),
@@ -1231,19 +1247,23 @@ async function readSlotRun(slotScope, before, requestedRunId) {
     result = await readTrackedRunOnce(slotScope, before, runId);
   }
   const terminal = await observeReadRun(slotScope, before, runId, result);
+  const otherActiveSlots = (
+    await sessionCoordinator.inspectConversation(slotScope)
+  ).slots
+    .filter((slot) => slot.slot !== slotScope.slot && slot.active?.runId)
+    .map((slot) => slot.slot);
   return withSlotContext(
     {
       ...result,
       pending: !terminal,
       resolution: requestedRunId ? "explicit" : "conversation-active-run",
       waitedMs: Date.now() - pollStartedAtMs,
-      nextStep: terminal
-        ? null
-        : "The Run is still working: call get_hermes_run again " +
-          (slotScope?.slot > 1
-            ? "with slot " + slotScope.slot
-            : "without a runId") +
-          ", in this same turn, until it is terminal.",
+      ...(otherActiveSlots.length ? { otherActiveSlots } : {}),
+      nextStep: otherActiveSlots.length
+        ? POLL_ALL_SLOTS_HINT
+        : terminal
+          ? null
+          : "The Run is still working: call get_hermes_run again without arguments, in this same turn, until it is terminal.",
     },
     slotScope,
   );

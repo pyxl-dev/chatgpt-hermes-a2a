@@ -115,6 +115,13 @@ entry per slot in `runs` and a `slots` overview. Terminal entries are settled in
 the coordinator and the run-finished notifier the same way single Runs are, and
 Discord messages for slots 2/3 name the slot.
 
+ChatGPT tends to poll one slot at a time, so a finished slot waits behind a
+slower one. To steer it to the single no-argument call, every answer given
+while another slot is running (a pending start or delegate, or a
+`get_hermes_run` for one slot) carries `pollWith: "get_hermes_run with no
+arguments"` and a `nextStep` saying so, and `get_hermes_run` for one slot also
+lists `otherActiveSlots`.
+
 Busy errors (`HERMES_SESSION_BUSY`) carry the slot and the conversation's
 `freeSlots`.
 
