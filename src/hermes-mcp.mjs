@@ -34,6 +34,27 @@ const NATIVE_DELEGATE_POLL_MS =
   Number.isFinite(configuredNativePollMs) && configuredNativePollMs >= 100
     ? configuredNativePollMs
     : 750;
+const configuredNativeRunPollWaitMs = Number(
+  process.env.HERMES_NATIVE_RUN_POLL_WAIT_MS,
+);
+const MAX_NATIVE_RUN_POLL_WAIT_MS = 55000;
+// A single get_hermes_run call holds the Run open for this long before handing
+// back a nonterminal status, so one assistant turn can sit on the Run instead of
+// spending a fresh model decision between every poll.
+const NATIVE_RUN_POLL_WAIT_MS =
+  Number.isFinite(configuredNativeRunPollWaitMs) &&
+  configuredNativeRunPollWaitMs >= 0
+    ? Math.min(configuredNativeRunPollWaitMs, MAX_NATIVE_DELEGATE_WAIT_MS)
+    : MAX_NATIVE_RUN_POLL_WAIT_MS;
+
+const SERVER_INSTRUCTIONS = [
+  "Hermes runs real work on the user's Mac; a Run can outlive a single ChatGPT turn.",
+  "Delegation protocol: when delegate_to_hermes, continue_hermes_session or start_hermes_run answers pending:true, keep calling get_hermes_run in the SAME turn until the Run reaches a terminal status.",
+  "get_hermes_run holds the call open for up to 55 seconds on its own, so call it again immediately after each nonterminal result. Do not narrate the wait, do not ask the user whether to keep checking, and do not end the turn while a Run is still running.",
+  "get_hermes_run accepts no runId: it then reads the Run currently bound to this conversation, which is what a later user follow-up needs.",
+  "Stop polling only when the Run is terminal, when the user asks you to stop, or after roughly 20 minutes of continuous waiting; then report the runId, the status and anything that needs the user's decision.",
+  "Read tools never mutate the user's machine and need no confirmation.",
+].join(" ");
 
 function redactText(value) {
   let text = String(value);
@@ -105,6 +126,13 @@ function requireString(args, key) {
   return value.trim();
 }
 
+function optionalString(args, key) {
+  const value = args[key];
+  return typeof value === "string" && value.trim() !== ""
+    ? value.trim()
+    : null;
+}
+
 function cleanHermesText(value) {
   const text = String(value || "").trim();
   return text
@@ -159,6 +187,10 @@ const TOOLS = [
   },
   {
     name: "list_hermes_sessions",
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     description:
       "List recent persisted Hermes conversations using Hermes' native sessions list command.",
     inputSchema: {
@@ -173,6 +205,10 @@ const TOOLS = [
   },
   {
     name: "get_hermes_session",
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     description:
       "Read a persisted Hermes conversation by durable sessionId using Hermes' native redacted session export.",
     inputSchema: {
@@ -217,14 +253,22 @@ const TOOLS = [
   {
     name: "get_hermes_run",
     description:
-      "Read the status/result of a Hermes Run by runId and reconcile coordinator state when it is the active Run.",
+      "Read the status/result of a Hermes Run by runId and reconcile coordinator state when it is the active Run. Holds the call open for up to 55 seconds while the Run is still running, so call it again immediately instead of ending the turn between polls. Omit runId to read the Run currently bound to this conversation.",
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        runId: { type: "string", minLength: 1 },
+        runId: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Optional. Defaults to the Run currently bound to this conversation.",
+        },
       },
-      required: ["runId"],
     },
   },
   {
@@ -256,6 +300,10 @@ const TOOLS = [
   },
   {
     name: "hermes_status",
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     description:
       "Check the authenticated Hermes native Runs API capabilities used by this bridge.",
     inputSchema: {
@@ -266,6 +314,10 @@ const TOOLS = [
   },
   {
     name: "hermes_activity",
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     description:
       "Read recent redacted local bridge activity traces without contacting Hermes.",
     inputSchema: {
@@ -297,6 +349,10 @@ const TOOLS = [
   },
   {
     name: "hermes_tool_timeline",
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
     description:
       "Read a session-scoped, content-free tool timeline (tool name, start/end, duration, ok/error kind, call state) for one persisted Hermes session. sessionId selects the session directly; runId only locates that session (the coordinator's active run, then the run-bound session id) and never narrows the entries to one run. It never returns tool arguments, tool results, prompts, assistant text or reasoning, and it never contacts the network.",
     inputSchema: {
@@ -1079,26 +1135,50 @@ async function executePublicTool(name, args, traceId, sessionScope) {
     }
 
     case "get_hermes_run": {
-      const runId = requireString(args, "runId");
+      const requestedRunId = optionalString(args, "runId");
       const before = await sessionCoordinator.inspect(sessionScope);
-      let result;
-      try {
-        result = await control.getRun(runId);
-      } catch (error) {
-        if (
-          nativeRunNotFoundError(error) &&
-          before?.active?.kind === "run" &&
-          before.active.runId === runId
-        ) {
-          await sessionCoordinator.observe(sessionScope, {
-            kind: "run",
-            id: runId,
-            terminal: true,
-            sessionId: before.active.sessionId || null,
-            replayPayload: null,
-          });
+      const runId = requestedRunId || before?.active?.runId || null;
+      if (!runId) {
+        return {
+          ok: true,
+          operation: "get_hermes_run",
+          agent: AGENT,
+          runId: null,
+          sessionId: before?.canonicalSessionId || null,
+          status: "no-active-run",
+          pending: false,
+          hint:
+            "This conversation has no active Run. Start work with delegate_to_hermes, or pass an explicit runId.",
+        };
+      }
+      const readRunOnce = async () => {
+        try {
+          return await control.getRun(runId);
+        } catch (error) {
+          if (
+            nativeRunNotFoundError(error) &&
+            before?.active?.kind === "run" &&
+            before.active.runId === runId
+          ) {
+            await sessionCoordinator.observe(sessionScope, {
+              kind: "run",
+              id: runId,
+              terminal: true,
+              sessionId: before.active.sessionId || null,
+              replayPayload: null,
+            });
+          }
+          throw error;
         }
-        throw error;
+      };
+      const pollStartedAtMs = Date.now();
+      const deadline = pollStartedAtMs + NATIVE_RUN_POLL_WAIT_MS;
+      let result = await readRunOnce();
+      while (!runIsTerminal(result) && Date.now() < deadline) {
+        await sleep(
+          Math.min(NATIVE_DELEGATE_POLL_MS, Math.max(1, deadline - Date.now())),
+        );
+        result = await readRunOnce();
       }
       const terminal = runIsTerminal(result);
       const replayPayload =
@@ -1114,7 +1194,15 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         sessionId: result.sessionId || null,
         replayPayload,
       });
-      return result;
+      return {
+        ...result,
+        pending: !terminal,
+        resolution: requestedRunId ? "explicit" : "conversation-active-run",
+        waitedMs: Date.now() - pollStartedAtMs,
+        nextStep: terminal
+          ? null
+          : "The Run is still working: call get_hermes_run again without a runId, in this same turn, until it is terminal.",
+      };
     }
 
     case "steer_hermes_run": {
@@ -1226,7 +1314,10 @@ async function executePublicTool(name, args, traceId, sessionScope) {
 
 const server = new Server(
   { name: "hermes-mac", version: "0.9.0" },
-  { capabilities: { tools: {} } },
+  {
+    capabilities: { tools: {} },
+    instructions: SERVER_INSTRUCTIONS,
+  },
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -1239,6 +1330,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const sessionScope = sessionCoordinator.scopeFromMeta(extra?._meta);
   const trace = observability.beginTrace(name, args, {
     chatgptSessionHash: sessionScope.sessionHash,
+    metaKeys: Object.keys(extra?._meta || {})
+      .sort()
+      .slice(0, 16),
   });
   let payload = null;
   let failure = null;

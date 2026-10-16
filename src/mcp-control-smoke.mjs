@@ -16,9 +16,14 @@ const terminalStatuses = new Set([
   "rejected",
 ]);
 
-const childEnv = Object.fromEntries(
-  Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
-);
+const childEnv = {
+  ...Object.fromEntries(
+    Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
+  ),
+  // This smoke drives its own 500 ms poll loop, so the bridge must not hold each
+  // read open for the in-call long poll that production ChatGPT turns rely on.
+  HERMES_NATIVE_RUN_POLL_WAIT_MS: "0",
+};
 
 function extractText(result) {
   const parts = Array.isArray(result?.content) ? result.content : [];

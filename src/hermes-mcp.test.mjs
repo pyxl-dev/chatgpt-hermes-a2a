@@ -469,3 +469,237 @@ test("control smoke accepts both canceled and cancelled terminal statuses", asyn
     }
   }
 });
+
+async function createPollingApi({ terminalAfterMs = 1200 } = {}) {
+  const state = { submissions: 0, statusReads: 0, terminalAt: null };
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    request.resume();
+
+    if (request.method === "POST" && url.pathname === "/v1/runs") {
+      state.submissions += 1;
+      sendJson(response, {
+        run_id: "run-polled",
+        session_id: "polled-session",
+        status: "running",
+      });
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
+      state.statusReads += 1;
+      const runId = url.pathname.slice("/v1/runs/".length);
+      if (state.terminalAt === null) {
+        state.terminalAt = Date.now() + terminalAfterMs;
+      }
+      if (Date.now() < state.terminalAt) {
+        sendJson(response, {
+          run_id: runId,
+          session_id: "polled-session",
+          status: "running",
+        });
+      } else {
+        sendJson(response, {
+          run_id: runId,
+          session_id: "polled-session",
+          status: "completed",
+          output: "polled work finished",
+        });
+      }
+      return;
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/capabilities") {
+      sendJson(response, {
+        features: {
+          run_submission: true,
+          run_status: true,
+          run_steer: true,
+          run_stop: true,
+        },
+      });
+      return;
+    }
+
+    sendJson(response, { error: { message: "not found" } }, 404);
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  return {
+    state,
+    baseUrl: "http://127.0.0.1:" + server.address().port,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+async function startBridgeForPollTest(api, tempDir, extraEnv = {}) {
+  const sandboxSrc = path.join(tempDir, "src");
+  await cp(path.join(projectRoot, "src"), sandboxSrc, { recursive: true });
+  await symlink(
+    path.join(projectRoot, "node_modules"),
+    path.join(tempDir, "node_modules"),
+    "dir",
+  );
+
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [path.join(sandboxSrc, "hermes-mcp.mjs")],
+    cwd: tempDir,
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      API_SERVER_KEY: "test-control-key",
+      HERMES_API_SERVER_KEY: "test-control-key",
+      HERMES_API_SERVER_URL: api.baseUrl,
+      HERMES_ACTIVITY_LOG: path.join(tempDir, "activity.jsonl"),
+      HERMES_NATIVE_DELEGATE_TIMEOUT_MS: "1000",
+      HERMES_NATIVE_DELEGATE_POLL_MS: "100",
+      HERMES_NATIVE_RUN_POLL_WAIT_MS: "5000",
+      ...extraEnv,
+    },
+  });
+
+  const client = new Client(
+    { name: "run-poll-regression", version: "1.0.0" },
+    { capabilities: {} },
+  );
+  await client.connect(transport);
+  return client;
+}
+
+test("read tools are annotated read-only and advertise the delegate-then-poll loop", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-readonly-hints-"));
+  const api = await createPollingApi();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir);
+    const tools = (await client.listTools()).tools;
+    const byName = new Map(tools.map((tool) => [tool.name, tool]));
+
+    for (const name of [
+      "list_hermes_sessions",
+      "get_hermes_session",
+      "get_hermes_run",
+      "hermes_status",
+      "hermes_activity",
+      "hermes_tool_timeline",
+    ]) {
+      assert.equal(
+        byName.get(name)?.annotations?.readOnlyHint,
+        true,
+        name + " must be advertised as read-only so unattended turns are not stopped by a confirmation prompt",
+      );
+    }
+
+    for (const name of [
+      "delegate_to_hermes",
+      "continue_hermes_session",
+      "start_hermes_run",
+      "steer_hermes_run",
+      "stop_hermes_run",
+    ]) {
+      assert.notEqual(
+        byName.get(name)?.annotations?.readOnlyHint,
+        true,
+        name + " mutates the user's machine and must not claim read-only access",
+      );
+    }
+
+    const getRun = byName.get("get_hermes_run");
+    assert.equal(
+      getRun?.inputSchema?.required,
+      undefined,
+      "runId must be optional so a later turn can resume with no argument",
+    );
+
+    const instructions = String(client.getInstructions() || "");
+    assert.match(instructions, /get_hermes_run/);
+    assert.match(instructions, /same turn/i);
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("get_hermes_run without a runId resolves the conversation's active Run and holds the call until terminal", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-poll-"));
+  const api = await createPollingApi({ terminalAfterMs: 1200 });
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir);
+    const metadata = { "openai/session": "run-poll-regression" };
+
+    const delegated = await client.callTool({
+      name: "delegate_to_hermes",
+      arguments: { instruction: "long running work" },
+      _meta: metadata,
+    });
+    assert.equal(delegated.structuredContent?.pending, true);
+    assert.equal(delegated.structuredContent?.runId, "run-polled");
+
+    const first = await client.callTool({
+      name: "get_hermes_run",
+      arguments: {},
+      _meta: metadata,
+    });
+    assert.notEqual(first.isError, true);
+    assert.equal(first.structuredContent?.runId, "run-polled");
+    assert.equal(
+      first.structuredContent?.resolution,
+      "conversation-active-run",
+    );
+    assert.equal(first.structuredContent?.status, "completed");
+    assert.equal(first.structuredContent?.pending, false);
+    assert.ok(
+      (first.structuredContent?.waitedMs || 0) >= 100,
+      "the read must wait for the Run instead of returning immediately; waitedMs=" +
+        String(first.structuredContent?.waitedMs),
+    );
+    assert.ok(
+      api.state.statusReads >= 3,
+      "the bridge must poll the Run, not read it once",
+    );
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("get_hermes_run without a runId answers no-active-run when nothing is bound", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-idle-"));
+  const api = await createPollingApi();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      HERMES_NATIVE_RUN_POLL_WAIT_MS: "0",
+    });
+
+    const result = await client.callTool({
+      name: "get_hermes_run",
+      arguments: {},
+      _meta: { "openai/session": "idle-conversation" },
+    });
+    assert.notEqual(result.isError, true);
+    assert.equal(result.structuredContent?.ok, true);
+    assert.equal(result.structuredContent?.status, "no-active-run");
+    assert.equal(result.structuredContent?.runId, null);
+    assert.equal(
+      api.state.statusReads,
+      0,
+      "an idle conversation must not hit the Runs API",
+    );
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});

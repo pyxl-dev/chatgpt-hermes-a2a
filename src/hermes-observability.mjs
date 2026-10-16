@@ -101,6 +101,7 @@ export function createHermesObservability({
         typeof metadata?.chatgptSessionHash === "string"
           ? metadata.chatgptSessionHash
           : null,
+      metaKeys: Array.isArray(metadata?.metaKeys) ? metadata.metaKeys : null,
       instructionHash: instructionHash(args?.instruction),
       instructionPreview: instructionPreview(args?.instruction),
       inputRunId: typeof args?.runId === "string" ? args.runId : null,
