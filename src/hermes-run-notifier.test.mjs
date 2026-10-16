@@ -113,6 +113,18 @@ test("formats a short message without Hermes output", () => {
   assert.match(text, /continue/);
 });
 
+test("names the slot only for parallel slots", () => {
+  const base = { runId: "run_s", status: "completed", elapsedMs: 120000 };
+  assert.match(
+    formatRunNotification({ ...base, slot: 2 }),
+    /^✅ Hermes a fini un run \(slot 2\) : completed/,
+  );
+  assert.match(
+    formatRunNotification({ ...base, slot: 1 }),
+    /^✅ Hermes a fini un run : completed/,
+  );
+});
+
 test("Discord sender posts to the webhook, mutes mentions and never leaks the URL", async () => {
   const calls = [];
   const send = createDiscordWebhookSender({

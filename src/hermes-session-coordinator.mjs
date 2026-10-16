@@ -4,6 +4,13 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 const DEFAULT_DEDUP_WINDOW_MS = 60_000;
+const STATE_VERSION = 4;
+// One ChatGPT conversation drives at most this many durable Hermes sessions
+// ("slots"), each with at most one Run, so it never has more than this many
+// Runs in flight. Slot 1 is the default and the only slot older clients use.
+export const MAX_SLOTS = 3;
+export const DEFAULT_SLOT = 1;
+const SLOT_HISTORY_LIMIT = 10;
 const PROCESS_STATE_TRANSACTION_QUEUES = new Map();
 
 async function withProcessStateTransactionQueue(key, fn) {
@@ -93,11 +100,75 @@ function payloadIsReusable(payload) {
   );
 }
 
+export function normalizeSlot(value) {
+  if (value === undefined || value === null) return null;
+  const slot = Number(value);
+  if (!Number.isInteger(slot) || slot < 1 || slot > MAX_SLOTS) {
+    throw coordinatorError(
+      "HERMES_SLOT_INVALID",
+      "slot must be an integer from 1 to " + MAX_SLOTS + ".",
+      { slot: value },
+    );
+  }
+  return slot;
+}
+
+function slotOf(scope) {
+  return Number.isInteger(scope?.slot) ? scope.slot : DEFAULT_SLOT;
+}
+
+// Slot 1 keeps the pre-slot fingerprint so replays recorded before the v4
+// migration still match; other slots get their own replay namespace so the
+// same instruction sent to two slots is never deduplicated across them.
+function slotFingerprint(slot, fingerprint) {
+  if (!fingerprint || slot === DEFAULT_SLOT) return fingerprint;
+  return sha256("slot:" + slot + "\n" + fingerprint);
+}
+
+function emptySlotRecord() {
+  return {
+    canonicalSessionId: null,
+    active: null,
+    updatedAt: null,
+    history: [],
+    archivedSessions: [],
+  };
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function conversationsFromLegacySessions(sessions) {
+  const conversations = {};
+  for (const [sessionHash, record] of Object.entries(sessions || {})) {
+    if (!isPlainObject(record)) continue;
+    conversations[sessionHash] = {
+      slots: {
+        [String(DEFAULT_SLOT)]: {
+          ...emptySlotRecord(),
+          ...record,
+          history: Array.isArray(record.history) ? record.history : [],
+          archivedSessions: Array.isArray(record.archivedSessions)
+            ? record.archivedSessions
+            : [],
+        },
+      },
+    };
+  }
+  return conversations;
+}
+
 function coordinatorError(code, message, details = null) {
   const error = new Error(message);
   error.code = code;
   if (details) error.details = details;
   return error;
+}
+
+function lastRunSummary(record) {
+  const history = Array.isArray(record?.history) ? record.history : [];
+  return history.length ? history[history.length - 1] : null;
 }
 
 function activeSummary(active) {
@@ -155,7 +226,7 @@ export function createHermesSessionCoordinator({
   const stateMutexPath = filePath + ".mutex.sqlite";
   const stateMutexWaitMs = 30_000;
 
-  const state = { version: 3, sessions: {}, recentResults: {} };
+  const state = { version: STATE_VERSION, conversations: {}, recentResults: {} };
   const instanceId = randomUUID();
 
   function scopeFromMeta(meta) {
@@ -169,6 +240,7 @@ export function createHermesSessionCoordinator({
     return {
       tracked: true,
       sessionHash: sha256(raw.trim()),
+      slot: DEFAULT_SLOT,
     };
   }
 
@@ -287,9 +359,9 @@ export function createHermesSessionCoordinator({
 
     }
 
-    state.sessions = nextSessions;
+    state.conversations = conversationsFromLegacySessions(nextSessions);
     state.recentResults = nextRecent;
-    state.version = 3;
+    state.version = STATE_VERSION;
   }
 
   async function persist() {
@@ -314,8 +386,8 @@ export function createHermesSessionCoordinator({
   }
 
   function resetState() {
-    state.version = 3;
-    state.sessions = {};
+    state.version = STATE_VERSION;
+    state.conversations = {};
     state.recentResults = {};
   }
 
@@ -334,7 +406,7 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      if (![1, 2, 3].includes(parsed.version)) {
+      if (![1, 2, 3, STATE_VERSION].includes(parsed.version)) {
         throw coordinatorError(
           "HERMES_COORDINATOR_STATE_VERSION_UNSUPPORTED",
           "Hermes coordinator state uses an unsupported schema version; refusing to overwrite it.",
@@ -342,36 +414,39 @@ export function createHermesSessionCoordinator({
         );
       }
 
-      if (
-        !parsed.sessions ||
-        typeof parsed.sessions !== "object" ||
-        Array.isArray(parsed.sessions)
-      ) {
+      const containerKey =
+        parsed.version === STATE_VERSION ? "conversations" : "sessions";
+      if (!isPlainObject(parsed[containerKey])) {
         throw coordinatorError(
           "HERMES_COORDINATOR_STATE_INVALID",
-          "Hermes coordinator state has an invalid sessions object.",
+          "Hermes coordinator state has an invalid " + containerKey + " object.",
           { version: parsed.version },
         );
       }
+
+      const parsedRecent = isPlainObject(parsed.recentResults)
+        ? parsed.recentResults
+        : {};
 
       if (parsed.version === 1) {
         migrateV1(parsed);
         migrated = true;
       } else if (parsed.version === 2) {
-        state.sessions = parsed.sessions;
+        state.conversations = conversationsFromLegacySessions(parsed.sessions);
         state.recentResults = migrateLegacyRecentResults(
           parsed.recentResults,
         );
-        state.version = 3;
+        migrated = true;
+      } else if (parsed.version === 3) {
+        // v3 bound exactly one session per conversation: it becomes slot 1,
+        // and its replay keys stay valid because slot 1 fingerprints are
+        // unchanged.
+        state.conversations = conversationsFromLegacySessions(parsed.sessions);
+        state.recentResults = parsedRecent;
         migrated = true;
       } else {
-        state.sessions = parsed.sessions;
-        state.recentResults =
-          parsed.recentResults &&
-          typeof parsed.recentResults === "object" &&
-          !Array.isArray(parsed.recentResults)
-            ? parsed.recentResults
-            : {};
+        state.conversations = parsed.conversations;
+        state.recentResults = parsedRecent;
       }
     } catch (error) {
       if (error?.code !== "ENOENT") throw error;
@@ -440,17 +515,96 @@ export function createHermesSessionCoordinator({
     });
   }
 
-  function getRecord(sessionHash) {
-    let record = state.sessions[sessionHash];
-    if (!record || typeof record !== "object" || Array.isArray(record)) {
-      record = {
-        canonicalSessionId: null,
-        active: null,
-        updatedAt: null,
-      };
-      state.sessions[sessionHash] = record;
+  function getConversation(sessionHash) {
+    let conversation = state.conversations[sessionHash];
+    if (!isPlainObject(conversation)) {
+      conversation = { slots: {} };
+      state.conversations[sessionHash] = conversation;
     }
+    if (!isPlainObject(conversation.slots)) conversation.slots = {};
+    return conversation;
+  }
+
+  function peekRecord(scope) {
+    const record =
+      state.conversations[scope.sessionHash]?.slots?.[String(slotOf(scope))];
+    return isPlainObject(record) ? record : null;
+  }
+
+  // Creating a slot only lives in memory until a transaction persists it, so
+  // reads never materialize slots 2/3; only work started on them does.
+  function getRecord(scope) {
+    const conversation = getConversation(scope.sessionHash);
+    const key = String(slotOf(scope));
+    let record = conversation.slots[key];
+    if (!isPlainObject(record)) {
+      record = emptySlotRecord();
+      conversation.slots[key] = record;
+    }
+    if (!Array.isArray(record.history)) record.history = [];
+    if (!Array.isArray(record.archivedSessions)) record.archivedSessions = [];
     return record;
+  }
+
+  function slotEntries(sessionHash) {
+    const slots = state.conversations[sessionHash]?.slots;
+    if (!isPlainObject(slots)) return [];
+    return Object.entries(slots)
+      .map(([key, record]) => [Number(key), record])
+      .filter(
+        ([slot, record]) =>
+          Number.isInteger(slot) &&
+          slot >= 1 &&
+          slot <= MAX_SLOTS &&
+          isPlainObject(record),
+      )
+      .sort(([a], [b]) => a - b);
+  }
+
+  function otherSlotEntries(scope) {
+    const slot = slotOf(scope);
+    return slotEntries(scope.sessionHash).filter(([other]) => other !== slot);
+  }
+
+  function freeSlotsFor(scope) {
+    const free = [];
+    for (let slot = 1; slot <= MAX_SLOTS; slot += 1) {
+      if (!isPlainObject(peekRecord({ ...scope, slot })?.active)) free.push(slot);
+    }
+    return free;
+  }
+
+  function parallelRunsFor(scope) {
+    return otherSlotEntries(scope)
+      .filter(([, record]) => isPlainObject(record.active))
+      .map(([slot, record]) => ({
+        slot,
+        runId: record.active.runId || null,
+        sessionId:
+          record.active.sessionId || record.canonicalSessionId || null,
+        kind: record.active.kind || null,
+        startedAt: record.active.startedAt || null,
+      }));
+  }
+
+  // Remember a Run that just left the slot so the slot keeps a light trail of
+  // what it did; the session binding itself is untouched.
+  function recordRunEnded(record, active, outcome = null) {
+    if (!active?.runId) return;
+    if (!Array.isArray(record.history)) record.history = [];
+    if (record.history.some((entry) => entry?.runId === active.runId)) return;
+    record.history.push({
+      runId: active.runId,
+      tool: active.tool || null,
+      traceId: active.traceId || null,
+      sessionId: active.sessionId || record.canonicalSessionId || null,
+      startedAt: active.startedAt || null,
+      endedAt: new Date().toISOString(),
+      outcome: outcome ? String(outcome).toLowerCase() : null,
+    });
+    if (record.history.length > SLOT_HISTORY_LIMIT) {
+      record.history.splice(0, record.history.length - SLOT_HISTORY_LIMIT);
+    }
   }
 
   function getRecentResult(sessionHash, fingerprint) {
@@ -547,8 +701,13 @@ export function createHermesSessionCoordinator({
     return {
       tracked: Boolean(scope?.tracked),
       sessionHash: scope?.sessionHash || null,
+      slot: slotOf(scope),
       canonicalSessionId: record?.canonicalSessionId || null,
       active: activeSummary(record?.active),
+      lastRun: lastRunSummary(record),
+      archivedSessions: Array.isArray(record?.archivedSessions)
+        ? record.archivedSessions.map((entry) => ({ ...entry }))
+        : [],
     };
   }
 
@@ -557,13 +716,51 @@ export function createHermesSessionCoordinator({
       return {
         tracked: false,
         sessionHash: null,
+        slot: slotOf(scope),
         canonicalSessionId: null,
         active: null,
+        lastRun: null,
+        archivedSessions: [],
       };
     }
     return withStateTransaction(async () =>
-      snapshot(scope, getRecord(scope.sessionHash)),
+      snapshot(scope, peekRecord(scope) || emptySlotRecord()),
     );
+  }
+
+  // Every slot this conversation has used, in slot order.
+  async function inspectConversation(scope) {
+    if (!scope?.tracked || !scope.sessionHash) {
+      return { tracked: false, sessionHash: null, maxSlots: MAX_SLOTS, slots: [] };
+    }
+    return withStateTransaction(async () => ({
+      tracked: true,
+      sessionHash: scope.sessionHash,
+      maxSlots: MAX_SLOTS,
+      slots: slotEntries(scope.sessionHash).map(([slot, record]) => ({
+        ...snapshot({ ...scope, slot }, record),
+        updatedAt: record.updatedAt || null,
+      })),
+    }));
+  }
+
+  async function findSlotForRun(scope, runId) {
+    if (!scope?.tracked || !scope.sessionHash || !runId) return null;
+    return withStateTransaction(async () => {
+      for (const [slot, record] of slotEntries(scope.sessionHash)) {
+        if (record.active?.runId === runId) return slot;
+      }
+      return null;
+    });
+  }
+
+  // Resolve which slot a tool call addresses: an explicit slot wins, then the
+  // slot whose active Run matches runId, then the default slot.
+  async function scopeForSlot(scope, { slot = null, runId = null } = {}) {
+    const explicit = normalizeSlot(slot);
+    if (explicit) return { ...scope, slot: explicit };
+    const found = await findSlotForRun(scope, runId);
+    return { ...scope, slot: found || DEFAULT_SLOT };
   }
 
   async function begin(
@@ -575,19 +772,24 @@ export function createHermesSessionCoordinator({
       instruction,
       requestedSessionId = null,
       reconcileActive = null,
+      replaceSession = false,
     },
   ) {
     const requested =
       typeof requestedSessionId === "string" && requestedSessionId.trim()
         ? requestedSessionId.trim()
         : null;
+    const slot = slotOf(scope);
 
     const fingerprint =
       typeof instruction === "string" && instruction.trim()
-        ? currentFingerprint(mode, requested, instruction)
+        ? slotFingerprint(slot, currentFingerprint(mode, requested, instruction))
         : null;
+    // Pre-slot (v1) state only ever described the default slot.
     const legacyFingerprint =
-      typeof instruction === "string" && instruction.trim()
+      slot === DEFAULT_SLOT &&
+      typeof instruction === "string" &&
+      instruction.trim()
         ? legacyNativeFingerprint(mode, requested, instruction)
         : null;
 
@@ -599,13 +801,15 @@ export function createHermesSessionCoordinator({
         canonicalSessionId: requested,
         sessionIdToUse: requested,
         idempotencyKey: null,
+        slot,
+        parallelRuns: [],
       };
     }
 
     let reconcileTarget = null;
     if (typeof reconcileActive === "function") {
       reconcileTarget = await withStateTransaction(async () => {
-        const record = state.sessions[scope.sessionHash];
+        const record = peekRecord(scope);
         let active =
           record &&
           typeof record === "object" &&
@@ -651,7 +855,7 @@ export function createHermesSessionCoordinator({
     }
 
     return withStateTransaction(async () => {
-      const record = getRecord(scope.sessionHash);
+      const record = getRecord(scope);
       let changed = false;
 
       if (
@@ -671,6 +875,7 @@ export function createHermesSessionCoordinator({
             "Hermes reported a different sessionId while reconciling the active Run.",
             {
               sessionHash: scope.sessionHash,
+              slot: slotOf(scope),
               expectedSessionId,
               returnedSessionId: reconciled.sessionId,
               active: activeSummary(record.active),
@@ -706,6 +911,13 @@ export function createHermesSessionCoordinator({
           } else if (fingerprint) {
             deleteRecentResult(scope.sessionHash, fingerprint);
           }
+
+          recordRunEnded(
+            record,
+            currentActive,
+            reconciled.status ||
+              (reconciled.runMissing ? "missing" : null),
+          );
 
           if (
             reusable &&
@@ -795,6 +1007,8 @@ export function createHermesSessionCoordinator({
             dedupWindowMs: replayWindowMs,
           },
           idempotencyKey: null,
+          slot,
+          parallelRuns: [],
         };
       }
 
@@ -823,6 +1037,8 @@ export function createHermesSessionCoordinator({
               ? active.reusedSession
               : Boolean(record.canonicalSessionId),
           idempotencyKey: active.idempotencyKey || null,
+          slot,
+          parallelRuns: parallelRunsFor(scope),
         };
       }
 
@@ -832,6 +1048,7 @@ export function createHermesSessionCoordinator({
           "Hermes completed the previous sessionless Run without returning a durable sessionId. Exact retries can replay the completed result, but different work is blocked until Hermes exposes the durable session binding.",
           {
             sessionHash: scope.sessionHash,
+            slot: slotOf(scope),
             active: activeSummary(active),
           },
         );
@@ -840,12 +1057,61 @@ export function createHermesSessionCoordinator({
       if (active && !recoverablePending) {
         throw coordinatorError(
           "HERMES_SESSION_BUSY",
-          "Another Hermes Run is already active for this ChatGPT conversation.",
+          "Another Hermes Run is already active for this ChatGPT conversation" +
+            (slot === DEFAULT_SLOT ? "." : " in slot " + slot + ".") +
+            " Keep polling it with get_hermes_run, or use a free slot only for genuinely independent work.",
           {
             sessionHash: scope.sessionHash,
+            slot: slotOf(scope),
             active: activeSummary(active),
+            freeSlots: freeSlotsFor(scope),
           },
         );
+      }
+
+      // A durable session accepts one Run at a time, so it may be bound to
+      // only one slot of the conversation.
+      const targetSessionId =
+        requested || (replaceSession ? null : record.canonicalSessionId) || null;
+      const owningSlot = targetSessionId
+        ? otherSlotEntries(scope).find(
+            ([, other]) =>
+              other.canonicalSessionId === targetSessionId ||
+              other.active?.sessionId === targetSessionId,
+          )
+        : null;
+      if (owningSlot) {
+        throw coordinatorError(
+          "HERMES_SESSION_BOUND_TO_OTHER_SLOT",
+          "This Hermes sessionId is already bound to slot " +
+            owningSlot[0] +
+            " of this ChatGPT conversation; address that slot instead.",
+          {
+            sessionHash: scope.sessionHash,
+            slot,
+            requestedSessionId: targetSessionId,
+            boundSlot: owningSlot[0],
+          },
+        );
+      }
+
+      // Replacing a slot's session only archives the binding: the Hermes
+      // session and its history stay untouched and can be resumed later.
+      let replacedSessionId =
+        recoverablePending ? active?.replacedSessionId || null : null;
+      if (
+        replaceSession &&
+        record.canonicalSessionId &&
+        record.canonicalSessionId !== requested
+      ) {
+        replacedSessionId = record.canonicalSessionId;
+        record.archivedSessions.push({
+          sessionId: record.canonicalSessionId,
+          archivedAt: new Date().toISOString(),
+          reason: "replaced",
+          lastRunId: lastRunSummary(record)?.runId || null,
+        });
+        record.canonicalSessionId = null;
       }
 
       if (
@@ -858,6 +1124,7 @@ export function createHermesSessionCoordinator({
           "The requested Hermes sessionId does not match the canonical durable session for this ChatGPT conversation.",
           {
             sessionHash: scope.sessionHash,
+            slot: slotOf(scope),
             canonicalSessionId: record.canonicalSessionId,
             requestedSessionId: requested,
           },
@@ -887,6 +1154,7 @@ export function createHermesSessionCoordinator({
         ownerInstanceId: instanceId,
         idempotencyKey,
         reusedSession,
+        ...(replacedSessionId ? { replacedSessionId } : {}),
       };
       record.updatedAt = new Date().toISOString();
       await persist();
@@ -899,6 +1167,9 @@ export function createHermesSessionCoordinator({
         sessionIdToUse: requested || record.canonicalSessionId || null,
         reusedSession,
         idempotencyKey,
+        slot,
+        parallelRuns: parallelRunsFor(scope),
+        replacedSessionId,
       };
     });
   }
@@ -918,7 +1189,7 @@ export function createHermesSessionCoordinator({
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
 
     return withStateTransaction(async () => {
-      const record = getRecord(scope.sessionHash);
+      const record = getRecord(scope);
       const active = record.active;
       if (!active || active.operationId !== operationId) {
         return snapshot(scope, record);
@@ -952,6 +1223,7 @@ export function createHermesSessionCoordinator({
           "Hermes returned a different sessionId than the requested or canonical durable session.",
           {
             sessionHash: scope.sessionHash,
+            slot: slotOf(scope),
             expectedSessionId,
             returnedSessionId,
             runId: runId || null,
@@ -981,19 +1253,26 @@ export function createHermesSessionCoordinator({
           runId: runId || active.runId || null,
           ownerInstanceId: instanceId,
         };
-      } else if (
-        cacheable &&
-        !sessionBindingResolved(record, active, returnedSessionId)
-      ) {
-        record.active = {
-          ...active,
-          kind: "native-session-unresolved",
-          sessionId: null,
-          runId: runId || active.runId || null,
-          ownerInstanceId: instanceId,
-        };
       } else {
-        record.active = null;
+        recordRunEnded(
+          record,
+          { ...active, runId: runId || active.runId || null },
+          payload?.status || null,
+        );
+        if (
+          cacheable &&
+          !sessionBindingResolved(record, active, returnedSessionId)
+        ) {
+          record.active = {
+            ...active,
+            kind: "native-session-unresolved",
+            sessionId: null,
+            runId: runId || active.runId || null,
+            ownerInstanceId: instanceId,
+          };
+        } else {
+          record.active = null;
+        }
       }
 
       if (cacheable) {
@@ -1015,8 +1294,18 @@ export function createHermesSessionCoordinator({
   async function fail(scope, operationId) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
     return withStateTransaction(async () => {
-      const record = getRecord(scope.sessionHash);
+      const record = getRecord(scope);
       if (record.active?.operationId === operationId) {
+        // Nothing reached Hermes, so an explicit replacement never happened:
+        // put the previous binding back.
+        const replaced = record.active.replacedSessionId || null;
+        if (replaced && !record.canonicalSessionId) {
+          record.canonicalSessionId = replaced;
+          const index = record.archivedSessions.findLastIndex(
+            (entry) => entry?.sessionId === replaced,
+          );
+          if (index >= 0) record.archivedSessions.splice(index, 1);
+        }
         record.active = null;
         record.updatedAt = new Date().toISOString();
         await persist();
@@ -1041,7 +1330,7 @@ export function createHermesSessionCoordinator({
     }
 
     return withStateTransaction(async () => {
-      const record = getRecord(scope.sessionHash);
+      const record = getRecord(scope);
       const active = record.active;
       if (!active || active.operationId !== operationId) {
         return snapshot(scope, record);
@@ -1083,7 +1372,7 @@ export function createHermesSessionCoordinator({
   async function markSubmissionUnknown(scope, operationId) {
     if (!scope?.tracked || !scope.sessionHash || !operationId) return;
     return withStateTransaction(async () => {
-      const record = getRecord(scope.sessionHash);
+      const record = getRecord(scope);
       if (record.active?.operationId === operationId) {
         record.active = {
           ...record.active,
@@ -1105,12 +1394,13 @@ export function createHermesSessionCoordinator({
       terminal,
       sessionId = null,
       replayPayload = null,
+      status = null,
     },
   ) {
     if (!scope?.tracked || !scope.sessionHash) return;
 
     return withStateTransaction(async () => {
-      const record = getRecord(scope.sessionHash);
+      const record = getRecord(scope);
       const active = record.active;
       if (
         kind !== "run" ||
@@ -1137,6 +1427,7 @@ export function createHermesSessionCoordinator({
           "Hermes reported a different sessionId while observing the active Run.",
           {
             sessionHash: scope.sessionHash,
+            slot: slotOf(scope),
             expectedSessionId,
             returnedSessionId,
             active: activeSummary(active),
@@ -1170,6 +1461,12 @@ export function createHermesSessionCoordinator({
           deleteRecentResult(scope.sessionHash, active.fingerprint);
         }
 
+        recordRunEnded(
+          record,
+          active,
+          status || replayPayload?.status || null,
+        );
+
         if (
           reusable &&
           !sessionBindingResolved(record, active, returnedSessionId)
@@ -1194,7 +1491,7 @@ export function createHermesSessionCoordinator({
   async function assertActiveRun(scope, runId) {
     if (!scope?.tracked || !scope.sessionHash) return;
     return withStateTransaction(async () => {
-      const record = getRecord(scope.sessionHash);
+      const record = getRecord(scope);
       if (record.active?.kind === "run" && record.active.runId === runId) {
         return snapshot(scope, record);
       }
@@ -1203,6 +1500,7 @@ export function createHermesSessionCoordinator({
         "The requested runId is not the active Hermes Run for this ChatGPT conversation.",
         {
           sessionHash: scope.sessionHash,
+          slot: slotOf(scope),
           requestedRunId: runId,
           active: activeSummary(record.active),
         },
@@ -1212,7 +1510,10 @@ export function createHermesSessionCoordinator({
 
   return {
     scopeFromMeta,
+    scopeForSlot,
     inspect,
+    inspectConversation,
+    findSlotForRun,
     begin,
     complete,
     fail,

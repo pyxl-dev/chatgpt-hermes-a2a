@@ -13,7 +13,10 @@ import {
 
 import { createHermesControl } from "./hermes-control.mjs";
 import { createHermesObservability } from "./hermes-observability.mjs";
-import { createHermesSessionCoordinator } from "./hermes-session-coordinator.mjs";
+import {
+  MAX_SLOTS,
+  createHermesSessionCoordinator,
+} from "./hermes-session-coordinator.mjs";
 import { createHermesSessionAccess } from "./hermes-sessions.mjs";
 import { createRunNotifierFromEnv } from "./hermes-run-notifier.mjs";
 
@@ -53,6 +56,10 @@ const SERVER_INSTRUCTIONS = [
   "Delegation protocol: when delegate_to_hermes, continue_hermes_session or start_hermes_run answers pending:true, keep calling get_hermes_run in the SAME turn until the Run reaches a terminal status.",
   "get_hermes_run holds the call open for up to 55 seconds on its own, so call it again immediately after each nonterminal result. Do not narrate the wait, do not ask the user whether to keep checking, and do not end the turn while a Run is still running.",
   "get_hermes_run accepts no runId: it then reads the Run currently bound to this conversation, which is what a later user follow-up needs.",
+  "Slots: one conversation can drive up to " + MAX_SLOTS + " durable Hermes sessions (slot 1 to " + MAX_SLOTS + "), each with at most one Run, so up to " + MAX_SLOTS + " Runs can work in parallel. Omit slot for normal work: it uses slot 1.",
+  "Use slot 2 or 3 only when the user explicitly asks for parallel work, or for a genuinely independent task that must not wait for the busy slot; never split one task across slots, and keep parallel slots on disjoint files because every slot shares the same Mac workspace.",
+  "A slot keeps its Hermes session and context after its Run ends: send follow-ups for that line of work to the same slot. Pass replaceSession:true only when the user wants that slot to start a fresh Hermes session; the old one is archived, never deleted.",
+  "With several slots running, call get_hermes_run with no arguments: it waits on every active slot at once and returns each slot's Run; keep calling it in the same turn until no slot is pending. A busy slot answers HERMES_SESSION_BUSY: poll it instead of resubmitting.",
   "Stop polling only when the Run is terminal, when the user asks you to stop, or after roughly 20 minutes of continuous waiting; then report the runId, the status and anything that needs the user's decision.",
   "Read tools never mutate the user's machine and need no confirmation.",
 ].join(" ");
@@ -200,22 +207,45 @@ function trackRunForNotification(name, args, payload, failure) {
     }
     return;
   }
-  const runId = typeof payload?.runId === "string" ? payload.runId : null;
-  if (!runId) return;
-  if (runIsTerminal(payload)) {
-    runNotifier.settle(runId);
-  } else if (payload.pending === true || payload.status) {
-    runNotifier.watch(runId, {
-      instruction: typeof args.instruction === "string" ? args.instruction : null,
-    });
+  // get_hermes_run over several slots answers one entry per slot's Run.
+  const runs = Array.isArray(payload?.runs) ? payload.runs : [payload];
+  for (const run of runs) {
+    const runId = typeof run?.runId === "string" ? run.runId : null;
+    if (!runId) continue;
+    if (runIsTerminal(run)) {
+      runNotifier.settle(runId);
+    } else if (run.pending === true || run.status) {
+      runNotifier.watch(runId, {
+        instruction:
+          typeof args.instruction === "string" ? args.instruction : null,
+        slot: Number.isInteger(run.slot) ? run.slot : null,
+      });
+    }
   }
 }
+
+const SLOT_PROPERTY = {
+  type: "integer",
+  minimum: 1,
+  maximum: MAX_SLOTS,
+  description:
+    "Optional Hermes slot of this conversation (1-" +
+    MAX_SLOTS +
+    "). Defaults to 1. Use 2 or 3 only for parallel, independent work.",
+};
+
+const REPLACE_SESSION_PROPERTY = {
+  type: "boolean",
+  default: false,
+  description:
+    "Start this slot on a fresh Hermes session (or on the given sessionId) and archive its previous session binding. Only when the user asks for a fresh context; the slot must be idle.",
+};
 
 const TOOLS = [
   {
     name: "delegate_to_hermes",
     description:
-      "Run ordinary Hermes work in the single durable native Hermes session bound to this ChatGPT conversation. Uses Hermes' authenticated Runs API, serializes mutating work, and automatically reuses the returned durable sessionId on later turns. Waits up to 90 seconds; if Hermes is still running, returns the existing runId/status so get_hermes_run can continue polling. An exact retry reuses the same active Run instead of starting duplicate work.",
+      "Run ordinary Hermes work in the durable native Hermes session bound to this ChatGPT conversation's slot (slot 1 unless slot is given). Uses Hermes' authenticated Runs API, allows one Run per slot, and automatically reuses the slot's durable sessionId on later turns. Waits up to 90 seconds; if Hermes is still running, returns the existing runId/status so get_hermes_run can continue polling. An exact retry reuses the same active Run instead of starting duplicate work.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -226,6 +256,8 @@ const TOOLS = [
           description:
             "The complete task for Hermes. Include exact paths, constraints, expected result, and anything Hermes must not change.",
         },
+        slot: SLOT_PROPERTY,
+        replaceSession: REPLACE_SESSION_PROPERTY,
       },
       required: ["instruction"],
     },
@@ -270,13 +302,15 @@ const TOOLS = [
   {
     name: "continue_hermes_session",
     description:
-      "Continue an explicitly chosen durable Hermes session through the authenticated Runs API. The wrapper rejects a different session once this ChatGPT conversation has a canonical Hermes session. Long work hands back the active runId after at most 90 seconds for polling, and exact retries reuse that Run.",
+      "Continue an explicitly chosen durable Hermes session through the authenticated Runs API. The wrapper rejects a different session once the addressed slot (slot 1 by default) has a canonical Hermes session, unless replaceSession is true, and never binds one session to two slots. Long work hands back the active runId after at most 90 seconds for polling, and exact retries reuse that Run.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         sessionId: { type: "string", minLength: 1 },
         instruction: { type: "string", minLength: 1 },
+        slot: SLOT_PROPERTY,
+        replaceSession: REPLACE_SESSION_PROPERTY,
       },
       required: ["sessionId", "instruction"],
     },
@@ -284,13 +318,15 @@ const TOOLS = [
   {
     name: "start_hermes_run",
     description:
-      "Start the single controllable Hermes Run allowed for this ChatGPT conversation and return its runId. Reuses the canonical durable session when known; an exact retry while that Run is still active returns the same runId instead of failing busy or submitting duplicate work.",
+      "Start the single controllable Hermes Run allowed for this conversation's slot (slot 1 unless slot is given) and return its runId. Reuses the slot's canonical durable session when known; an exact retry while that Run is still active returns the same runId instead of failing busy or submitting duplicate work.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         instruction: { type: "string", minLength: 1 },
         sessionId: { type: "string", minLength: 1 },
+        slot: SLOT_PROPERTY,
+        replaceSession: REPLACE_SESSION_PROPERTY,
       },
       required: ["instruction"],
     },
@@ -298,7 +334,7 @@ const TOOLS = [
   {
     name: "get_hermes_run",
     description:
-      "Read the status/result of a Hermes Run by runId and reconcile coordinator state when it is the active Run. Holds the call open for up to 55 seconds while the Run is still running, so call it again immediately instead of ending the turn between polls. Omit runId to read the Run currently bound to this conversation.",
+      "Read the status/result of a Hermes Run by runId and reconcile coordinator state when it is the active Run. Holds the call open for up to 55 seconds while the Run is still running, so call it again immediately instead of ending the turn between polls. Omit runId to read the Run currently bound to this conversation; with several slots running and no slot given, waits on every active slot and returns each slot's Run.",
     annotations: {
       readOnlyHint: true,
       openWorldHint: false,
@@ -313,19 +349,21 @@ const TOOLS = [
           description:
             "Optional. Defaults to the Run currently bound to this conversation.",
         },
+        slot: SLOT_PROPERTY,
       },
     },
   },
   {
     name: "steer_hermes_run",
     description:
-      "Queue course-correction guidance into the active Hermes Run. Requires the exact active runId for tracked ChatGPT conversations.",
+      "Queue course-correction guidance into the active Hermes Run. Requires the exact active runId of one of this conversation's slots for tracked ChatGPT conversations.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         runId: { type: "string", minLength: 1 },
         instruction: { type: "string", minLength: 1 },
+        slot: SLOT_PROPERTY,
       },
       required: ["runId", "instruction"],
     },
@@ -339,6 +377,7 @@ const TOOLS = [
       additionalProperties: false,
       properties: {
         runId: { type: "string", minLength: 1 },
+        slot: SLOT_PROPERTY,
       },
       required: ["runId"],
     },
@@ -490,7 +529,10 @@ function requireNativeRunId(result, sessionScope) {
   const error = codedError(
     "HERMES_NATIVE_RUN_ID_MISSING",
     "Hermes accepted native Run submission without returning a runId. Delivery may have succeeded, so tracked ChatGPT work remains locked for an exact idempotent retry.",
-    { sessionHash: sessionScope?.sessionHash || null },
+    {
+      sessionHash: sessionScope?.sessionHash || null,
+      slot: sessionScope?.slot ?? null,
+    },
   );
   error.deliveryAmbiguous = true;
   throw error;
@@ -510,6 +552,7 @@ function nativeRunFailureError(result, runId, sessionScope) {
     "Hermes native Run reached an unsuccessful terminal state.",
     {
       sessionHash: sessionScope?.sessionHash || null,
+      slot: sessionScope?.slot ?? null,
       runId,
       sessionId: result?.sessionId || null,
       status: result?.status || null,
@@ -699,6 +742,7 @@ async function reconcileCoordinatorActive(active) {
       const terminal = runIsTerminal(result);
       return {
         terminal,
+        status: result.status || null,
         sessionId: result.sessionId || active.sessionId || null,
         replayPayload:
           terminal ? recoveredNativeRunPayload(active, result) : null,
@@ -746,12 +790,14 @@ async function reuseActiveNativeRun(
         terminal: true,
         sessionId: lease.sessionIdToUse || null,
         replayPayload: null,
+        status: "missing",
       });
       throw codedError(
         "HERMES_NATIVE_RUN_NOT_FOUND_RECOVERED",
         "The previously active Hermes Run no longer exists. Its stale coordinator lease was cleared; retry the operation to start a fresh Run.",
         {
           sessionHash: sessionScope?.sessionHash || null,
+          slot: sessionScope?.slot ?? null,
           runId: lease.runId,
         },
       );
@@ -783,6 +829,7 @@ async function reuseActiveNativeRun(
       terminal: true,
       sessionId: current.sessionId || lease.sessionIdToUse || null,
       replayPayload: null,
+      status: current.status || null,
     });
     throw nativeRunFailureError(current, lease.runId, sessionScope);
   }
@@ -828,11 +875,50 @@ async function reuseActiveNativeRun(
   };
 }
 
+// Hermes caps concurrent Runs globally (api_server.max_concurrent_runs, 10 by
+// default) and answers 429 beyond it. Nothing was submitted, so say so plainly.
+function explainCapacityRejection(error) {
+  if (error?.status !== 429 || !error || typeof error !== "object") return;
+  error.code = "HERMES_RUN_CAPACITY_EXHAUSTED";
+  error.message =
+    "Hermes is already running its maximum number of concurrent Runs and did not accept this one. Wait for a Run to finish (poll get_hermes_run), then retry. " +
+    error.message;
+}
+
+// Tool answers about a slot say which slot they used and warn when other
+// slots of the conversation are working in the same Hermes workspace.
+function withSlotContext(result, sessionScope, lease = null) {
+  if (!sessionScope?.tracked || !result || typeof result !== "object") {
+    return result;
+  }
+  const parallelRuns = Array.isArray(lease?.parallelRuns)
+    ? lease.parallelRuns
+    : [];
+  const warnings = Array.isArray(result.warnings) ? [...result.warnings] : [];
+  if (parallelRuns.length) {
+    warnings.push(
+      "Slot " +
+        parallelRuns.map((run) => run.slot).join(" and ") +
+        " of this conversation also has Hermes work in progress. Every slot shares the same Mac workspace, so keep parallel instructions on disjoint files and directories.",
+    );
+  }
+  return {
+    ...result,
+    slot: sessionScope.slot ?? 1,
+    ...(parallelRuns.length ? { parallelRuns } : {}),
+    ...(lease?.replacedSessionId
+      ? { archivedSessionId: lease.replacedSessionId }
+      : {}),
+    ...(warnings.length ? { warnings } : {}),
+  };
+}
+
 async function releaseOrPreserveSubmissionFailure(
   sessionScope,
   operationId,
   error,
 ) {
+  explainCapacityRejection(error);
   if (error?.deliveryAmbiguous === true) {
     await sessionCoordinator.markSubmissionUnknown(
       sessionScope,
@@ -873,13 +959,17 @@ async function executeSynchronousNative(
     requestedSessionId,
     sessionScope,
     traceId,
+    replaceSession = false,
   },
 ) {
   if (!control.configured) {
     throw codedError(
       "HERMES_NATIVE_CONTROL_REQUIRED",
       "Hermes' authenticated native Runs API is required. Run scripts/setup-hermes-control.sh, restart the bridge, then retry.",
-      { sessionHash: sessionScope?.sessionHash || null },
+      {
+        sessionHash: sessionScope?.sessionHash || null,
+        slot: sessionScope?.slot ?? null,
+      },
     );
   }
 
@@ -890,7 +980,22 @@ async function executeSynchronousNative(
     instruction,
     requestedSessionId,
     reconcileActive: reconcileCoordinatorActive,
+    replaceSession,
   });
+  return withSlotContext(
+    await runSynchronousNativeLease(
+      { operation, instruction, requestedSessionId, sessionScope, traceId },
+      lease,
+    ),
+    sessionScope,
+    lease,
+  );
+}
+
+async function runSynchronousNativeLease(
+  { operation, instruction, requestedSessionId, sessionScope, traceId },
+  lease,
+) {
   if (lease.replay) return lease.replayPayload;
   if (lease.activeRun) {
     return reuseActiveNativeRun(
@@ -997,6 +1102,7 @@ async function executeSynchronousNative(
           lease.sessionIdToUse ||
           null,
         replayPayload: null,
+        status: completed.status || null,
       });
       throw nativeRunFailureError(completed, runId, sessionScope);
     }
@@ -1047,11 +1153,344 @@ async function executeSynchronousNative(
           ...(error?.details || {}),
           runId,
           sessionHash: sessionScope?.sessionHash || null,
+          slot: sessionScope?.slot ?? null,
         };
       }
     }
     throw error;
   }
+}
+
+// Reads a Run once; a Run Hermes no longer knows releases the slot it held.
+async function readTrackedRunOnce(slotScope, before, runId) {
+  try {
+    return await control.getRun(runId);
+  } catch (error) {
+    if (
+      nativeRunNotFoundError(error) &&
+      before?.active?.kind === "run" &&
+      before.active.runId === runId
+    ) {
+      await sessionCoordinator.observe(slotScope, {
+        kind: "run",
+        id: runId,
+        terminal: true,
+        sessionId: before.active.sessionId || null,
+        replayPayload: null,
+        status: "missing",
+      });
+    }
+    throw error;
+  }
+}
+
+async function observeReadRun(slotScope, before, runId, result) {
+  const terminal = runIsTerminal(result);
+  const replayPayload =
+    terminal &&
+    ["run", "native-session-unresolved"].includes(before?.active?.kind) &&
+    before.active.runId === runId
+      ? recoveredNativeRunPayload(before.active, result)
+      : null;
+  await sessionCoordinator.observe(slotScope, {
+    kind: "run",
+    id: runId,
+    terminal,
+    sessionId: result.sessionId || null,
+    replayPayload,
+    status: result.status || null,
+  });
+  return terminal;
+}
+
+async function readSlotRun(slotScope, before, requestedRunId) {
+  const runId = requestedRunId || before?.active?.runId || null;
+  if (!runId) {
+    return withSlotContext(
+      {
+        ok: true,
+        operation: "get_hermes_run",
+        agent: AGENT,
+        runId: null,
+        sessionId: before?.canonicalSessionId || null,
+        status: "no-active-run",
+        pending: false,
+        hint:
+          "This conversation has no active Run. Start work with delegate_to_hermes, or pass an explicit runId.",
+      },
+      slotScope,
+    );
+  }
+  const pollStartedAtMs = Date.now();
+  const deadline = pollStartedAtMs + NATIVE_RUN_POLL_WAIT_MS;
+  let result = await readTrackedRunOnce(slotScope, before, runId);
+  while (!runIsTerminal(result) && Date.now() < deadline) {
+    await sleep(
+      Math.min(NATIVE_DELEGATE_POLL_MS, Math.max(1, deadline - Date.now())),
+    );
+    result = await readTrackedRunOnce(slotScope, before, runId);
+  }
+  const terminal = await observeReadRun(slotScope, before, runId, result);
+  return withSlotContext(
+    {
+      ...result,
+      pending: !terminal,
+      resolution: requestedRunId ? "explicit" : "conversation-active-run",
+      waitedMs: Date.now() - pollStartedAtMs,
+      nextStep: terminal
+        ? null
+        : "The Run is still working: call get_hermes_run again " +
+          (slotScope?.slot > 1
+            ? "with slot " + slotScope.slot
+            : "without a runId") +
+          ", in this same turn, until it is terminal.",
+    },
+    slotScope,
+  );
+}
+
+// get_hermes_run with neither runId nor slot. With at most one busy slot it
+// answers exactly like the single-slot bridge did; with several it waits on
+// all of them at once and returns as soon as any one finishes.
+async function readConversationRuns(sessionScope) {
+  const conversation = await sessionCoordinator.inspectConversation(
+    sessionScope,
+  );
+  const busy = conversation.slots.filter((slot) => slot.active?.runId);
+  if (busy.length <= 1) {
+    const slotScope = {
+      ...sessionScope,
+      slot: busy[0]?.slot ?? 1,
+    };
+    const before =
+      busy[0] ||
+      conversation.slots.find((slot) => slot.slot === 1) ||
+      (await sessionCoordinator.inspect(slotScope));
+    const result = await readSlotRun(slotScope, before, null);
+    return conversation.slots.length > 1
+      ? { ...result, slots: slotOverview(conversation.slots) }
+      : result;
+  }
+
+  const entries = busy.map((before) => ({
+    slotScope: { ...sessionScope, slot: before.slot },
+    before,
+    runId: before.active.runId,
+    result: null,
+    error: null,
+  }));
+  const readAll = () =>
+    Promise.all(
+      entries.map(async (entry) => {
+        if (entry.error || runIsTerminal(entry.result)) return;
+        try {
+          entry.result = await readTrackedRunOnce(
+            entry.slotScope,
+            entry.before,
+            entry.runId,
+          );
+        } catch (error) {
+          if (error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH") throw error;
+          if (nativeRunNotFoundError(error)) entry.error = error;
+          else entry.lastError = error;
+        }
+      }),
+    );
+  const settled = () =>
+    entries.some((entry) => entry.error || runIsTerminal(entry.result));
+
+  const pollStartedAtMs = Date.now();
+  const deadline = pollStartedAtMs + NATIVE_RUN_POLL_WAIT_MS;
+  await readAll();
+  while (!settled() && Date.now() < deadline) {
+    await sleep(
+      Math.min(NATIVE_DELEGATE_POLL_MS, Math.max(1, deadline - Date.now())),
+    );
+    await readAll();
+  }
+
+  const runs = [];
+  for (const entry of entries) {
+    if (entry.error) {
+      runs.push({
+        slot: entry.slotScope.slot,
+        runId: entry.runId,
+        status: "missing",
+        pending: false,
+        error: publicError(entry.error),
+      });
+      continue;
+    }
+    if (!entry.result) {
+      runs.push({
+        slot: entry.slotScope.slot,
+        runId: entry.runId,
+        status: "unknown",
+        pending: true,
+        ...(entry.lastError
+          ? { lastPollError: errorMessage(entry.lastError) }
+          : {}),
+      });
+      continue;
+    }
+    const terminal = await observeReadRun(
+      entry.slotScope,
+      entry.before,
+      entry.runId,
+      entry.result,
+    );
+    runs.push({
+      ...entry.result,
+      slot: entry.slotScope.slot,
+      pending: !terminal,
+    });
+  }
+
+  const pendingSlots = runs.filter((run) => run.pending).map((run) => run.slot);
+  return {
+    ok: true,
+    operation: "get_hermes_run",
+    agent: AGENT,
+    runId: null,
+    status: pendingSlots.length ? "running" : "settled",
+    pending: pendingSlots.length > 0,
+    resolution: "conversation-active-slots",
+    waitedMs: Date.now() - pollStartedAtMs,
+    runs,
+    slots: slotOverview(conversation.slots),
+    nextStep: pendingSlots.length
+      ? "Slot " +
+        pendingSlots.join(" and ") +
+        " still working: call get_hermes_run again with no arguments, in this same turn, until no slot is pending."
+      : null,
+  };
+}
+
+function slotOverview(slots) {
+  return slots.map((slot) => ({
+    slot: slot.slot,
+    sessionId: slot.canonicalSessionId || slot.active?.sessionId || null,
+    activeRunId: slot.active?.runId || null,
+    lastRun: slot.lastRun || null,
+  }));
+}
+
+async function startNativeRun(name, args, traceId, sessionScope) {
+  const instruction = requireString(args, "instruction");
+  const requestedSessionId =
+    typeof args.sessionId === "string" && args.sessionId.trim()
+      ? args.sessionId.trim()
+      : null;
+  const lease = await sessionCoordinator.begin(sessionScope, {
+    mode: name,
+    tool: name,
+    traceId,
+    instruction,
+    requestedSessionId,
+    reconcileActive: reconcileCoordinatorActive,
+    replaceSession: args.replaceSession === true,
+  });
+  return withSlotContext(
+    await runStartLease(
+      name,
+      instruction,
+      requestedSessionId,
+      traceId,
+      sessionScope,
+      lease,
+    ),
+    sessionScope,
+    lease,
+  );
+}
+
+async function runStartLease(
+  name,
+  instruction,
+  requestedSessionId,
+  traceId,
+  sessionScope,
+  lease,
+) {
+  if (lease.replay) return lease.replayPayload;
+  if (lease.activeRun) {
+    return reuseActiveNativeRun(
+      name,
+      lease,
+      requestedSessionId,
+      sessionScope,
+    );
+  }
+
+  let submitted = false;
+  let runRecorded = false;
+  let runId = null;
+  let submittedSessionId = null;
+  try {
+    const result = await control.startRun(
+      instruction,
+      lease.sessionIdToUse,
+      lease.idempotencyKey || "unscoped",
+    );
+    runId = requireNativeRunId(result, sessionScope);
+    submitted = true;
+    submittedSessionId =
+      result.sessionId || lease.sessionIdToUse || null;
+    const terminal = runIsTerminal(result);
+
+    await sessionCoordinator.complete(
+      sessionScope,
+      lease.operationId,
+      {
+        payload: result,
+        traceId,
+        sessionId: result.sessionId || lease.sessionIdToUse || null,
+        runId,
+        keepActive: !terminal,
+        activeKind: !terminal ? "run" : null,
+      },
+    );
+    runRecorded = true;
+
+    if (terminal && !nativeRunSucceeded(result)) {
+      throw nativeRunFailureError(result, runId, sessionScope);
+    }
+    return result;
+  } catch (error) {
+    if (!submitted) {
+      await releaseOrPreserveSubmissionFailure(
+        sessionScope,
+        lease.operationId,
+        error,
+      );
+    } else {
+      if (!runRecorded) {
+        await preserveKnownSubmittedRun(
+          sessionScope,
+          lease.operationId,
+          runId,
+          submittedSessionId,
+          error,
+        );
+      }
+      if (!error?.details?.runId) {
+        error.details = {
+          ...(error?.details || {}),
+          runId,
+          sessionHash: sessionScope?.sessionHash || null,
+          slot: sessionScope?.slot ?? null,
+        };
+      }
+    }
+    throw error;
+  }
+}
+
+async function slotScopeFor(args, sessionScope) {
+  return sessionCoordinator.scopeForSlot(sessionScope, {
+    slot: args.slot,
+    runId: optionalString(args, "runId"),
+  });
 }
 
 async function executePublicTool(name, args, traceId, sessionScope) {
@@ -1061,8 +1500,9 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         operation: name,
         instruction: requireString(args, "instruction"),
         requestedSessionId: null,
-        sessionScope,
+        sessionScope: await slotScopeFor(args, sessionScope),
         traceId,
+        replaceSession: args.replaceSession === true,
       });
 
     case "list_hermes_sessions":
@@ -1088,181 +1528,44 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         operation: name,
         instruction: requireString(args, "instruction"),
         requestedSessionId: requireString(args, "sessionId"),
-        sessionScope,
+        sessionScope: await slotScopeFor(args, sessionScope),
         traceId,
+        replaceSession: args.replaceSession === true,
       });
 
-    case "start_hermes_run": {
-      const instruction = requireString(args, "instruction");
-      const requestedSessionId =
-        typeof args.sessionId === "string" && args.sessionId.trim()
-          ? args.sessionId.trim()
-          : null;
-      const lease = await sessionCoordinator.begin(sessionScope, {
-        mode: name,
-        tool: name,
+    case "start_hermes_run":
+      return startNativeRun(
+        name,
+        args,
         traceId,
-        instruction,
-        requestedSessionId,
-        reconcileActive: reconcileCoordinatorActive,
-      });
-      if (lease.replay) return lease.replayPayload;
-      if (lease.activeRun) {
-        return reuseActiveNativeRun(
-          name,
-          lease,
-          requestedSessionId,
-          sessionScope,
-        );
-      }
-
-      let submitted = false;
-      let runRecorded = false;
-      let runId = null;
-      let submittedSessionId = null;
-      try {
-        const result = await control.startRun(
-          instruction,
-          lease.sessionIdToUse,
-          lease.idempotencyKey || "unscoped",
-        );
-        runId = requireNativeRunId(result, sessionScope);
-        submitted = true;
-        submittedSessionId =
-          result.sessionId || lease.sessionIdToUse || null;
-        const terminal = runIsTerminal(result);
-
-        await sessionCoordinator.complete(
-          sessionScope,
-          lease.operationId,
-          {
-            payload: result,
-            traceId,
-            sessionId: result.sessionId || lease.sessionIdToUse || null,
-            runId,
-            keepActive: !terminal,
-            activeKind: !terminal ? "run" : null,
-          },
-        );
-        runRecorded = true;
-
-        if (terminal && !nativeRunSucceeded(result)) {
-          throw nativeRunFailureError(result, runId, sessionScope);
-        }
-        return result;
-      } catch (error) {
-        if (!submitted) {
-          await releaseOrPreserveSubmissionFailure(
-            sessionScope,
-            lease.operationId,
-            error,
-          );
-        } else {
-          if (!runRecorded) {
-            await preserveKnownSubmittedRun(
-              sessionScope,
-              lease.operationId,
-              runId,
-              submittedSessionId,
-              error,
-            );
-          }
-          if (!error?.details?.runId) {
-            error.details = {
-              ...(error?.details || {}),
-              runId,
-              sessionHash: sessionScope?.sessionHash || null,
-            };
-          }
-        }
-        throw error;
-      }
-    }
+        await slotScopeFor(args, sessionScope),
+      );
 
     case "get_hermes_run": {
       const requestedRunId = optionalString(args, "runId");
-      const before = await sessionCoordinator.inspect(sessionScope);
-      const runId = requestedRunId || before?.active?.runId || null;
-      if (!runId) {
-        return {
-          ok: true,
-          operation: "get_hermes_run",
-          agent: AGENT,
-          runId: null,
-          sessionId: before?.canonicalSessionId || null,
-          status: "no-active-run",
-          pending: false,
-          hint:
-            "This conversation has no active Run. Start work with delegate_to_hermes, or pass an explicit runId.",
-        };
+      if (!requestedRunId && args.slot === undefined) {
+        return readConversationRuns(sessionScope);
       }
-      const readRunOnce = async () => {
-        try {
-          return await control.getRun(runId);
-        } catch (error) {
-          if (
-            nativeRunNotFoundError(error) &&
-            before?.active?.kind === "run" &&
-            before.active.runId === runId
-          ) {
-            await sessionCoordinator.observe(sessionScope, {
-              kind: "run",
-              id: runId,
-              terminal: true,
-              sessionId: before.active.sessionId || null,
-              replayPayload: null,
-            });
-          }
-          throw error;
-        }
-      };
-      const pollStartedAtMs = Date.now();
-      const deadline = pollStartedAtMs + NATIVE_RUN_POLL_WAIT_MS;
-      let result = await readRunOnce();
-      while (!runIsTerminal(result) && Date.now() < deadline) {
-        await sleep(
-          Math.min(NATIVE_DELEGATE_POLL_MS, Math.max(1, deadline - Date.now())),
-        );
-        result = await readRunOnce();
-      }
-      const terminal = runIsTerminal(result);
-      const replayPayload =
-        terminal &&
-        ["run", "native-session-unresolved"].includes(before?.active?.kind) &&
-        before.active.runId === runId
-          ? recoveredNativeRunPayload(before.active, result)
-          : null;
-      await sessionCoordinator.observe(sessionScope, {
-        kind: "run",
-        id: runId,
-        terminal,
-        sessionId: result.sessionId || null,
-        replayPayload,
-      });
-      return {
-        ...result,
-        pending: !terminal,
-        resolution: requestedRunId ? "explicit" : "conversation-active-run",
-        waitedMs: Date.now() - pollStartedAtMs,
-        nextStep: terminal
-          ? null
-          : "The Run is still working: call get_hermes_run again without a runId, in this same turn, until it is terminal.",
-      };
+      const slotScope = await slotScopeFor(args, sessionScope);
+      const before = await sessionCoordinator.inspect(slotScope);
+      return readSlotRun(slotScope, before, requestedRunId);
     }
 
     case "steer_hermes_run": {
       const runId = requireString(args, "runId");
-      await sessionCoordinator.assertActiveRun(sessionScope, runId);
-      return control.steerRun(
-        runId,
-        requireString(args, "instruction"),
+      const slotScope = await slotScopeFor(args, sessionScope);
+      await sessionCoordinator.assertActiveRun(slotScope, runId);
+      return withSlotContext(
+        await control.steerRun(runId, requireString(args, "instruction")),
+        slotScope,
       );
     }
 
     case "stop_hermes_run": {
       const runId = requireString(args, "runId");
-      await sessionCoordinator.assertActiveRun(sessionScope, runId);
-      const before = await sessionCoordinator.inspect(sessionScope);
+      const slotScope = await slotScopeFor(args, sessionScope);
+      await sessionCoordinator.assertActiveRun(slotScope, runId);
+      const before = await sessionCoordinator.inspect(slotScope);
       const result = await control.stopRun(runId);
       const terminal = runIsTerminal(result);
       const replayPayload =
@@ -1271,14 +1574,15 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         before.active.runId === runId
           ? recoveredNativeRunPayload(before.active, result)
           : null;
-      await sessionCoordinator.observe(sessionScope, {
+      await sessionCoordinator.observe(slotScope, {
         kind: "run",
         id: runId,
         terminal,
         sessionId: result.sessionId || null,
         replayPayload,
+        status: result.status || null,
       });
-      return result;
+      return withSlotContext(result, slotScope);
     }
 
     case "hermes_status": {
@@ -1318,8 +1622,11 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         // run-bound session id is the run id itself (GET /v1/runs/{id} binds
         // them). The conversation's current canonical session is deliberately
         // NOT used: it may belong to a different, later run.
-        const state = await sessionCoordinator
-          .inspect(sessionScope)
+        const state = await slotScopeFor(
+          { runId: requestedRunId },
+          sessionScope,
+        )
+          .then((slotScope) => sessionCoordinator.inspect(slotScope))
           .catch(() => null);
         const active = state?.active || null;
         const activeMatches =

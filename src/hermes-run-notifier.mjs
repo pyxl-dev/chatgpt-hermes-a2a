@@ -51,11 +51,19 @@ function formatDuration(ms) {
   return hours + " h" + (rest ? " " + String(rest).padStart(2, "0") : "");
 }
 
-export function formatRunNotification({ runId, status, elapsedMs, instruction }) {
+export function formatRunNotification({
+  runId,
+  status,
+  elapsedMs,
+  instruction,
+  slot = null,
+}) {
   const normalized = String(status || "").toLowerCase();
   const icon = normalized === "completed" ? "✅" : "⚠️";
+  // Slot 1 is the default and stays unnamed; parallel slots say which one.
+  const where = Number.isInteger(slot) && slot > 1 ? " (slot " + slot + ")" : "";
   const lines = [
-    icon + " Hermes a fini un run : " + (normalized || "inconnu") +
+    icon + " Hermes a fini un run" + where + " : " + (normalized || "inconnu") +
       " après " + formatDuration(elapsedMs) + ".",
   ];
   const shown = preview(instruction);
@@ -101,7 +109,7 @@ export function createRunNotifier({
   onError = () => {},
 }) {
   const enabled = typeof send === "function" && typeof getRun === "function";
-  // runId -> { startedAtMs, instruction, delivered }
+  // runId -> { startedAtMs, instruction, slot, delivered }
   const watched = new Map();
   // Runs whose terminal result already reached ChatGPT, or that the user
   // stopped: kept briefly so a late pending payload cannot re-arm a watch.
@@ -139,6 +147,7 @@ export function createRunNotifier({
             status: lastStatus,
             elapsedMs: now() - entry.startedAtMs,
             instruction: entry.instruction,
+            slot: entry.slot,
           }),
         );
       } catch (error) {
@@ -154,14 +163,15 @@ export function createRunNotifier({
     enabled,
 
     // Called whenever a tool hands ChatGPT a Run that is still running.
-    watch(runId, { instruction = null } = {}) {
+    watch(runId, { instruction = null, slot = null } = {}) {
       if (!enabled || !runId || settled.has(runId)) return false;
       const existing = watched.get(runId);
       if (existing) {
         if (instruction && !existing.instruction) existing.instruction = instruction;
+        if (slot && !existing.slot) existing.slot = slot;
         return false;
       }
-      const entry = { startedAtMs: now(), instruction, delivered: false };
+      const entry = { startedAtMs: now(), instruction, slot, delivered: false };
       watched.set(runId, entry);
       entry.done = loop(runId, entry);
       return true;

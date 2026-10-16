@@ -107,6 +107,7 @@ export function createHermesObservability({
       inputRunId: typeof args?.runId === "string" ? args.runId : null,
       inputSessionId:
         typeof args?.sessionId === "string" ? args.sessionId : null,
+      inputSlot: Number.isInteger(args?.slot) ? args.slot : null,
     };
   }
 
@@ -126,6 +127,10 @@ export function createHermesObservability({
       outputRunId:
         payload && typeof payload.runId === "string" ? payload.runId : null,
       inputSessionId: base.inputSessionId,
+      slot:
+        payload && Number.isInteger(payload.slot)
+          ? payload.slot
+          : base.inputSlot ?? null,
       outputSessionId:
         payload && typeof payload.sessionId === "string"
           ? payload.sessionId

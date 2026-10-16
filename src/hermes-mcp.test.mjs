@@ -817,3 +817,211 @@ test("a Run ChatGPT collects itself is never announced", async () => {
     await rm(tempDir, { recursive: true, force: true });
   }
 });
+
+async function createSlotsApi({ maxConcurrent = 10 } = {}) {
+  const state = { submissions: [], runs: new Map(), statusReads: 0 };
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const now = Date.now();
+      const running = [...state.runs.values()].filter(
+        (run) => now < run.terminalAt,
+      ).length;
+
+      if (request.method === "POST" && url.pathname === "/v1/runs") {
+        const input = JSON.parse(body || "{}");
+        if (running >= maxConcurrent) {
+          sendJson(
+            response,
+            { error: { message: "Too many concurrent runs" } },
+            429,
+          );
+          return;
+        }
+        const index = state.submissions.length + 1;
+        const run = {
+          runId: "run-" + index,
+          sessionId: input.session_id || "session-" + index,
+          terminalAt: now + (/slow/u.test(input.input) ? 2500 : 700),
+        };
+        state.runs.set(run.runId, run);
+        state.submissions.push({ ...input, runId: run.runId });
+        sendJson(response, {
+          run_id: run.runId,
+          session_id: run.sessionId,
+          status: "running",
+        });
+        return;
+      }
+
+      if (request.method === "GET" && url.pathname.startsWith("/v1/runs/")) {
+        state.statusReads += 1;
+        const run = state.runs.get(url.pathname.slice("/v1/runs/".length));
+        if (!run) {
+          sendJson(response, { error: { message: "run not found" } }, 404);
+          return;
+        }
+        sendJson(response, {
+          run_id: run.runId,
+          session_id: run.sessionId,
+          status: now < run.terminalAt ? "running" : "completed",
+          ...(now < run.terminalAt ? {} : { output: run.runId + " done" }),
+        });
+        return;
+      }
+
+      sendJson(response, { error: { message: "not found" } }, 404);
+    });
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+
+  return {
+    state,
+    baseUrl: "http://127.0.0.1:" + server.address().port,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+test("one conversation drives two slots in parallel and collects both Runs", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-slots-bridge-"));
+  const api = await createSlotsApi();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      HERMES_NATIVE_DELEGATE_TIMEOUT_MS: "1000",
+    });
+    const metadata = { "openai/session": "parallel-conversation" };
+    const call = (name, args) =>
+      client.callTool({ name, arguments: args, _meta: metadata });
+
+    const tools = (await client.listTools()).tools;
+    for (const name of [
+      "delegate_to_hermes",
+      "continue_hermes_session",
+      "start_hermes_run",
+      "get_hermes_run",
+      "steer_hermes_run",
+      "stop_hermes_run",
+    ]) {
+      const slot = tools.find((tool) => tool.name === name)?.inputSchema
+        ?.properties?.slot;
+      assert.equal(slot?.maximum, 3, name + " must accept an optional slot");
+    }
+    assert.match(String(client.getInstructions()), /slot 2 or 3/i);
+
+    const first = await call("delegate_to_hermes", {
+      instruction: "slow refactor of module A",
+    });
+    assert.equal(first.structuredContent?.pending, true);
+    assert.equal(first.structuredContent?.slot, 1);
+    assert.equal(first.structuredContent?.warnings, undefined);
+
+    const busy = await call("delegate_to_hermes", {
+      instruction: "unrelated question",
+    });
+    assert.equal(busy.isError, true);
+    assert.equal(busy.structuredContent?.error?.code, "HERMES_SESSION_BUSY");
+    assert.deepEqual(busy.structuredContent?.error?.details?.freeSlots, [2, 3]);
+
+    const second = await call("start_hermes_run", {
+      instruction: "independent docs fix",
+      slot: 2,
+    });
+    assert.notEqual(second.isError, true);
+    assert.equal(second.structuredContent?.slot, 2);
+    assert.equal(second.structuredContent?.parallelRuns?.[0]?.slot, 1);
+    assert.match(
+      second.structuredContent?.warnings?.[0] || "",
+      /same Mac workspace/,
+    );
+
+    const seen = new Map();
+    let sawAllSlots = false;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const polled = await call("get_hermes_run", {});
+      assert.notEqual(polled.isError, true);
+      const content = polled.structuredContent;
+      for (const run of content.runs || [content]) {
+        if (run.runId && run.pending === false) seen.set(run.slot, run);
+      }
+      if (seen.size === 2) break;
+      if (!content.runs) {
+        assert.equal(content.resolution, "conversation-active-run");
+      } else {
+        assert.equal(content.resolution, "conversation-active-slots");
+        assert.equal(content.runs.length, 2);
+        sawAllSlots = true;
+      }
+    }
+    assert.ok(sawAllSlots, "get_hermes_run must report every busy slot at once");
+    assert.equal(seen.get(1)?.runId, "run-1");
+    assert.equal(seen.get(1)?.status, "completed");
+    assert.equal(seen.get(2)?.runId, "run-2");
+    assert.equal(seen.get(2)?.output, "run-2 done");
+
+    // Slot 2 keeps its own Hermes session for follow-ups.
+    const followUp = await call("start_hermes_run", {
+      instruction: "follow-up on the docs",
+      slot: 2,
+    });
+    assert.equal(followUp.structuredContent?.slot, 2);
+    assert.equal(api.state.submissions.at(-1).session_id, "session-2");
+
+    const idle = await call("get_hermes_run", { slot: 1 });
+    assert.equal(idle.structuredContent?.status, "no-active-run");
+    assert.equal(idle.structuredContent?.sessionId, "session-1");
+
+    // An explicit runId finds its slot without the slot argument.
+    const byRunId = await call("get_hermes_run", { runId: followUp.structuredContent.runId });
+    assert.equal(byRunId.structuredContent?.slot, 2);
+    assert.equal(byRunId.structuredContent?.status, "completed");
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("Hermes' global Run cap surfaces as a clear error and frees the slot", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-slots-cap-"));
+  const api = await createSlotsApi({ maxConcurrent: 1 });
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      HERMES_NATIVE_RUN_POLL_WAIT_MS: "0",
+    });
+    const metadata = { "openai/session": "capped-conversation" };
+    const call = (name, args) =>
+      client.callTool({ name, arguments: args, _meta: metadata });
+
+    const first = await call("start_hermes_run", { instruction: "slow one" });
+    assert.notEqual(first.isError, true);
+
+    const rejected = await call("start_hermes_run", {
+      instruction: "slow two",
+      slot: 3,
+    });
+    assert.equal(rejected.isError, true);
+    assert.equal(
+      rejected.structuredContent?.error?.code,
+      "HERMES_RUN_CAPACITY_EXHAUSTED",
+    );
+
+    const slot3 = await call("get_hermes_run", { slot: 3 });
+    assert.equal(slot3.structuredContent?.status, "no-active-run");
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
