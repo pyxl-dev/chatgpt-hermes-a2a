@@ -103,19 +103,15 @@ if ! "$NODE_BIN" -e '
   exit 1
 fi
 
-# Run-finished notifications reuse Hermes' own Telegram bot and home channel.
-# Set HERMES_A2A_NOTIFY=off to disable them.
-if [[ "${HERMES_A2A_NOTIFY:-}" != "off" ]]; then
-  if [[ -z "${HERMES_A2A_TELEGRAM_BOT_TOKEN:-}" ]]; then
-    HERMES_A2A_TELEGRAM_BOT_TOKEN="$(read_hermes_env_value TELEGRAM_BOT_TOKEN)"
+# Run-finished notifications go to a Discord webhook whose URL lives in the
+# macOS Keychain (service chatgpt-hermes-a2a.discord-webhook). Without it the
+# notifier stays off. Set HERMES_A2A_NOTIFY=off to disable it explicitly.
+if [[ "${HERMES_A2A_NOTIFY:-}" != "off" && -z "${HERMES_A2A_DISCORD_WEBHOOK_URL:-}" ]]; then
+  HERMES_A2A_DISCORD_WEBHOOK_URL="$(/usr/bin/security find-generic-password \
+    -a "$(id -un)" -s chatgpt-hermes-a2a.discord-webhook -w 2>/dev/null || true)"
+  if [[ -n "$HERMES_A2A_DISCORD_WEBHOOK_URL" ]]; then
+    export HERMES_A2A_DISCORD_WEBHOOK_URL
   fi
-  if [[ -z "${HERMES_A2A_TELEGRAM_CHAT_ID:-}" ]]; then
-    HERMES_A2A_TELEGRAM_CHAT_ID="$(read_hermes_env_value TELEGRAM_HOME_CHANNEL)"
-  fi
-  if [[ -z "${HERMES_A2A_TELEGRAM_THREAD_ID:-}" ]]; then
-    HERMES_A2A_TELEGRAM_THREAD_ID="$(read_hermes_env_value TELEGRAM_HOME_CHANNEL_THREAD_ID)"
-  fi
-  export HERMES_A2A_TELEGRAM_BOT_TOKEN HERMES_A2A_TELEGRAM_CHAT_ID HERMES_A2A_TELEGRAM_THREAD_ID
 fi
 
 unset HERMES_ENV_FILE

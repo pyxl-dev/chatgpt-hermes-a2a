@@ -4,7 +4,7 @@
 // (~23-26 min). Runs that outlive that turn, or that ChatGPT simply stopped
 // polling, finish with nobody looking. This module watches every Run the bridge
 // hands back as still pending and, once it reaches a terminal status that no
-// tool call has already returned to ChatGPT, sends a short Telegram message so
+// tool call has already returned to ChatGPT, posts a short Discord message so
 // the user can come back and say "continue".
 //
 // The message is deliberately small: status, duration, a short preview of the
@@ -65,32 +65,27 @@ export function formatRunNotification({ runId, status, elapsedMs, instruction })
   return lines.join("\n");
 }
 
-export function createTelegramSender({
-  token,
-  chatId,
-  threadId = null,
-  apiBase = "https://api.telegram.org",
+export function createDiscordWebhookSender({
+  webhookUrl,
   fetchImpl = globalThis.fetch,
   timeoutMs = 15000,
 }) {
-  if (!token || !chatId) return null;
-  const url = apiBase.replace(/\/+$/, "") + "/bot" + token + "/sendMessage";
+  if (!webhookUrl) return null;
   return async function send(text) {
-    const body = {
-      chat_id: chatId,
-      text,
-      disable_web_page_preview: true,
-      ...(threadId ? { message_thread_id: Number(threadId) } : {}),
-    };
-    const response = await fetchImpl(url, {
+    const response = await fetchImpl(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        content: text,
+        username: "Hermes",
+        // The instruction preview is user text: never let it ping anyone.
+        allowed_mentions: { parse: [] },
+      }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!response.ok) {
-      // Never surface the URL: it carries the bot token.
-      throw new Error("Telegram sendMessage failed with HTTP " + response.status);
+      // Never surface the URL: it is the webhook's credential.
+      throw new Error("Discord webhook failed with HTTP " + response.status);
     }
   };
 }
@@ -196,17 +191,11 @@ export function createRunNotifierFromEnv({ getRun, env = process.env, onError })
   if (String(env.HERMES_A2A_NOTIFY || "").toLowerCase() === "off") {
     return createRunNotifier({ getRun, send: null });
   }
-  const send = createTelegramSender({
-    token: env.HERMES_A2A_TELEGRAM_BOT_TOKEN,
-    chatId: env.HERMES_A2A_TELEGRAM_CHAT_ID,
-    threadId: env.HERMES_A2A_TELEGRAM_THREAD_ID || null,
-    ...(env.HERMES_A2A_TELEGRAM_API_BASE
-      ? { apiBase: env.HERMES_A2A_TELEGRAM_API_BASE }
-      : {}),
-  });
   return createRunNotifier({
     getRun,
-    send,
+    send: createDiscordWebhookSender({
+      webhookUrl: env.HERMES_A2A_DISCORD_WEBHOOK_URL,
+    }),
     pollMs: boundedNumber(env.HERMES_A2A_NOTIFY_POLL_MS, DEFAULT_POLL_MS, 50),
     graceMs: boundedNumber(env.HERMES_A2A_NOTIFY_GRACE_MS, DEFAULT_GRACE_MS, 0),
     onError,

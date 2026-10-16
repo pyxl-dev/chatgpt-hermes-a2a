@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
   createRunNotifier,
-  createTelegramSender,
+  createDiscordWebhookSender,
   formatRunNotification,
 } from "./hermes-run-notifier.mjs";
 
@@ -113,29 +113,25 @@ test("formats a short message without Hermes output", () => {
   assert.match(text, /continue/);
 });
 
-test("Telegram sender posts to sendMessage and never leaks the token in errors", async () => {
+test("Discord sender posts to the webhook, mutes mentions and never leaks the URL", async () => {
   const calls = [];
-  const send = createTelegramSender({
-    token: "123:SECRET",
-    chatId: "42",
-    threadId: "7",
-    apiBase: "https://telegram.test",
+  const send = createDiscordWebhookSender({
+    webhookUrl: "https://discord.test/api/webhooks/1/SECRET",
     fetchImpl: async (url, init) => {
       calls.push({ url, body: JSON.parse(init.body) });
       return { ok: calls.length === 1, status: 401 };
     },
   });
-  await send("hello");
-  assert.equal(calls[0].url, "https://telegram.test/bot123:SECRET/sendMessage");
+  await send("hello @everyone");
+  assert.equal(calls[0].url, "https://discord.test/api/webhooks/1/SECRET");
   assert.deepEqual(calls[0].body, {
-    chat_id: "42",
-    text: "hello",
-    disable_web_page_preview: true,
-    message_thread_id: 7,
+    content: "hello @everyone",
+    username: "Hermes",
+    allowed_mentions: { parse: [] },
   });
   await assert.rejects(send("again"), (error) => {
-    assert.doesNotMatch(error.message, /SECRET/);
+    assert.doesNotMatch(error.message, /SECRET|discord\.test/);
     return true;
   });
-  assert.equal(createTelegramSender({ token: "", chatId: "42" }), null);
+  assert.equal(createDiscordWebhookSender({ webhookUrl: "" }), null);
 });

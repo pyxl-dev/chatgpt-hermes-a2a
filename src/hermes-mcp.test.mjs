@@ -703,7 +703,7 @@ test("get_hermes_run without a runId answers no-active-run when nothing is bound
     await rm(tempDir, { recursive: true, force: true });
   }
 });
-async function createFakeTelegram() {
+async function createFakeDiscord() {
   const messages = [];
   const server = createServer((request, response) => {
     let body = "";
@@ -712,7 +712,8 @@ async function createFakeTelegram() {
     });
     request.on("end", () => {
       messages.push({ path: request.url, body: JSON.parse(body || "{}") });
-      sendJson(response, { ok: true, result: { message_id: messages.length } });
+      response.writeHead(204);
+      response.end();
     });
   });
   await new Promise((resolve, reject) => {
@@ -735,24 +736,22 @@ async function waitFor(predicate, timeoutMs) {
   return predicate();
 }
 
-function notifyEnv(telegram) {
+function notifyEnv(discord) {
   return {
-    HERMES_A2A_TELEGRAM_BOT_TOKEN: "test-bot-token",
-    HERMES_A2A_TELEGRAM_CHAT_ID: "4242",
-    HERMES_A2A_TELEGRAM_API_BASE: telegram.baseUrl,
+    HERMES_A2A_DISCORD_WEBHOOK_URL: discord.baseUrl + "/api/webhooks/1/test-token",
     HERMES_A2A_NOTIFY_POLL_MS: "100",
     HERMES_A2A_NOTIFY_GRACE_MS: "200",
   };
 }
 
-test("a Run ChatGPT stopped polling is announced on Telegram when it finishes", async () => {
+test("a Run ChatGPT stopped polling is announced on Discord when it finishes", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-notify-"));
   const api = await createPollingApi({ terminalAfterMs: 1200 });
-  const telegram = await createFakeTelegram();
+  const discord = await createFakeDiscord();
   let client = null;
 
   try {
-    client = await startBridgeForPollTest(api, tempDir, notifyEnv(telegram));
+    client = await startBridgeForPollTest(api, tempDir, notifyEnv(discord));
     const delegated = await client.callTool({
       name: "delegate_to_hermes",
       arguments: { instruction: "abandoned long work" },
@@ -762,22 +761,22 @@ test("a Run ChatGPT stopped polling is announced on Telegram when it finishes", 
 
     // ChatGPT never calls get_hermes_run again.
     assert.ok(
-      await waitFor(() => telegram.messages.length > 0, 8000),
+      await waitFor(() => discord.messages.length > 0, 8000),
       "the finished Run must be announced",
     );
-    const [message] = telegram.messages;
-    assert.equal(message.path, "/bottest-bot-token/sendMessage");
-    assert.equal(message.body.chat_id, "4242");
-    assert.match(message.body.text, /completed/);
-    assert.match(message.body.text, /abandoned long work/);
-    assert.match(message.body.text, /run-polled/);
-    assert.doesNotMatch(message.body.text, /polled work finished/, "Hermes output must not be sent");
+    const [message] = discord.messages;
+    assert.equal(message.path, "/api/webhooks/1/test-token");
+    assert.deepEqual(message.body.allowed_mentions, { parse: [] });
+    assert.match(message.body.content, /completed/);
+    assert.match(message.body.content, /abandoned long work/);
+    assert.match(message.body.content, /run-polled/);
+    assert.doesNotMatch(message.body.content, /polled work finished/, "Hermes output must not be sent");
 
     await new Promise((resolve) => setTimeout(resolve, 600));
-    assert.equal(telegram.messages.length, 1, "exactly one notification per Run");
+    assert.equal(discord.messages.length, 1, "exactly one notification per Run");
   } finally {
     await client?.close();
-    await telegram.close();
+    await discord.close();
     await api.close();
     await rm(tempDir, { recursive: true, force: true });
   }
@@ -786,12 +785,12 @@ test("a Run ChatGPT stopped polling is announced on Telegram when it finishes", 
 test("a Run ChatGPT collects itself is never announced", async () => {
   const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-run-quiet-"));
   const api = await createPollingApi({ terminalAfterMs: 1200 });
-  const telegram = await createFakeTelegram();
+  const discord = await createFakeDiscord();
   let client = null;
 
   try {
     client = await startBridgeForPollTest(api, tempDir, {
-      ...notifyEnv(telegram),
+      ...notifyEnv(discord),
       HERMES_A2A_NOTIFY_GRACE_MS: "1500",
     });
     const metadata = { "openai/session": "attentive-conversation" };
@@ -810,10 +809,10 @@ test("a Run ChatGPT collects itself is never announced", async () => {
     assert.equal(polled.structuredContent?.status, "completed");
 
     await new Promise((resolve) => setTimeout(resolve, 2500));
-    assert.equal(telegram.messages.length, 0);
+    assert.equal(discord.messages.length, 0);
   } finally {
     await client?.close();
-    await telegram.close();
+    await discord.close();
     await api.close();
     await rm(tempDir, { recursive: true, force: true });
   }

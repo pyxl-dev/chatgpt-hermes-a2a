@@ -251,9 +251,9 @@ expire after 300 seconds and it is a transport, not a store.
 
 ## Run-finished notifications
 
-A ChatGPT turn can wait on a Run for roughly 20 minutes. Runs that outlive it, or that ChatGPT stops polling, would otherwise finish unseen. `src/hermes-run-notifier.mjs` watches every Run a tool hands back as nonterminal, polls it every 20 s, and once it is terminal waits a 45 s grace period. If no tool call returned that terminal result to ChatGPT in the meantime (and nobody called `stop_hermes_run` on it), it sends one Telegram message through Hermes' own bot to its home channel: status, duration, a 120-character preview of the instruction and the run id. Hermes output is never sent.
+A ChatGPT turn can wait on a Run for roughly 20 minutes. Runs that outlive it, or that ChatGPT stops polling, would otherwise finish unseen. `src/hermes-run-notifier.mjs` watches every Run a tool hands back as nonterminal, polls it every 20 s, and once it is terminal waits a 45 s grace period. If no tool call returned that terminal result to ChatGPT in the meantime (and nobody called `stop_hermes_run` on it), it posts one message to a Discord webhook: status, duration, a 120-character preview of the instruction and the run id. Hermes output is never sent.
 
-`scripts/start-bridge.sh` reads `TELEGRAM_BOT_TOKEN`, `TELEGRAM_HOME_CHANNEL` and `TELEGRAM_HOME_CHANNEL_THREAD_ID` from the Hermes env file and passes them as `HERMES_A2A_TELEGRAM_*`. `HERMES_A2A_NOTIFY=off` disables the feature; `HERMES_A2A_NOTIFY_POLL_MS` and `HERMES_A2A_NOTIFY_GRACE_MS` tune it. Watches live in the bridge process, so a bridge restart drops the ones in flight.
+`scripts/start-bridge.sh` reads the webhook URL from the macOS Keychain (service `chatgpt-hermes-a2a.discord-webhook`) into `HERMES_A2A_DISCORD_WEBHOOK_URL`; without it the notifier is off. Mentions are disabled on every post. `HERMES_A2A_NOTIFY=off` disables the feature; `HERMES_A2A_NOTIFY_POLL_MS` and `HERMES_A2A_NOTIFY_GRACE_MS` tune it. Watches live in the bridge process, so a bridge restart drops the ones in flight.
 
 ## Dependencies
 

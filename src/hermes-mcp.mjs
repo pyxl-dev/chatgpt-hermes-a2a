@@ -64,7 +64,7 @@ function redactText(value) {
     "OPENAI_API_KEY",
     "API_SERVER_KEY",
     "HERMES_API_SERVER_KEY",
-    "HERMES_A2A_TELEGRAM_BOT_TOKEN",
+    "HERMES_A2A_DISCORD_WEBHOOK_URL",
   ]) {
     const secret = process.env[key];
     if (secret) text = text.split(secret).join("[REDACTED]");
@@ -1434,7 +1434,7 @@ try {
       "; dedup=" +
       observability.dedupWindowMs +
       "ms; runNotify=" +
-      (runNotifier.enabled ? "telegram" : "off"),
+      (runNotifier.enabled ? "discord" : "off"),
   );
 } catch (error) {
   console.error("Failed to start Hermes Mac native MCP: " + errorMessage(error));
