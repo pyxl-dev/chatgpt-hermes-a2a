@@ -26,6 +26,7 @@ const TOOL_PURPOSE = {
   steer_hermes_run: "steer-native-run",
   stop_hermes_run: "stop-native-run",
   hermes_status: "native-health-check",
+  list_hermes_profiles: "list-native-profiles",
   hermes_activity: "read-local-activity",
   hermes_tool_timeline: "read-tool-timeline",
 };
@@ -108,7 +109,22 @@ export function createHermesObservability({
       inputSessionId:
         typeof args?.sessionId === "string" ? args.sessionId : null,
       inputSlot: Number.isInteger(args?.slot) ? args.slot : null,
+      inputProfile:
+        typeof args?.profile === "string" && args.profile.trim()
+          ? args.profile.trim().toLowerCase()
+          : null,
     };
+  }
+
+  // The profile the call ran in: what the answer reports, else what a
+  // profile error names, else what was asked.
+  function tracedProfile(base, payload, error) {
+    if (typeof payload?.profile === "string") return payload.profile;
+    const details = error?.details || payload?.error?.details || null;
+    for (const value of [details?.requestedProfile, details?.profile]) {
+      if (typeof value === "string" && value) return value;
+    }
+    return base.inputProfile ?? null;
   }
 
   function finishTrace(base, payload, error) {
@@ -131,6 +147,7 @@ export function createHermesObservability({
         payload && Number.isInteger(payload.slot)
           ? payload.slot
           : base.inputSlot ?? null,
+      profile: tracedProfile(base, payload, error),
       outputSessionId:
         payload && typeof payload.sessionId === "string"
           ? payload.sessionId
@@ -142,6 +159,7 @@ export function createHermesObservability({
             message: redactText(
               error instanceof Error ? error.message : String(error),
             ),
+            ...(typeof error?.code === "string" ? { code: error.code } : {}),
           }
         : payload?.error
           ? redactValue(payload.error)
