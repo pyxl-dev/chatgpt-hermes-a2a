@@ -3,7 +3,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 
+import { DEFAULT_PROFILE, profileOrDefault } from "./hermes-profiles.mjs";
+
 const execFileAsync = promisify(execFile);
+
+// The default profile keeps the bare CLI; other profiles go through -p.
+function profileArgs(profile) {
+  const name = profileOrDefault(profile);
+  return name === DEFAULT_PROFILE ? [] : ["-p", name];
+}
 
 const DEFAULT_TIMEOUT_MS = 330000;
 const DEFAULT_HISTORY_LIMIT = 50;
@@ -461,9 +469,9 @@ export function createHermesSessionAccess({
     1000,
   );
 
-  async function runHermes(args) {
+  async function runHermes(args, profile = null) {
     try {
-      return await execFileAsync(hermesBin, args, {
+      return await execFileAsync(hermesBin, [...profileArgs(profile), ...args], {
         cwd: root,
         env: process.env,
         encoding: "utf8",
@@ -513,7 +521,7 @@ export function createHermesSessionAccess({
     if (source) args.push("--source", source);
     if (workspace) args.push("--workspace", workspace);
 
-    const { stdout } = await runHermes(args);
+    const { stdout } = await runHermes(args, options.profile);
     const sessions = parseSessionList(stdout, source).map((session) => ({
       ...session,
       title: session.title ? redactText(session.title) : null,
@@ -525,6 +533,7 @@ export function createHermesSessionAccess({
       ok: true,
       operation: "list_hermes_sessions",
       agent: "hermes",
+      profile: profileOrDefault(options.profile),
       limit,
       source,
       workspace,
@@ -533,7 +542,7 @@ export function createHermesSessionAccess({
     };
   }
 
-  async function exportSession(sessionId) {
+  async function exportSession(sessionId, profile = null) {
     const requestedSessionId = requireSessionId(sessionId);
     await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
     const outputPath = path.join(
@@ -551,7 +560,7 @@ export function createHermesSessionAccess({
         "--format",
         "jsonl",
         "--redact",
-      ]);
+      ], profile);
 
       const raw = await fs.readFile(outputPath, "utf8");
       const rows = raw
@@ -587,7 +596,7 @@ export function createHermesSessionAccess({
     }
 
     const includeTools = options.includeTools === true;
-    const session = await exportSession(requestedSessionId);
+    const session = await exportSession(requestedSessionId, options.profile);
     const allMessages = Array.isArray(session.messages)
       ? session.messages.filter(
           (message) => message && typeof message === "object",
@@ -606,6 +615,7 @@ export function createHermesSessionAccess({
       ok: true,
       operation: "get_hermes_session",
       agent: "hermes",
+      profile: profileOrDefault(options.profile),
       requestedSessionId,
       sessionId: sessionIdOf(session, requestedSessionId),
       title: session.title || null,
@@ -627,7 +637,7 @@ export function createHermesSessionAccess({
 
   async function getToolTimeline(sessionId, options = {}) {
     const requestedSessionId = requireSessionId(sessionId);
-    const session = await exportSession(requestedSessionId);
+    const session = await exportSession(requestedSessionId, options.profile);
     const messages = Array.isArray(session.messages)
       ? session.messages.filter(
           (message) => message && typeof message === "object",
@@ -645,6 +655,7 @@ export function createHermesSessionAccess({
       ok: true,
       operation: "hermes_tool_timeline",
       agent: "hermes",
+      profile: profileOrDefault(options.profile),
       requestedSessionId,
       sessionId: sessionIdOf(session, requestedSessionId),
       // The timeline is always a whole-session chronology. A runId is only a

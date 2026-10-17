@@ -14,6 +14,11 @@ import {
 import { createHermesControl } from "./hermes-control.mjs";
 import { createHermesObservability } from "./hermes-observability.mjs";
 import {
+  createHermesProfiles,
+  normalizeProfile,
+  profileOrDefault,
+} from "./hermes-profiles.mjs";
+import {
   MAX_SLOTS,
   createHermesSessionCoordinator,
 } from "./hermes-session-coordinator.mjs";
@@ -61,6 +66,8 @@ const SERVER_INSTRUCTIONS = [
   "A slot keeps its Hermes session and context after its Run ends: send follow-ups for that line of work to the same slot. Pass replaceSession:true only when the user wants that slot to start a fresh Hermes session; the old one is archived, never deleted. A Hermes session belongs to one conversation: HERMES_SESSION_BOUND_TO_OTHER_CONVERSATION means another chat uses it, so start a new session unless the user explicitly wants to move it here (replaceSession:true).",
   "Polling several slots: as soon as two or more slots have a Run in progress, call get_hermes_run with NO arguments at all (no runId, no slot). That one call waits on every slot at once and returns the moment any of them finishes, with one entry per slot in runs. Never poll slots one at a time with slot or runId: a finished slot would then wait behind a slower one. Keep calling get_hermes_run with no arguments in the same turn until no slot is pending. A busy slot answers HERMES_SESSION_BUSY: poll it instead of resubmitting.",
   "Stop polling only when the Run is terminal, when the user asks you to stop, or after roughly 20 minutes of continuous waiting; then report the runId, the status and anything that needs the user's decision.",
+  "Profiles: Hermes has several profiles, each with its own instructions (SOUL), skills, memory and model. Call list_hermes_profiles to see them with their descriptions, then pass profile to delegate_to_hermes, start_hermes_run or continue_hermes_session to run the task in the profile whose description best fits it; omit profile for general work (the default profile). Only profiles with available:true can be used.",
+  "A slot keeps the profile of its Hermes session: follow-ups to that slot need no profile. To work in another profile, use a free slot, or replaceSession:true when the user wants this slot to switch; HERMES_PROFILE_MISMATCH means the slot is bound to another profile.",
   "Read tools never mutate the user's machine and need no confirmation.",
 ].join(" ");
 
@@ -159,9 +166,15 @@ const observability = createHermesObservability({
   randomUUID,
 });
 
+const profiles = createHermesProfiles({
+  defaultApiKey:
+    process.env.HERMES_API_SERVER_KEY || process.env.API_SERVER_KEY || "",
+});
+
 const control = createHermesControl({
   redactText,
   redactValue,
+  profiles,
 });
 
 const sessionAccess = createHermesSessionAccess({
@@ -176,7 +189,7 @@ const sessionCoordinator = createHermesSessionCoordinator({
 });
 
 const runNotifier = createRunNotifierFromEnv({
-  getRun: (runId) => control.getRun(runId),
+  getRun: (runId, options) => control.getRun(runId, options),
   onError: (error, runId) =>
     console.error(
       "Run-finished notifier error for " + runId + ": " + errorMessage(error),
@@ -219,6 +232,7 @@ function trackRunForNotification(name, args, payload, failure) {
         instruction:
           typeof args.instruction === "string" ? args.instruction : null,
         slot: Number.isInteger(run.slot) ? run.slot : null,
+        profile: typeof run.profile === "string" ? run.profile : null,
       });
     }
   }
@@ -232,6 +246,13 @@ const SLOT_PROPERTY = {
     "Optional Hermes slot of this conversation (1-" +
     MAX_SLOTS +
     "). Defaults to 1. Use 2 or 3 only for parallel, independent work.",
+};
+
+const PROFILE_PROPERTY = {
+  type: "string",
+  minLength: 1,
+  description:
+    "Optional Hermes profile to run in (see list_hermes_profiles). Pick the profile whose description fits the task; omit it for general work or to keep the slot's current profile.",
 };
 
 const REPLACE_SESSION_PROPERTY = {
@@ -256,6 +277,7 @@ const TOOLS = [
           description:
             "The complete task for Hermes. Include exact paths, constraints, expected result, and anything Hermes must not change.",
         },
+        profile: PROFILE_PROPERTY,
         slot: SLOT_PROPERTY,
         replaceSession: REPLACE_SESSION_PROPERTY,
       },
@@ -277,6 +299,11 @@ const TOOLS = [
         limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
         source: { type: "string", minLength: 1 },
         workspace: { type: "string", minLength: 1 },
+        profile: {
+          type: "string",
+          minLength: 1,
+          description: "Hermes profile whose sessions to list. Defaults to the default profile.",
+        },
       },
     },
   },
@@ -295,6 +322,11 @@ const TOOLS = [
         sessionId: { type: "string", minLength: 1 },
         limit: { type: "integer", minimum: 0, maximum: 200, default: 50 },
         includeTools: { type: "boolean", default: false },
+        profile: {
+          type: "string",
+          minLength: 1,
+          description: "Hermes profile that owns the session. Defaults to the default profile.",
+        },
       },
       required: ["sessionId"],
     },
@@ -309,6 +341,11 @@ const TOOLS = [
       properties: {
         sessionId: { type: "string", minLength: 1 },
         instruction: { type: "string", minLength: 1 },
+        profile: {
+          ...PROFILE_PROPERTY,
+          description:
+            "Hermes profile that owns this session. Omit it to use the slot's current profile.",
+        },
         slot: SLOT_PROPERTY,
         replaceSession: REPLACE_SESSION_PROPERTY,
       },
@@ -325,6 +362,7 @@ const TOOLS = [
       properties: {
         instruction: { type: "string", minLength: 1 },
         sessionId: { type: "string", minLength: 1 },
+        profile: PROFILE_PROPERTY,
         slot: SLOT_PROPERTY,
         replaceSession: REPLACE_SESSION_PROPERTY,
       },
@@ -353,6 +391,12 @@ const TOOLS = [
           ...SLOT_PROPERTY,
           description:
             "Optional. Leave empty while several slots are running, so one call waits on all of them; only for reading one specific slot.",
+        },
+        profile: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Only for an explicit runId that no slot of this conversation tracks: the profile it runs in.",
         },
       },
     },
@@ -397,6 +441,26 @@ const TOOLS = [
     inputSchema: {
       type: "object",
       additionalProperties: false,
+      properties: {
+        profile: {
+          type: "string",
+          minLength: 1,
+          description: "Hermes profile to check. Defaults to the default profile.",
+        },
+      },
+    },
+  },
+  {
+    name: "list_hermes_profiles",
+    annotations: {
+      readOnlyHint: true,
+      openWorldHint: false,
+    },
+    description:
+      "List the Hermes profiles (name, description, model, available) so you can choose the one best suited to a task before delegating it. Reads local profile metadata only; never returns credentials.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
       properties: {},
     },
   },
@@ -425,6 +489,7 @@ const TOOLS = [
             "steer_hermes_run",
             "stop_hermes_run",
             "hermes_status",
+            "list_hermes_profiles",
             "hermes_activity",
             "hermes_tool_timeline",
           ],
@@ -458,6 +523,12 @@ const TOOLS = [
           minLength: 1,
           description:
             "Hermes Run id used only to locate its session: the coordinator's active run is preferred, then the run-bound session id from GET /v1/runs/{id}.",
+        },
+        profile: {
+          type: "string",
+          minLength: 1,
+          description:
+            "Hermes profile that owns the session. Defaults to the profile of the matching active Run, else the default profile.",
         },
         limit: { type: "integer", minimum: 1, maximum: 500, default: 100 },
         since: {
@@ -697,7 +768,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForNativeRun(runId) {
+async function waitForNativeRun(runId, profile = null) {
   const deadline = Date.now() + NATIVE_DELEGATE_TIMEOUT_MS;
   let lastResult = null;
   let lastError = null;
@@ -710,6 +781,7 @@ async function waitForNativeRun(runId) {
     try {
       lastResult = await control.getRun(runId, {
         timeoutMs: remainingBeforePoll,
+        profile,
       });
       lastError = null;
       if (runIsTerminal(lastResult)) {
@@ -742,7 +814,9 @@ async function reconcileCoordinatorActive(active) {
     active.runId
   ) {
     try {
-      const result = await control.getRun(active.runId);
+      const result = await control.getRun(active.runId, {
+        profile: active.profile,
+      });
       const terminal = runIsTerminal(result);
       return {
         terminal,
@@ -784,7 +858,7 @@ async function reuseActiveNativeRun(
   let current = null;
   let pollError = null;
   try {
-    current = await control.getRun(lease.runId);
+    current = await control.getRun(lease.runId, { profile: lease.profile });
   } catch (error) {
     if (error?.code === "HERMES_NATIVE_RUN_ID_MISMATCH") throw error;
     if (nativeRunNotFoundError(error)) {
@@ -909,11 +983,13 @@ function withSlotContext(result, sessionScope, lease = null) {
         " of this conversation also has Hermes work in progress. Every slot shares the same Mac workspace, so keep parallel instructions on disjoint files and directories.",
     );
   }
+  const profile = lease?.profile || result.profile || null;
   // While other slots work, the next poll must cover all of them at once.
   const pollAllSlots = parallelRuns.length > 0 && !runIsTerminal(result);
   return {
     ...result,
     slot: sessionScope.slot ?? 1,
+    ...(profile ? { profile: profileOrDefault(profile) } : {}),
     ...(parallelRuns.length ? { parallelRuns } : {}),
     ...(pollAllSlots
       ? {
@@ -976,6 +1052,7 @@ async function executeSynchronousNative(
     sessionScope,
     traceId,
     replaceSession = false,
+    profile = null,
   },
 ) {
   if (!control.configured) {
@@ -997,6 +1074,7 @@ async function executeSynchronousNative(
     requestedSessionId,
     reconcileActive: reconcileCoordinatorActive,
     replaceSession,
+    profile,
   });
   return withSlotContext(
     await runSynchronousNativeLease(
@@ -1031,6 +1109,7 @@ async function runSynchronousNativeLease(
       instruction,
       lease.sessionIdToUse,
       lease.idempotencyKey || "unscoped",
+      { profile: lease.profile },
     );
     runId = requireNativeRunId(started, sessionScope);
     runSubmitted = true;
@@ -1094,7 +1173,7 @@ async function runSynchronousNativeLease(
     );
     runRecorded = true;
 
-    const waited = await waitForNativeRun(runId);
+    const waited = await waitForNativeRun(runId, lease.profile);
     if (!waited.terminal) {
       return nativePendingRunResult({
         operation,
@@ -1177,10 +1256,21 @@ async function runSynchronousNativeLease(
   }
 }
 
+// The profile a Run lives in: the slot's active Run knows it; otherwise an
+// explicit choice, then the slot's profile.
+function profileForRun(before, runId, explicitProfile = null) {
+  if (before?.active?.runId === runId && before.active.profile) {
+    return before.active.profile;
+  }
+  return explicitProfile || before?.profile || null;
+}
+
 // Reads a Run once; a Run Hermes no longer knows releases the slot it held.
-async function readTrackedRunOnce(slotScope, before, runId) {
+async function readTrackedRunOnce(slotScope, before, runId, profile = null) {
   try {
-    return await control.getRun(runId);
+    return await control.getRun(runId, {
+      profile: profileForRun(before, runId, profile),
+    });
   } catch (error) {
     if (
       nativeRunNotFoundError(error) &&
@@ -1219,7 +1309,12 @@ async function observeReadRun(slotScope, before, runId, result) {
   return terminal;
 }
 
-async function readSlotRun(slotScope, before, requestedRunId) {
+async function readSlotRun(
+  slotScope,
+  before,
+  requestedRunId,
+  explicitProfile = null,
+) {
   const runId = requestedRunId || before?.active?.runId || null;
   if (!runId) {
     return withSlotContext(
@@ -1229,6 +1324,7 @@ async function readSlotRun(slotScope, before, requestedRunId) {
         agent: AGENT,
         runId: null,
         sessionId: before?.canonicalSessionId || null,
+        profile: profileOrDefault(before?.profile),
         status: "no-active-run",
         pending: false,
         hint:
@@ -1239,12 +1335,22 @@ async function readSlotRun(slotScope, before, requestedRunId) {
   }
   const pollStartedAtMs = Date.now();
   const deadline = pollStartedAtMs + NATIVE_RUN_POLL_WAIT_MS;
-  let result = await readTrackedRunOnce(slotScope, before, runId);
+  let result = await readTrackedRunOnce(
+    slotScope,
+    before,
+    runId,
+    explicitProfile,
+  );
   while (!runIsTerminal(result) && Date.now() < deadline) {
     await sleep(
       Math.min(NATIVE_DELEGATE_POLL_MS, Math.max(1, deadline - Date.now())),
     );
-    result = await readTrackedRunOnce(slotScope, before, runId);
+    result = await readTrackedRunOnce(
+      slotScope,
+      before,
+      runId,
+      explicitProfile,
+    );
   }
   const terminal = await observeReadRun(slotScope, before, runId, result);
   const otherActiveSlots = (
@@ -1334,6 +1440,7 @@ async function readConversationRuns(sessionScope) {
     if (entry.error) {
       runs.push({
         slot: entry.slotScope.slot,
+        profile: profileOrDefault(entry.before.active.profile),
         runId: entry.runId,
         status: "missing",
         pending: false,
@@ -1344,6 +1451,7 @@ async function readConversationRuns(sessionScope) {
     if (!entry.result) {
       runs.push({
         slot: entry.slotScope.slot,
+        profile: profileOrDefault(entry.before.active.profile),
         runId: entry.runId,
         status: "unknown",
         pending: true,
@@ -1389,6 +1497,7 @@ async function readConversationRuns(sessionScope) {
 function slotOverview(slots) {
   return slots.map((slot) => ({
     slot: slot.slot,
+    profile: profileOrDefault(slot.active?.profile || slot.profile),
     sessionId: slot.canonicalSessionId || slot.active?.sessionId || null,
     activeRunId: slot.active?.runId || null,
     lastRun: slot.lastRun || null,
@@ -1409,6 +1518,7 @@ async function startNativeRun(name, args, traceId, sessionScope) {
     requestedSessionId,
     reconcileActive: reconcileCoordinatorActive,
     replaceSession: args.replaceSession === true,
+    profile: normalizeProfile(args.profile),
   });
   return withSlotContext(
     await runStartLease(
@@ -1451,6 +1561,7 @@ async function runStartLease(
       instruction,
       lease.sessionIdToUse,
       lease.idempotencyKey || "unscoped",
+      { profile: lease.profile },
     );
     runId = requireNativeRunId(result, sessionScope);
     submitted = true;
@@ -1523,10 +1634,15 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         sessionScope: await slotScopeFor(args, sessionScope),
         traceId,
         replaceSession: args.replaceSession === true,
+        profile: normalizeProfile(args.profile),
       });
+
+    case "list_hermes_profiles":
+      return profiles.listProfiles();
 
     case "list_hermes_sessions":
       return sessionAccess.listSessions({
+        profile: normalizeProfile(args.profile),
         ...(args.limit === undefined ? {} : { limit: args.limit }),
         ...(typeof args.source === "string" ? { source: args.source } : {}),
         ...(typeof args.workspace === "string"
@@ -1540,6 +1656,7 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         {
           ...(args.limit === undefined ? {} : { limit: args.limit }),
           includeTools: args.includeTools === true,
+          profile: normalizeProfile(args.profile),
         },
       );
 
@@ -1551,6 +1668,7 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         sessionScope: await slotScopeFor(args, sessionScope),
         traceId,
         replaceSession: args.replaceSession === true,
+        profile: normalizeProfile(args.profile),
       });
 
     case "start_hermes_run":
@@ -1568,15 +1686,22 @@ async function executePublicTool(name, args, traceId, sessionScope) {
       }
       const slotScope = await slotScopeFor(args, sessionScope);
       const before = await sessionCoordinator.inspect(slotScope);
-      return readSlotRun(slotScope, before, requestedRunId);
+      return readSlotRun(
+        slotScope,
+        before,
+        requestedRunId,
+        normalizeProfile(args.profile),
+      );
     }
 
     case "steer_hermes_run": {
       const runId = requireString(args, "runId");
       const slotScope = await slotScopeFor(args, sessionScope);
-      await sessionCoordinator.assertActiveRun(slotScope, runId);
+      const before = await sessionCoordinator.assertActiveRun(slotScope, runId);
       return withSlotContext(
-        await control.steerRun(runId, requireString(args, "instruction")),
+        await control.steerRun(runId, requireString(args, "instruction"), {
+          profile: profileForRun(before, runId),
+        }),
         slotScope,
       );
     }
@@ -1586,7 +1711,9 @@ async function executePublicTool(name, args, traceId, sessionScope) {
       const slotScope = await slotScopeFor(args, sessionScope);
       await sessionCoordinator.assertActiveRun(slotScope, runId);
       const before = await sessionCoordinator.inspect(slotScope);
-      const result = await control.stopRun(runId);
+      const result = await control.stopRun(runId, {
+        profile: profileForRun(before, runId),
+      });
       const terminal = runIsTerminal(result);
       const replayPayload =
         terminal &&
@@ -1606,7 +1733,9 @@ async function executePublicTool(name, args, traceId, sessionScope) {
     }
 
     case "hermes_status": {
-      const controlStatus = await control.status();
+      const controlStatus = await control.status({
+        profile: normalizeProfile(args.profile),
+      });
       return {
         ok: true,
         operation: "hermes_status",
@@ -1635,6 +1764,7 @@ async function executePublicTool(name, args, traceId, sessionScope) {
           : null;
       let sessionId = explicitSessionId;
       let correlation = explicitSessionId ? "explicit-session-id" : null;
+      let profile = normalizeProfile(args.profile);
 
       if (!sessionId && requestedRunId) {
         // A runId is only used to locate its session. The coordinator's active
@@ -1656,6 +1786,7 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         if (activeMatches) {
           sessionId = active.sessionId;
           correlation = "coordinator-active-run";
+          profile = profile || active.profile || null;
         } else {
           sessionId = requestedRunId;
           correlation = "run-id-as-session-id";
@@ -1676,6 +1807,7 @@ async function executePublicTool(name, args, traceId, sessionScope) {
         ...(typeof args.tool === "string" ? { tool: args.tool } : {}),
         ...(requestedRunId ? { runId: requestedRunId } : {}),
         ...(correlation ? { correlation } : {}),
+        profile,
       });
     }
 

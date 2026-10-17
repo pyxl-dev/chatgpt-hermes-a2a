@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmod, cp, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -362,7 +362,8 @@ test("hermes_tool_timeline is exposed read-only and returns content-free entries
 
     const listed = await client.listTools();
     const names = (listed.tools || []).map((tool) => tool.name);
-    assert.equal(names.length, 11, "the 10 native tools plus the read-only timeline");
+    assert.equal(names.length, 12, "the 10 native tools plus the read-only timeline and profile list");
+    assert.ok(names.includes("list_hermes_profiles"));
     assert.ok(names.includes("hermes_tool_timeline"));
     assert.ok(names.includes("delegate_to_hermes"), "existing tools stay exposed");
 
@@ -1063,6 +1064,157 @@ test("with several slots running, every answer steers ChatGPT to one no-argument
     const all = await call("get_hermes_run", {});
     assert.equal(all.structuredContent?.resolution, "conversation-active-slots");
     assert.match(all.structuredContent?.nextStep || "", /no arguments/);
+  } finally {
+    await client?.close();
+    await api.close();
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+async function createProfileApi() {
+  const keys = { "": "test-control-key", "/p/rea": "rea-key" };
+  const state = { requests: [], runs: new Map() };
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    let body = "";
+    request.on("data", (chunk) => {
+      body += chunk;
+    });
+    request.on("end", () => {
+      const match = /^(\/p\/[^/]+)?(\/v1\/.*)$/u.exec(url.pathname);
+      const prefix = match?.[1] || "";
+      const route = match?.[2] || url.pathname;
+      state.requests.push({
+        method: request.method,
+        prefix,
+        route,
+        auth: request.headers.authorization,
+      });
+      if (!(prefix in keys)) {
+        sendJson(response, { error: "Unknown or unconfigured profile" }, 404);
+        return;
+      }
+      if (request.headers.authorization !== "Bearer " + keys[prefix]) {
+        sendJson(response, { error: { message: "Invalid gateway API key" } }, 401);
+        return;
+      }
+      if (request.method === "POST" && route === "/v1/runs") {
+        const input = JSON.parse(body || "{}");
+        const runId = "run-" + (state.runs.size + 1);
+        state.runs.set(runId, {
+          prefix,
+          sessionId: input.session_id || (prefix ? "rea-session" : "default-session"),
+          terminalAt: Date.now() + 1500,
+        });
+        sendJson(response, {
+          run_id: runId,
+          session_id: state.runs.get(runId).sessionId,
+          status: "running",
+        });
+        return;
+      }
+      if (request.method === "GET" && route.startsWith("/v1/runs/")) {
+        const runId = route.slice("/v1/runs/".length);
+        const run = state.runs.get(runId);
+        if (!run || run.prefix !== prefix) {
+          sendJson(response, { error: { message: "run not found" } }, 404);
+          return;
+        }
+        const done = Date.now() >= run.terminalAt;
+        sendJson(response, {
+          run_id: runId,
+          session_id: run.sessionId,
+          status: done ? "completed" : "running",
+          ...(done ? { output: "done in " + (prefix || "default") } : {}),
+        });
+        return;
+      }
+      sendJson(response, { error: { message: "not found" } }, 404);
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  return {
+    state,
+    baseUrl: "http://127.0.0.1:" + server.address().port,
+    close: () => new Promise((resolve) => server.close(resolve)),
+  };
+}
+
+test("ChatGPT picks a Hermes profile and the slot keeps routing to it", async () => {
+  const tempDir = await mkdtemp(path.join(os.tmpdir(), "hermes-profile-bridge-"));
+  const hermesHome = path.join(tempDir, "hermes-home");
+  await mkdir(path.join(hermesHome, "profiles", "rea"), { recursive: true });
+  await mkdir(path.join(hermesHome, "profiles", "youtube"), { recursive: true });
+  await writeFile(
+    path.join(hermesHome, "profiles", "rea", "profile.yaml"),
+    "description: Reverse engineering\n",
+  );
+  await writeFile(path.join(hermesHome, "profiles", "rea", ".env"), "API_SERVER_KEY=rea-key\n");
+  await writeFile(
+    path.join(hermesHome, "profiles", "youtube", "profile.yaml"),
+    "description: YouTube channel\n",
+  );
+  const api = await createProfileApi();
+  let client = null;
+
+  try {
+    client = await startBridgeForPollTest(api, tempDir, {
+      HERMES_ROOT_HOME: hermesHome,
+      HERMES_NATIVE_DELEGATE_TIMEOUT_MS: "1000",
+    });
+    const metadata = { "openai/session": "profile-conversation" };
+    const call = (name, args) =>
+      client.callTool({ name, arguments: args, _meta: metadata });
+
+    assert.match(String(client.getInstructions()), /list_hermes_profiles/);
+    const listed = await call("list_hermes_profiles", {});
+    assert.deepEqual(
+      listed.structuredContent.profiles.map((profile) => [profile.name, profile.available]),
+      [["default", true], ["rea", true], ["youtube", false]],
+    );
+    assert.doesNotMatch(JSON.stringify(listed), /rea-key|test-control-key/);
+
+    const started = await call("delegate_to_hermes", {
+      instruction: "slow analysis of the firmware",
+      profile: "rea",
+    });
+    assert.notEqual(started.isError, true);
+    assert.equal(started.structuredContent.pending, true);
+    assert.equal(started.structuredContent.profile, "rea");
+
+    let polled = null;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      polled = await call("get_hermes_run", {});
+      if (polled.structuredContent?.pending === false) break;
+    }
+    assert.equal(polled.structuredContent.status, "completed");
+    assert.equal(polled.structuredContent.output, "done in /p/rea");
+    assert.equal(polled.structuredContent.profile, "rea");
+
+    const runCalls = api.state.requests.filter((entry) => entry.route.startsWith("/v1/runs"));
+    assert.ok(runCalls.length >= 2);
+    for (const entry of runCalls) {
+      assert.equal(entry.prefix, "/p/rea", "every Run call must stay in the rea profile");
+      assert.equal(entry.auth, "Bearer rea-key");
+    }
+
+    const mismatch = await call("delegate_to_hermes", {
+      instruction: "write a script",
+      profile: "default",
+    });
+    assert.equal(mismatch.structuredContent?.error?.code, "HERMES_PROFILE_MISMATCH");
+
+    const unconfigured = await call("start_hermes_run", {
+      instruction: "thumbnail ideas",
+      profile: "youtube",
+      slot: 2,
+    });
+    assert.equal(unconfigured.structuredContent?.error?.code, "HERMES_PROFILE_NOT_CONFIGURED");
+    const freed = await call("get_hermes_run", { slot: 2 });
+    assert.equal(freed.structuredContent?.status, "no-active-run");
   } finally {
     await client?.close();
     await api.close();

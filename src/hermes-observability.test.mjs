@@ -122,3 +122,41 @@ test("activity traces rotate at a bounded size and reads span segments", async (
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("traces record the profile and the error code", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "hermes-observability-profile-"));
+  const observability = createHermesObservability({
+    root,
+    redactText: String,
+    redactValue: (value) => value,
+    randomUUID: () => "trace-profile",
+  });
+
+  const ran = observability.finishTrace(
+    observability.beginTrace("delegate_to_hermes", { instruction: "titles", profile: "YouTube" }),
+    { ok: true, runId: "run-1", profile: "youtube", status: "completed" },
+    null,
+  );
+  assert.equal(ran.profile, "youtube");
+  assert.equal(ran.error, null);
+
+  const mismatch = new Error("Slot 1 is bound to profile 'youtube'.");
+  mismatch.code = "HERMES_PROFILE_MISMATCH";
+  mismatch.details = { boundProfile: "youtube", requestedProfile: "rea" };
+  const refused = observability.finishTrace(
+    observability.beginTrace("delegate_to_hermes", { instruction: "re", profile: "rea" }),
+    null,
+    mismatch,
+  );
+  assert.equal(refused.profile, "rea");
+  assert.equal(refused.ok, false);
+  assert.equal(refused.error.code, "HERMES_PROFILE_MISMATCH");
+
+  const plain = observability.finishTrace(
+    observability.beginTrace("hermes_status", {}),
+    null,
+    new Error("boom"),
+  );
+  assert.equal(plain.profile, null);
+  assert.deepEqual(Object.keys(plain.error), ["message"]);
+});

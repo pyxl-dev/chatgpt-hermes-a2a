@@ -8,6 +8,71 @@ if [[ -z "$HERMES_BIN" ]]; then
   exit 1
 fi
 
+# --profile NAME (repeatable) gives an existing Hermes profile its own
+# API_SERVER_KEY so ChatGPT can run work in it. Under Hermes' multiplexed
+# gateway, /p/<profile>/ requests must carry that profile's key; the gateway
+# reads it live, so no restart is needed.
+PROFILES=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)
+      [[ $# -ge 2 && -n "$2" ]] || { echo "--profile needs a profile name." >&2; exit 64; }
+      PROFILES+=("$2")
+      shift 2
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      echo "Usage: $0 [--profile NAME]..." >&2
+      exit 64
+      ;;
+  esac
+done
+
+new_api_key() {
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -hex 32
+  else
+    node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))'
+  fi
+}
+
+if [[ ${#PROFILES[@]} -gt 0 ]]; then
+  PORT="$("$HERMES_BIN" config get API_SERVER_PORT 2>/dev/null || true)"
+  [[ "$PORT" =~ ^[0-9]+$ ]] || PORT=8642
+  STATUS=0
+  for PROFILE in "${PROFILES[@]}"; do
+    if [[ ! "$PROFILE" =~ ^[a-z0-9][a-z0-9_-]{0,63}$ ]]; then
+      echo "$PROFILE: invalid profile name." >&2
+      STATUS=1
+      continue
+    fi
+    if ! "$HERMES_BIN" profile show "$PROFILE" >/dev/null 2>&1; then
+      echo "$PROFILE: no such Hermes profile." >&2
+      STATUS=1
+      continue
+    fi
+    KEY="$("$HERMES_BIN" -p "$PROFILE" config get API_SERVER_KEY --raw 2>/dev/null || true)"
+    if [[ -z "$KEY" ]]; then
+      KEY="$(new_api_key)"
+      "$HERMES_BIN" -p "$PROFILE" config set API_SERVER_KEY "$KEY" >/dev/null
+      echo "$PROFILE: created an API server key."
+    else
+      echo "$PROFILE: reusing its API server key."
+    fi
+    CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+      -H "Authorization: Bearer $KEY" \
+      "http://127.0.0.1:$PORT/p/$PROFILE/v1/capabilities" || true)"
+    unset KEY
+    if [[ "$CODE" == "200" ]]; then
+      echo "$PROFILE: reachable at /p/$PROFILE/ — ChatGPT can now use it."
+    else
+      echo "$PROFILE: the gateway answered HTTP $CODE on /p/$PROFILE/. Check that gateway.multiplex_profiles is on and the profile is not standalone or parked." >&2
+      STATUS=1
+    fi
+  done
+  exit "$STATUS"
+fi
+
 ENV_FILE="$("$HERMES_BIN" config env-path 2>/dev/null || true)"
 ENV_FILE="${ENV_FILE:-$HOME/.hermes/.env}"
 mkdir -p "$(dirname "$ENV_FILE")"
@@ -45,11 +110,7 @@ if [[ -z "$API_KEY" ]]; then
 fi
 
 if [[ -z "$API_KEY" ]]; then
-  if command -v openssl >/dev/null 2>&1; then
-    GENERATED_API_KEY="$(openssl rand -hex 32)"
-  else
-    GENERATED_API_KEY="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("hex"))')"
-  fi
+  GENERATED_API_KEY="$(new_api_key)"
   "$HERMES_BIN" config set API_SERVER_KEY "$GENERATED_API_KEY" >/dev/null
 
   # Hermes 0.21.5 masks credential-shaped values from "config get" unless

@@ -109,7 +109,7 @@ export function createRunNotifier({
   onError = () => {},
 }) {
   const enabled = typeof send === "function" && typeof getRun === "function";
-  // runId -> { startedAtMs, instruction, slot, delivered }
+  // runId -> { startedAtMs, instruction, slot, profile, delivered }
   const watched = new Map();
   // Runs whose terminal result already reached ChatGPT, or that the user
   // stopped: kept briefly so a late pending payload cannot re-arm a watch.
@@ -127,7 +127,7 @@ export function createRunNotifier({
       await sleep(pollMs);
       if (entry.delivered) break;
       try {
-        const result = await getRun(runId);
+        const result = await getRun(runId, { profile: entry.profile });
         lastStatus = result?.status || null;
       } catch (error) {
         onError(error, runId);
@@ -163,15 +163,22 @@ export function createRunNotifier({
     enabled,
 
     // Called whenever a tool hands ChatGPT a Run that is still running.
-    watch(runId, { instruction = null, slot = null } = {}) {
+    watch(runId, { instruction = null, slot = null, profile = null } = {}) {
       if (!enabled || !runId || settled.has(runId)) return false;
       const existing = watched.get(runId);
       if (existing) {
         if (instruction && !existing.instruction) existing.instruction = instruction;
         if (slot && !existing.slot) existing.slot = slot;
+        if (profile && !existing.profile) existing.profile = profile;
         return false;
       }
-      const entry = { startedAtMs: now(), instruction, slot, delivered: false };
+      const entry = {
+        startedAtMs: now(),
+        instruction,
+        slot,
+        profile,
+        delivered: false,
+      };
       watched.set(runId, entry);
       entry.done = loop(runId, entry);
       return true;
