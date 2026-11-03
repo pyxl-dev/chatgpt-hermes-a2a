@@ -36,7 +36,7 @@ There is no private A2A MCP backend, no A2A task envelope, no A2A context routin
 
 ## Public MCP surface
 
-The wrapper exposes 10 tools:
+The wrapper exposes 12 tools:
 
 - `delegate_to_hermes`
 - `list_hermes_sessions`
@@ -47,7 +47,9 @@ The wrapper exposes 10 tools:
 - `steer_hermes_run`
 - `stop_hermes_run`
 - `hermes_status`
+- `list_hermes_profiles`
 - `hermes_activity`
+- `hermes_tool_timeline`
 
 Ordinary ChatGPT work should use `delegate_to_hermes`. It waits synchronously for at most 90 seconds; if the Run is still nonterminal, the wrapper returns the active `runId` and leaves it running so ChatGPT can continue with `get_hermes_run`. Long work that is known in advance to need intervention can still use `start_hermes_run` followed by get/steer/stop.
 

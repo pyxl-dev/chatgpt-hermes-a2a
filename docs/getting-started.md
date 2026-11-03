@@ -13,7 +13,7 @@ openai/tunnel-client on your Mac
   |
   | MCP stdio
   v
-chatgpt-hermes wrapper (10 tools)
+chatgpt-hermes wrapper (12 tools)
   |\
   | \ Hermes native session CLI
   |  \-> sessions list / sessions export
@@ -101,7 +101,7 @@ npm run check
 npm run smoke
 ```
 
-The native MCP smoke verifies the exact 10-tool public surface and delegates a harmless task to Hermes.
+The native MCP smoke verifies the exact 12-tool public surface and delegates a harmless task to Hermes.
 
 You can run the combined local diagnostic instead:
 
@@ -188,7 +188,9 @@ get_hermes_run
 steer_hermes_run
 stop_hermes_run
 hermes_status
+list_hermes_profiles
 hermes_activity
+hermes_tool_timeline
 ```
 
 If old A2A tools such as `continue_with_hermes`, `get_hermes_task` or `cancel_hermes_task` still appear, refresh/rescan the MCP app after restarting the bridge on the native-only build.
