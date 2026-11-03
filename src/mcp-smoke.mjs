@@ -20,6 +20,7 @@ const expectedTools = [
   "steer_hermes_run",
   "stop_hermes_run",
   "hermes_status",
+  "list_hermes_profiles",
   "hermes_activity",
   "hermes_tool_timeline",
 ];
